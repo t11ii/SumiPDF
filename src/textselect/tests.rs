@@ -57,7 +57,7 @@ fn pdf_glyphs_snap_to_forward_and_reverse_lines_and_cid_widths() {
     let (u, v) = midpoint(text.glyphs[3]);
     assert_eq!(
         text.range(start, u, v),
-        vec![text.glyphs[1], union(text.glyphs[2], text.glyphs[3])]
+        [text.glyphs[1], union(text.glyphs[2], text.glyphs[3])].map(TextRun::horizontal)
     );
     assert_eq!(
         text.range(start, u, v),
@@ -68,10 +68,14 @@ fn pdf_glyphs_snap_to_forward_and_reverse_lines_and_cid_widths() {
 fn rotated_pages_select_the_same_cropped_glyphs() {
     let normal = TextDocument::load(&sample(0)).unwrap().page(0).unwrap();
     let original = normal.glyphs[0];
-    for (angle, want) in [
-        (90, (1. - original.bottom, original.left)),
-        (180, (1. - original.right, 1. - original.bottom)),
-        (270, (original.top, 1. - original.right)),
+    for (angle, direction, want) in [
+        (90, Direction::Down, (1. - original.bottom, original.left)),
+        (
+            180,
+            Direction::Left,
+            (1. - original.right, 1. - original.bottom),
+        ),
+        (270, Direction::Up, (original.top, 1. - original.right)),
     ] {
         let text = TextDocument::load(&sample(angle)).unwrap().page(0).unwrap();
         let first = text.glyphs[0];
@@ -81,7 +85,10 @@ fn rotated_pages_select_the_same_cropped_glyphs() {
         let (u, v) = midpoint(text.glyphs[1]);
         assert_eq!(
             text.range(text.hit(x, y).unwrap(), u, v),
-            vec![union(first, text.glyphs[1])]
+            [TextRun {
+                bounds: union(first, text.glyphs[1]),
+                direction
+            }]
         );
     }
 }

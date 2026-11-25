@@ -86,7 +86,8 @@ fn dragging_across_two_lines_highlights_only_the_selected_words() {
         selection,
         layout.range(layout.hit(end.0, end.1).unwrap(), start.0, start.1)
     );
-    for (rect, bounds) in selection.iter().zip([first, last]) {
+    for (run, bounds) in selection.iter().zip([first, last]) {
+        let rect = run.bounds;
         assert!(
             (rect.left * 300.0 - bounds[0]).abs() < 1.0,
             "{rect:?} vs {bounds:?}"
@@ -100,7 +101,8 @@ fn dragging_across_two_lines_highlights_only_the_selected_words() {
         source,
         &[Mark {
             page: 0,
-            rects: selection,
+            style: Default::default(),
+            runs: selection,
         }],
     )
     .unwrap();

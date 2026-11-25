@@ -13,12 +13,110 @@ pub struct UnitRect {
     pub bottom: f32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    Right,
+    Down,
+    Left,
+    Up,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextRun {
+    pub bounds: UnitRect,
+    pub direction: Direction,
+}
+
+impl TextRun {
+    pub fn horizontal(bounds: UnitRect) -> Self {
+        Self {
+            bounds,
+            direction: Direction::Right,
+        }
+    }
+
+    /// Corners in reading order, including for text on a rotated page.
+    fn corners(self) -> [(f32, f32); 4] {
+        let r = self.bounds;
+        let (tl, tr) = ((r.left, r.top), (r.right, r.top));
+        let (bl, br) = ((r.left, r.bottom), (r.right, r.bottom));
+        match self.direction {
+            Direction::Right => [tl, tr, bl, br],
+            Direction::Down => [tr, br, tl, bl],
+            Direction::Left => [br, bl, tr, tl],
+            Direction::Up => [bl, tl, br, tr],
+        }
+    }
+
+    pub fn ink(self, kind: MarkKind) -> UnitRect {
+        let mut r = self.bounds;
+        if kind == MarkKind::Underline {
+            let h = (r.bottom - r.top) * 0.1;
+            let w = (r.right - r.left) * 0.1;
+            match self.direction {
+                Direction::Right => r.top = r.bottom - h,
+                Direction::Down => r.right = r.left + w,
+                Direction::Left => r.bottom = r.top + h,
+                Direction::Up => r.left = r.right - w,
+            }
+        }
+        r
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MarkKind {
+    #[default]
+    Highlight,
+    Underline,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MarkColor {
+    #[default]
+    Yellow,
+    Red,
+    Green,
+    Blue,
+}
+
+impl MarkColor {
+    pub const ALL: [Self; 4] = [Self::Yellow, Self::Red, Self::Green, Self::Blue];
+
+    pub fn rgb(self) -> [u8; 3] {
+        match self {
+            Self::Yellow => [255, 255, 0],
+            Self::Red => [255, 0, 0],
+            Self::Green => [0, 255, 0],
+            Self::Blue => [0, 0, 255],
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Yellow => "黄",
+            Self::Red => "赤",
+            Self::Green => "緑",
+            Self::Blue => "青",
+        }
+    }
+}
+
+pub const HIGHLIGHT_OPACITY: f32 = 0.45;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MarkStyle {
+    pub kind: MarkKind,
+    pub color: MarkColor,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Mark {
     /// Zero-based page number.
     pub page: u32,
-    /// One rectangle per contiguous selected run.
-    pub rects: Vec<UnitRect>,
+    pub style: MarkStyle,
+    pub runs: Vec<TextRun>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -159,33 +257,44 @@ fn write_mark(
 ) -> Result<ObjectId, String> {
     let mut quads = Vec::new();
     let mut rect: Option<Bounds> = None;
-    let mut commands = b"/Hi gs\n1 1 0 rg\n".to_vec();
-    for part in &mark.rects {
+    let (subtype, blend, opacity) = match mark.style.kind {
+        MarkKind::Highlight => ("Highlight", "Multiply", HIGHLIGHT_OPACITY),
+        MarkKind::Underline => ("Underline", "Normal", 1.0),
+    };
+    let color = mark.style.color.rgb().map(|v| f32::from(v) / 255.0);
+    let [red, green, blue] = color;
+    let mut commands = format!("/Ink gs\n{red} {green} {blue} rg\n").into_bytes();
+    for run in &mark.runs {
+        let part = run.bounds;
         let coords = [part.left, part.top, part.right, part.bottom];
         if coords.iter().any(|n| !(0.0..=1.0).contains(n))
             || part.left >= part.right
             || part.top >= part.bottom
         {
-            return Err("ハイライトの選択範囲が不正です。".into());
+            return Err("注釈の選択範囲が不正です。".into());
         }
         let tl = geometry.pdf_point(part.left, part.top);
-        let tr = geometry.pdf_point(part.right, part.top);
-        let bl = geometry.pdf_point(part.left, part.bottom);
         let br = geometry.pdf_point(part.right, part.bottom);
         // Acrobat and other readers use text order (top-left, top-right,
         // bottom-left, bottom-right) for markup QuadPoints.
-        for (x, y) in [tl, tr, bl, br] {
+        for (s, t) in run.corners() {
+            let (x, y) = geometry.pdf_point(s, t);
             quads.extend([Object::Real(x), Object::Real(y)]);
         }
         let r = Bounds::from_points(tl, br);
         if r.x0 >= r.x1 || r.y0 >= r.y1 {
-            return Err("ハイライトの選択範囲が小さすぎます。".into());
+            return Err("注釈の選択範囲が小さすぎます。".into());
         }
         if let Some(all) = &mut rect {
             all.include(r);
         } else {
             rect = Some(r);
         }
+        let ink = run.ink(mark.style.kind);
+        let r = Bounds::from_points(
+            geometry.pdf_point(ink.left, ink.top),
+            geometry.pdf_point(ink.right, ink.bottom),
+        );
         writeln!(
             commands,
             "{} {} {} {} re",
@@ -196,22 +305,22 @@ fn write_mark(
         )
         .map_err(pdf_error)?;
     }
-    let rect = rect.ok_or("ハイライトの範囲がありません。")?;
+    let rect = rect.ok_or("注釈の範囲がありません。")?;
     commands.extend_from_slice(b"f\n");
-    let state = dictionary! { "Type" => "ExtGState", "BM" => "Multiply", "ca" => 0.45_f32 };
+    let state = dictionary! { "Type" => "ExtGState", "BM" => blend, "ca" => opacity };
     let form = Stream::new(
         dictionary! {
             "Type" => "XObject", "Subtype" => "Form", "BBox" => rect.objects(),
-            "Resources" => dictionary! { "ExtGState" => dictionary! { "Hi" => state } },
+            "Resources" => dictionary! { "ExtGState" => dictionary! { "Ink" => state } },
         },
         commands,
     );
     let appearance = update.try_add_object(form).map_err(pdf_error)?;
     update
         .try_add_object(dictionary! {
-            "Type" => "Annot", "Subtype" => "Highlight", "P" => page, "F" => 4,
+            "Type" => "Annot", "Subtype" => subtype, "P" => page, "F" => 4,
             "Rect" => rect.objects(), "QuadPoints" => quads,
-            "C" => vec![1.into(), 1.into(), 0.into()], "CA" => 0.45_f32,
+            "C" => color.map(Object::Real).to_vec(), "CA" => opacity,
             "AP" => dictionary! { "N" => appearance },
         })
         .map_err(pdf_error)
@@ -221,7 +330,7 @@ pub fn annotate(input: Vec<u8>, marks: &[Mark]) -> Result<Vec<u8>, String> {
     if marks.is_empty() {
         return Ok(input);
     }
-    const TOO_LARGE: &str = "ハイライト付きPDFが4 GiBに達する文書には対応していません。";
+    const TOO_LARGE: &str = "注釈付きPDFが4 GiBに達する文書には対応していません。";
     let input_len = input.len();
     if input_len >= u32::MAX as usize {
         return Err(TOO_LARGE.into());
@@ -236,7 +345,7 @@ pub fn annotate(input: Vec<u8>, marks: &[Mark]) -> Result<Vec<u8>, String> {
     for (number, marks) in by_page {
         let id = *pages
             .get(number as usize)
-            .ok_or("ハイライト先のページがありません。")?;
+            .ok_or("注釈を付けるページがありません。")?;
         let previous = revision.get_prev_documents();
         let mut page = previous.get_dictionary(id).map_err(pdf_error)?.clone();
         let mut annots = array(previous, &page, b"Annots")?;
@@ -280,7 +389,7 @@ pub fn annotate(input: Vec<u8>, marks: &[Mark]) -> Result<Vec<u8>, String> {
                 .saturating_add(8192)
                 .saturating_add(marks.len().saturating_mul(1024)),
         )
-        .map_err(|_| "ハイライトの保存に必要なメモリを確保できません。")?;
+        .map_err(|_| "注釈の保存に必要なメモリを確保できません。")?;
     revision.save_to(&mut result).map_err(pdf_error)?;
     if result.len() > u32::MAX as usize {
         return Err(TOO_LARGE.into());

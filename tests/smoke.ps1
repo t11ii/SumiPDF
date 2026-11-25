@@ -55,6 +55,14 @@ public static class SumiSmoke {
     public static void Click(IntPtr window, int id) {
         Post(GetDlgItem(window, id), 0x00F5, 0, IntPtr.Zero); // BM_CLICK
     }
+    public static void PickColor(IntPtr window, uint index) {
+        var picker = GetDlgItem(window, 116);
+        UIntPtr selected;
+        if (picker == IntPtr.Zero || SendMessageTimeoutW(picker, 0x014E, new UIntPtr(index),
+            null, 2, 2000, out selected) == IntPtr.Zero || selected.ToUInt64() != index)
+            throw new InvalidOperationException("Could not select the annotation color.");
+        Post(window, 0x0111, (1u << 16) | 116u, picker); // WM_COMMAND / CBN_SELCHANGE
+    }
     static IntPtr Point(int x, int y) {
         return new IntPtr((y << 16) | (x & 0xffff));
     }
@@ -172,7 +180,15 @@ try {
     Wait-HighlightState $viewer $window '範囲をドラッグ' $true
     [SumiSmoke]::Click($window, 114)
     Wait-HighlightState $viewer $window '範囲をドラッグ' $false
-    [SumiSmoke]::Click($window, 108)
+    [SumiSmoke]::Click($window, 115)
+    Wait-HighlightState $viewer $window '下線（黄）' $false
+    [SumiSmoke]::PickColor($window, 3)
+    Wait-HighlightState $viewer $window '下線（青）' $false
+    [SumiSmoke]::DragOnPage($window, 300, 200, 0.62, 0.60, 0.30, 0.60)
+    Wait-HighlightState $viewer $window '下線（青）' $true
+    [SumiSmoke]::Click($window, 114)
+    Wait-HighlightState $viewer $window '下線（青）' $false
+    [SumiSmoke]::Click($window, 115)
     Wait-HighlightState $viewer $window 'ページ全体' $false
     [SumiSmoke]::Click($window, 102)
     $timer.Restart()
@@ -180,7 +196,14 @@ try {
     # The baseline is at y=180 on a 300-point-tall page. Drag through the glyphs.
     [SumiSmoke]::Click($window, 108)
     Wait-HighlightState $viewer $window '文字をドラッグ' $false
+    Wait-HighlightState $viewer $window '蛍光ペン（青）' $false
     [SumiSmoke]::DragOnPage($window, 200, 300, 0.22, 0.38, 0.56, 0.38)
+    Wait-HighlightState $viewer $window '文字をドラッグ' $true
+    [SumiSmoke]::Click($window, 114)
+    Wait-HighlightState $viewer $window '文字をドラッグ' $false
+    [SumiSmoke]::Click($window, 115)
+    Wait-HighlightState $viewer $window '下線（青）' $false
+    [SumiSmoke]::DragOnPage($window, 200, 300, 0.56, 0.38, 0.22, 0.38)
     Wait-HighlightState $viewer $window '文字をドラッグ' $true
     [SumiSmoke]::Click($window, 114)
     Wait-HighlightState $viewer $window '文字をドラッグ' $false

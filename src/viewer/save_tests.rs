@@ -1,5 +1,5 @@
 use super::copy;
-use crate::highlight::{Mark, UnitRect};
+use crate::highlight::{Mark, MarkColor, MarkKind, MarkStyle, TextRun, UnitRect};
 use crate::{wincrypto, winpdf};
 use lopdf::{Document, Object, Stream, dictionary};
 use std::fs;
@@ -126,15 +126,31 @@ fn windows_reopens_visible_highlights_in_unsigned_and_signed_copies() {
     fs::write(&input, &original).unwrap();
     let doc = winpdf::Document::open_file(&input).unwrap();
     let source = doc.signing_source().unwrap();
-    let marks = [Mark {
-        page: 0,
-        rects: vec![UnitRect {
-            left: 0.5,
-            top: 0.125,
-            right: 0.875,
-            bottom: 0.375,
-        }],
-    }];
+    let marks = [
+        Mark {
+            page: 0,
+            style: MarkStyle::default(),
+            runs: vec![TextRun::horizontal(UnitRect {
+                left: 0.5,
+                top: 0.125,
+                right: 0.875,
+                bottom: 0.375,
+            })],
+        },
+        Mark {
+            page: 0,
+            style: MarkStyle {
+                kind: MarkKind::Underline,
+                color: MarkColor::Blue,
+            },
+            runs: vec![TextRun::horizontal(UnitRect {
+                left: 0.5,
+                right: 0.875,
+                top: 0.5,
+                bottom: 0.75,
+            })],
+        },
+    ];
     copy(&source, &marks, None, &annotated).unwrap();
     wincrypto::tests::with_test_certificate(|cert| {
         copy(&source, &marks, Some(&cert), &signed).unwrap()
@@ -159,6 +175,13 @@ fn windows_reopens_visible_highlights_in_unsigned_and_signed_copies() {
             .filter(|a| a.get(b"Subtype").and_then(Object::as_name).ok() == Some(b"Highlight"))
             .collect();
         assert_eq!(marks.len(), 1);
+        assert_eq!(
+            annots
+                .iter()
+                .filter(|a| a.get(b"Subtype").and_then(Object::as_name).ok() == Some(b"Underline"))
+                .count(),
+            1
+        );
         assert_eq!(
             marks[0]
                 .get(b"QuadPoints")
@@ -200,5 +223,7 @@ fn windows_reopens_visible_highlights_in_unsigned_and_signed_copies() {
         );
         assert_eq!(pixel(&image, 96, 60), pixel(&paper, 96, 60));
         assert_eq!(pixel(&image, 32, 96), pixel(&paper, 32, 96));
+        assert_eq!(pixel(&image, 96, 80), [255; 3]);
+        assert_eq!(pixel(&image, 96, 94), [255, 0, 0]); // BGRA
     }
 }

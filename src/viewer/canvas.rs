@@ -1,7 +1,7 @@
 //! The UI thread owns the current page surface. Panning and painting use the
 //! last bitmap immediately, including while a higher-resolution render runs.
 use super::{dips, rect, wide};
-use crate::highlight::{Mark, UnitRect};
+use crate::highlight::{HIGHLIGHT_OPACITY, Mark, MarkKind, MarkStyle, TextRun, UnitRect};
 use crate::textselect::TextLayout;
 use crate::winpdf::Bitmap;
 use std::{
@@ -69,11 +69,12 @@ pub struct Canvas {
     offset: (i32, i32),
     drag: Option<Drag>,
     capture_window: HWND,
-    highlight_tool: bool,
+    tool: Option<MarkStyle>,
+    page: u32,
     text_layout: Option<TextLayout>,
-    marks: Vec<UnitRect>,
-    preview: Vec<UnitRect>,
-    completed: VecDeque<Vec<UnitRect>>,
+    marks: Vec<Mark>,
+    preview: Vec<TextRun>,
+    completed: VecDeque<Mark>,
     pub font: HFONT,
     pub headline: HFONT,
 }
@@ -107,18 +108,18 @@ impl Canvas {
         self.offset = (0, 0);
     }
 
-    pub fn set_tool(&mut self, active: bool) {
-        if self.highlight_tool != active {
+    pub fn set_tool(&mut self, tool: Option<MarkStyle>) {
+        if self.tool != tool {
             self.cancel_drag();
-            self.highlight_tool = active;
+            self.tool = tool;
         }
     }
 
     pub fn set_marks(&mut self, marks: &[Mark], page: u32) {
+        self.page = page;
         self.marks.clear();
-        for mark in marks.iter().filter(|mark| mark.page == page) {
-            self.marks.extend_from_slice(&mark.rects);
-        }
+        self.marks
+            .extend(marks.iter().filter(|mark| mark.page == page).cloned());
     }
 
     pub fn set_text_layout(&mut self, layout: Option<TextLayout>) {
@@ -128,7 +129,7 @@ impl Canvas {
         self.text_layout = layout;
     }
 
-    pub fn take_new_mark(&mut self) -> Option<Vec<UnitRect>> {
+    pub fn take_new_mark(&mut self) -> Option<Mark> {
         self.completed.pop_front()
     }
 
@@ -169,14 +170,14 @@ impl Canvas {
 
     fn start_drag(&mut self, hwnd: HWND, point: (i32, i32)) -> bool {
         let page = self.layout(hwnd);
-        self.drag = if self.highlight_tool && page.contains(point) {
+        self.drag = if self.tool.is_some() && page.contains(point) {
             let origin = page.normalized(point);
             let glyph = self
                 .text_layout
                 .as_ref()
                 .and_then(|text| text.hit(origin.0, origin.1));
             Some(Drag::Highlight { origin, glyph })
-        } else if !self.highlight_tool && self.bitmap.is_some() && self.zoom > 1.0 {
+        } else if self.tool.is_none() && self.bitmap.is_some() && self.zoom > 1.0 {
             Some(Drag::Pan(point))
         } else {
             None
@@ -190,6 +191,7 @@ impl Canvas {
         let Some(Drag::Highlight { origin, glyph }) = self.drag else {
             return;
         };
+        let Some(style) = self.tool else { return };
         let page = self.layout(hwnd);
         if page.w <= 0 || page.h <= 0 {
             return;
@@ -202,20 +204,28 @@ impl Canvas {
             Vec::new()
         } else if let (Some(text), Some(anchor)) = (&self.text_layout, glyph) {
             text.range(anchor, x, y)
-        } else if dx >= threshold && dy >= threshold {
-            vec![UnitRect {
+        } else if dx >= threshold && (style.kind == MarkKind::Underline || dy >= threshold) {
+            let (top, bottom) = if style.kind == MarkKind::Underline {
+                // A horizontal drag on an image needs a nonempty text quad
+                // for PDF readers. Place its lower edge at the pointer.
+                let bottom = origin.1.max(0.0015);
+                ((bottom - 0.015).max(0.0), bottom)
+            } else {
+                (y.min(origin.1), y.max(origin.1))
+            };
+            vec![TextRun::horizontal(UnitRect {
                 left: x.min(origin.0),
-                top: y.min(origin.1),
                 right: x.max(origin.0),
-                bottom: y.max(origin.1),
-            }]
+                top,
+                bottom,
+            })]
         } else {
             Vec::new()
         };
         if self.preview != new {
-            for r in self.preview.iter().chain(&new) {
+            for run in self.preview.iter().chain(&new) {
                 unsafe {
-                    InvalidateRect(hwnd, &page.pixels(r), 0);
+                    InvalidateRect(hwnd, &page.pixels(&run.ink(style.kind)), 0);
                 }
             }
             self.preview = new;
@@ -263,21 +273,25 @@ fn line(dc: HDC, font: HFONT, color: u32, bounds: RECT, label: &str) {
 }
 
 fn paint_highlights(dc: HDC, clip: RECT, page: PageArea, state: &Canvas) {
-    let mut visible = state.marks.iter().chain(&state.preview).filter_map(|mark| {
-        let p = page.pixels(mark);
-        let r = RECT {
-            left: p.left.max(clip.left),
-            top: p.top.max(clip.top),
-            right: p.right.min(clip.right),
-            bottom: p.bottom.min(clip.bottom),
-        };
-        (r.left < r.right && r.top < r.bottom).then_some(r)
-    });
+    let committed = state.marks.iter().map(|m| (m.style, m.runs.as_slice()));
+    let preview = state.tool.map(|s| (s, state.preview.as_slice()));
+    let mut visible = committed
+        .chain(preview)
+        .flat_map(|(style, runs)| runs.iter().map(move |run| (style, run)))
+        .filter_map(|(style, run)| {
+            let p = page.pixels(&run.ink(style.kind));
+            let r = RECT {
+                left: p.left.max(clip.left),
+                top: p.top.max(clip.top),
+                right: p.right.min(clip.right),
+                bottom: p.bottom.min(clip.bottom),
+            };
+            (r.left < r.right && r.top < r.bottom).then_some((r, style))
+        });
     let Some(first) = visible.next() else { return };
 
-    // Match PDF Multiply with yellow at 45% opacity. MERGECOPY removes
-    // blue from the page pixels, then AlphaBlend mixes those with the page,
-    // preserving dark text. A bounded tile handles even a full-page mark.
+    // Each palette channel is 0 or 255, so MERGECOPY's bitwise AND is
+    // exactly Multiply. AlphaBlend then applies the PDF highlight opacity.
     const WIDTH: usize = 512;
     const HEIGHT: usize = 128;
     unsafe {
@@ -289,13 +303,19 @@ fn paint_highlights(dc: HDC, clip: RECT, page: PageArea, state: &Canvas) {
         if !bitmap.is_null() {
             let original = SelectObject(tile, bitmap);
             SelectObject(tile, GetStockObject(DC_BRUSH));
-            SetDCBrushColor(tile, 0x0000ffff);
             let blend = BLENDFUNCTION {
                 BlendOp: AC_SRC_OVER as u8,
-                SourceConstantAlpha: 115,
+                SourceConstantAlpha: (HIGHLIGHT_OPACITY * 255.0).round() as u8,
                 ..Default::default()
             };
-            for r in std::iter::once(first).chain(visible) {
+            for (r, style) in std::iter::once(first).chain(visible) {
+                let [red, green, blue] = style.color.rgb();
+                let color = u32::from_le_bytes([red, green, blue, 0]);
+                if style.kind == MarkKind::Underline {
+                    fill(dc, &r, color);
+                    continue;
+                }
+                SetDCBrushColor(tile, color);
                 for y in (r.top..r.bottom).step_by(HEIGHT) {
                     for x in (r.left..r.right).step_by(WIDTH) {
                         let w = (r.right - x).min(WIDTH as i32);
@@ -411,7 +431,7 @@ pub unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, w: WPARAM, l: LPAR
         WM_ERASEBKGND => 1,
         WM_SETCURSOR
             if (l as u16) == HTCLIENT as u16
-                && VIEW.with_borrow(|v| v.highlight_tool && v.bitmap.is_some()) =>
+                && VIEW.with_borrow(|v| v.tool.is_some() && v.bitmap.is_some()) =>
         {
             unsafe {
                 SetCursor(LoadCursorW(null_mut(), IDC_CROSS));
@@ -448,9 +468,13 @@ pub unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, w: WPARAM, l: LPAR
                 if v.preview.is_empty() {
                     return false;
                 }
-                let new = std::mem::take(&mut v.preview);
-                v.marks.extend_from_slice(&new);
-                v.completed.push_back(new);
+                let mark = Mark {
+                    page: v.page,
+                    style: v.tool.expect("active markup drag"),
+                    runs: std::mem::take(&mut v.preview),
+                };
+                v.marks.push(mark.clone());
+                v.completed.push_back(mark);
                 true
             });
             unsafe {
@@ -526,14 +550,40 @@ mod tests {
     }
 
     #[test]
-    fn yellow_preview_multiplies_paper_and_preserves_black_text() {
+    fn colored_markers_preserve_text_and_underlines_only_paint_the_lower_edge() {
+        use crate::highlight::MarkColor;
+        let bounds = UnitRect {
+            left: 0.25,
+            top: 0.25,
+            right: 0.75,
+            bottom: 0.75,
+        };
         let state = Canvas {
-            marks: vec![UnitRect {
-                left: 0.25,
-                top: 0.25,
-                right: 0.75,
-                bottom: 0.75,
-            }],
+            marks: vec![
+                Mark {
+                    page: 0,
+                    style: MarkStyle::default(),
+                    runs: vec![TextRun::horizontal(bounds)],
+                },
+                Mark {
+                    page: 0,
+                    style: MarkStyle {
+                        kind: MarkKind::Highlight,
+                        color: MarkColor::Red,
+                    },
+                    runs: vec![TextRun::horizontal(UnitRect {
+                        left: 0.,
+                        top: 0.,
+                        right: 0.25,
+                        bottom: 0.75,
+                    })],
+                },
+            ],
+            tool: Some(MarkStyle {
+                kind: MarkKind::Underline,
+                color: MarkColor::Blue,
+            }),
+            preview: vec![TextRun::horizontal(bounds)],
             ..Default::default()
         };
         unsafe {
@@ -577,11 +627,17 @@ mod tests {
             let paper = GetPixel(dc, 2, 2);
             let ink = GetPixel(dc, 3, 3);
             let outside = GetPixel(dc, 7, 0);
+            let underline = GetPixel(dc, 3, 5);
+            let red_marker = GetPixel(dc, 0, 3);
             SelectObject(dc, original);
             DeleteObject(bitmap);
             DeleteDC(dc);
             assert_eq!(outside, 0x00ffffff);
             assert_eq!(ink, 0);
+            assert_eq!(underline, 0x00ff0000);
+            assert_eq!(red_marker & 0xff, 0xff);
+            assert!((139..=141).contains(&(red_marker >> 16)));
+            assert_eq!(red_marker >> 16, (red_marker >> 8) & 0xff);
             assert_eq!(paper & 0xffff, 0xffff);
             assert!(
                 (139..=141).contains(&(paper >> 16)),

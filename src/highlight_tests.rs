@@ -57,7 +57,8 @@ fn fixture(crop_right: i32) -> Vec<u8> {
 fn marks(page: u32) -> Mark {
     Mark {
         page,
-        rects: vec![
+        style: MarkStyle::default(),
+        runs: [
             UnitRect {
                 left: 0.1,
                 top: 0.18,
@@ -70,14 +71,20 @@ fn marks(page: u32) -> Mark {
                 right: 0.52,
                 bottom: 0.67,
             },
-        ],
+        ]
+        .map(TextRun::horizontal)
+        .to_vec(),
     }
 }
 
 #[test]
-fn retains_original_annotations_and_native_multiline_highlights_through_signing() {
+fn retains_original_annotations_and_mixed_multiline_markup_through_signing() {
     let original = fixture(190);
-    let marks = [marks(1), marks(1), marks(3)];
+    let mut marks = [marks(1), marks(1), marks(3)];
+    marks[1].style = MarkStyle {
+        kind: MarkKind::Underline,
+        color: MarkColor::Blue,
+    };
     let marked = annotate(original.clone(), &marks).unwrap();
     assert!(marked.starts_with(&original));
     let doc = Document::load_mem(&marked).unwrap();
@@ -99,10 +106,30 @@ fn retains_original_annotations_and_native_multiline_highlights_through_signing(
             annots[0].get(b"Subtype").unwrap().as_name().unwrap(),
             b"Link"
         );
-        for highlight in &annots[1..] {
+        for (index, highlight) in annots[1..].iter().enumerate() {
             assert_eq!(
                 highlight.get(b"Subtype").unwrap().as_name().unwrap(),
-                b"Highlight"
+                if index == 1 {
+                    b"Underline"
+                } else {
+                    b"Highlight"
+                }
+            );
+            let rgb: Vec<_> = highlight
+                .get(b"C")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_float().unwrap())
+                .collect();
+            assert_eq!(
+                rgb,
+                if index == 1 {
+                    [0., 0., 1.]
+                } else {
+                    [1., 1., 0.]
+                }
             );
             assert_eq!(
                 highlight
@@ -150,7 +177,7 @@ fn maps_both_directions_at_all_rotations_and_rejects_invalid_selections() {
         assert_eq!(geometry.to_unit(x, y), (0.125, 0.75));
     }
     let mut bad = marks(0);
-    bad.rects[1].right = f32::NAN;
+    bad.runs[1].bounds.right = f32::NAN;
     assert!(annotate(source.clone(), &[bad]).is_err());
     assert!(annotate(source.clone(), &[marks(4)]).is_err());
     assert_eq!(annotate(source.clone(), &[]).unwrap(), source);
@@ -158,9 +185,37 @@ fn maps_both_directions_at_all_rotations_and_rejects_invalid_selections() {
 
 #[test]
 #[ignore = "requires Poppler pdftoppm"]
-fn poppler_renders_yellow_only_in_selected_runs_on_each_rotated_crop() {
+fn poppler_renders_each_color_and_both_markup_types_on_rotated_crops() {
     let original = fixture(190);
-    let selections: Vec<_> = (0..4).map(marks).collect();
+    let directions = [
+        Direction::Right,
+        Direction::Down,
+        Direction::Left,
+        Direction::Up,
+    ];
+    let mut selections = Vec::new();
+    for (page, color) in MarkColor::ALL.into_iter().enumerate() {
+        let mut highlight = marks(page as u32);
+        highlight.style.color = color;
+        let runs = [0.10, 0.54].map(|top| TextRun {
+            bounds: UnitRect {
+                left: 0.70,
+                right: 0.96,
+                top,
+                bottom: top + 0.26,
+            },
+            direction: directions[page],
+        });
+        selections.push(highlight);
+        selections.push(Mark {
+            page: page as u32,
+            style: MarkStyle {
+                kind: MarkKind::Underline,
+                color,
+            },
+            runs: runs.to_vec(),
+        });
+    }
     let output = annotate(original.clone(), &selections).unwrap();
     let dir = tempfile::tempdir().unwrap();
     for (name, bytes) in [("source", original), ("marked", output)] {
@@ -168,7 +223,7 @@ fn poppler_renders_yellow_only_in_selected_runs_on_each_rotated_crop() {
         fs::write(&path, bytes).unwrap();
         let cmd = Command::new("pdftoppm")
             .current_dir(dir.path())
-            .args(["-r", "72", "-cropbox"])
+            .args(["-r", "144", "-cropbox"])
             .arg(&path)
             .arg(name)
             .output()
@@ -180,7 +235,7 @@ fn poppler_renders_yellow_only_in_selected_runs_on_each_rotated_crop() {
         );
     }
     for i in 1..=4 {
-        let (w, h) = if i % 2 == 1 { (180, 100) } else { (100, 180) };
+        let (w, h) = if i % 2 == 1 { (360, 200) } else { (200, 360) };
         let prefix = format!("P6\n{w} {h}\n255\n");
         let original = fs::read(dir.path().join(format!("source-{i}.ppm"))).unwrap();
         let marked = fs::read(dir.path().join(format!("marked-{i}.ppm"))).unwrap();
@@ -191,27 +246,40 @@ fn poppler_renders_yellow_only_in_selected_runs_on_each_rotated_crop() {
             )
         });
         let b = marked.strip_prefix(prefix.as_bytes()).unwrap();
-        for (x, y, selected) in [
+        let rgb = MarkColor::ALL[i - 1].rgb();
+        let pixel_at = |data: &[u8], x: f32, y: f32| -> [u8; 3] {
+            let offset = ((y * h as f32) as usize * w + (x * w as f32) as usize) * 3;
+            data[offset..offset + 3].try_into().unwrap()
+        };
+        for (x, y, filled) in [
             (0.2, 0.24, true),
             (0.3, 0.61, true),
             (0.2, 0.42, false),
-            (0.87, 0.25, false),
+            (0.83, 0.23, false),
+            (0.83, 0.67, false),
         ] {
-            let offset = ((y * h as f32) as usize * w + (x * w as f32) as usize) * 3;
-            let pixel = &b[offset..offset + 3];
-            let source = &a[offset..offset + 3];
-            if selected {
+            let pixel = pixel_at(b, x, y);
+            let source = pixel_at(a, x, y);
+            for channel in 0..3 {
+                let expected = if filled && rgb[channel] == 0 {
+                    (source[channel] as f32 * 0.55).round() as u8
+                } else {
+                    source[channel]
+                };
                 assert!(
-                    pixel[0].abs_diff(source[0]) <= 1 && pixel[1].abs_diff(source[1]) <= 1,
+                    pixel[channel].abs_diff(expected) <= 3,
                     "page {i} {x} {y}: {pixel:?}, {source:?}"
                 );
-                assert!(
-                    pixel[2].abs_diff((source[2] as f32 * 0.55).round() as u8) <= 3,
-                    "page {i} {x} {y}: {pixel:?}, {source:?}"
-                );
-            } else {
-                assert_eq!(pixel, source, "page {i} {x} {y}");
             }
+        }
+        for top in [0.10, 0.54] {
+            let (x, y) = match directions[i - 1] {
+                Direction::Right => (0.83, top + 0.247),
+                Direction::Down => (0.713, top + 0.13),
+                Direction::Left => (0.83, top + 0.013),
+                Direction::Up => (0.947, top + 0.13),
+            };
+            assert_eq!(pixel_at(b, x, y), rgb, "underline on rotated page {i}");
         }
     }
 }

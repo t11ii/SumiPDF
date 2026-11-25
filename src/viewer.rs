@@ -3,7 +3,10 @@ mod dialog;
 mod save;
 mod worker;
 
-use crate::{highlight::Mark, wincrypto::SigningCertificate};
+use crate::{
+    highlight::{Mark, MarkColor, MarkKind, MarkStyle},
+    wincrypto::SigningCertificate,
+};
 use canvas::VIEW;
 use std::{
     ffi::OsString,
@@ -34,6 +37,8 @@ const PAGE: usize = 111;
 const STATUS: usize = 112;
 const PAGE_INPUT: usize = 113;
 const UNDO: usize = 114;
+const UNDERLINE: usize = 115;
+const COLOR: usize = 116;
 const FIRST: usize = 121;
 const LAST: usize = 122;
 const LAYOUT: usize = 123;
@@ -101,6 +106,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             if id == PAGE_INPUT {
                 if w >> 16 == EN_KILLFOCUS as usize {
                     action(hwnd, END_JUMP);
+                }
+            } else if id == COLOR {
+                if matches!((w >> 16) as u32, CBN_SELCHANGE | CBN_CLOSEUP) {
+                    action(hwnd, COLOR);
                 }
             } else if w >> 16 == 0 {
                 action(hwnd, id);
@@ -234,6 +243,8 @@ struct Controls {
     larger: HWND,
     fit: HWND,
     highlighter: HWND,
+    underline: HWND,
+    color: HWND,
     undo: HWND,
     save: HWND,
     sign: HWND,
@@ -244,6 +255,29 @@ struct Controls {
 }
 
 impl Controls {
+    fn color_picker(hwnd: HWND) -> Result<HWND, String> {
+        let picker = child(
+            hwnd,
+            "COMBOBOX",
+            "",
+            COLOR,
+            WS_TABSTOP | CBS_DROPDOWNLIST as u32,
+        )?;
+        for color in MarkColor::ALL {
+            let label = wide(&format!("色：{}", color.label()));
+            let index = unsafe { SendMessageW(picker, CB_ADDSTRING, 0, label.as_ptr() as isize) };
+            if index < 0 {
+                return Err("注釈の色を追加できませんでした。".into());
+            }
+            if color == MarkColor::default() {
+                unsafe {
+                    SendMessageW(picker, CB_SETCURSEL, index as usize, 0);
+                }
+            }
+        }
+        Ok(picker)
+    }
+
     fn new(hwnd: HWND) -> Result<Self, String> {
         let page_input = child(
             hwnd,
@@ -277,6 +311,14 @@ impl Controls {
                 HIGHLIGHT,
                 WS_TABSTOP | (BS_CHECKBOX | BS_PUSHLIKE) as u32,
             )?,
+            underline: child(
+                hwnd,
+                "BUTTON",
+                "下線",
+                UNDERLINE,
+                WS_TABSTOP | (BS_CHECKBOX | BS_PUSHLIKE) as u32,
+            )?,
+            color: Self::color_picker(hwnd)?,
             undo: button(hwnd, "元に戻す", UNDO)?,
             save: button(hwnd, "注釈を保存…", SAVE_MARKS)?,
             sign: button(hwnd, "電子署名…", SIGN)?,
@@ -335,6 +377,8 @@ impl Controls {
             self.larger,
             self.fit,
             self.highlighter,
+            self.underline,
+            self.color,
             self.undo,
             self.save,
             self.sign,
@@ -357,7 +401,7 @@ impl Controls {
         }
         let bounds = rect(hwnd);
         let s = |n| dips(hwnd, n);
-        let compact = bounds.right < s(865);
+        let compact = bounds.right < s(995);
         let top = if compact { 91 } else { 50 };
         let place = |w, x, y, width, height| unsafe {
             SetWindowPos(
@@ -384,12 +428,18 @@ impl Controls {
         let left = if compact {
             s(10)
         } else {
-            bounds.right - s(390)
+            bounds.right - s(540)
         };
         let y = s(if compact { 50 } else { 9 });
-        for (id, x, width) in [(HIGHLIGHT, 0, 82), (UNDO, 85, 74), (SAVE_MARKS, 162, 100)] {
+        for (id, x, width) in [
+            (HIGHLIGHT, 0, 78),
+            (UNDERLINE, 81, 53),
+            (UNDO, 222, 74),
+            (SAVE_MARKS, 299, 100),
+        ] {
             place(control(id), left + s(x), y, s(width), s(32));
         }
+        place(control(COLOR), left + s(137), y + s(4), s(81), s(140));
         place(control(SIGN), bounds.right - s(114), s(9), s(104), s(32));
         place(control(PAGE_INPUT), s(134), s(12), s(72), s(26));
         place(
@@ -435,7 +485,8 @@ struct App {
     requested: Option<(u64, u32, (i32, i32), u64)>,
     marks: Vec<Mark>,
     saved_marks: Vec<Mark>,
-    highlighter: bool,
+    tool: Option<MarkKind>,
+    color: MarkColor,
     text_ready: bool,
     has_text: bool,
     text_worker: Option<Sender<worker::TextJob>>,
@@ -464,7 +515,8 @@ impl App {
             requested: None,
             marks: Vec::new(),
             saved_marks: Vec::new(),
-            highlighter: false,
+            tool: None,
+            color: MarkColor::default(),
             text_ready: false,
             has_text: false,
             text_worker: None,
@@ -492,6 +544,8 @@ impl App {
             ),
             (self.ui.sign, self.page_count() > 0 && !self.writing),
             (self.ui.highlighter, self.page_count() > 0 && !self.writing),
+            (self.ui.underline, self.page_count() > 0 && !self.writing),
+            (self.ui.color, self.page_count() > 0 && !self.writing),
             (self.ui.undo, !self.marks.is_empty() && !self.writing),
             (
                 self.ui.save,
@@ -508,13 +562,13 @@ impl App {
             format!("{} / {}", self.page + 1, self.page_count())
         };
         set_text(self.ui.page, &text);
-        unsafe {
-            SendMessageW(
-                self.ui.highlighter,
-                BM_SETCHECK,
-                usize::from(self.highlighter),
-                0,
-            );
+        for (button, kind) in [
+            (self.ui.highlighter, MarkKind::Highlight),
+            (self.ui.underline, MarkKind::Underline),
+        ] {
+            unsafe {
+                SendMessageW(button, BM_SETCHECK, usize::from(self.tool == Some(kind)), 0);
+            }
         }
     }
     fn title(&self) {
@@ -531,8 +585,7 @@ impl App {
             || unsafe {
                 MessageBoxW(
                     self.hwnd,
-                    wide("ハイライトの変更がまだ保存されていません。変更を破棄して続けますか？")
-                        .as_ptr(),
+                    wide("注釈の変更がまだ保存されていません。変更を破棄して続けますか？").as_ptr(),
                     wide("SumiPDF").as_ptr(),
                     MB_YESNO | MB_DEFBUTTON2 | MB_ICONQUESTION,
                 ) == IDYES
@@ -542,12 +595,21 @@ impl App {
         if self.writing {
             return;
         }
-        let text = if self.highlighter && !self.text_ready {
-            "蛍光ペン  ·  文字の位置を読み込み中…".into()
-        } else if self.highlighter && !self.has_text {
-            "蛍光ペン  ·  ハイライトする範囲をドラッグ  ·  Esc で終了".into()
-        } else if self.highlighter {
-            "蛍光ペン  ·  文字をドラッグして選択  ·  Esc で終了".into()
+        let text = if let Some(kind) = self.tool {
+            let name = match kind {
+                MarkKind::Highlight => "蛍光ペン",
+                MarkKind::Underline => "下線",
+            };
+            let help = if !self.text_ready {
+                "文字の位置を読み込み中…"
+            } else if self.has_text {
+                "文字をドラッグして選択"
+            } else if kind == MarkKind::Underline {
+                "線を引く位置で横にドラッグ"
+            } else {
+                "ハイライトする範囲をドラッグ"
+            };
+            format!("{name}（{}）  ·  {help}  ·  Esc で終了", self.color.label())
         } else if self.zoom == 1.0 {
             "ページ全体  ·  ホイールでページ移動".into()
         } else {
@@ -572,15 +634,25 @@ impl App {
             let _ = worker.send(worker::TextJob::Release);
         }
     }
+    fn sync_canvas_tool(&self) {
+        let tool = self
+            .tool
+            .filter(|_| self.text_ready && !self.writing)
+            .map(|kind| MarkStyle {
+                kind,
+                color: self.color,
+            });
+        VIEW.with_borrow_mut(|v| v.set_tool(tool));
+    }
     fn request_text(&mut self) -> Result<(), String> {
         self.text_ready = false;
         self.has_text = false;
         VIEW.with_borrow_mut(|v| {
-            v.set_tool(false);
+            v.set_tool(None);
             v.set_text_layout(None);
         });
         self.status();
-        if !self.highlighter {
+        if self.tool.is_none() {
             self.release_text();
             return Ok(());
         }
@@ -609,10 +681,10 @@ impl App {
             .map_err(|_| "文字位置を取得するスレッドが終了しました。".to_owned())
     }
     fn text_failed(&mut self, error: &str) {
-        self.highlighter = false;
+        self.tool = None;
         self.release_text();
         VIEW.with_borrow_mut(|v| {
-            v.set_tool(false);
+            v.set_tool(None);
             v.set_text_layout(None);
         });
         self.controls();
@@ -706,11 +778,11 @@ impl App {
         self.document = None;
         self.marks.clear();
         self.saved_marks.clear();
-        self.highlighter = false;
+        self.tool = None;
         self.text_ready = false;
         self.has_text = false;
         self.release_text();
-        VIEW.with_borrow_mut(|v| v.set_tool(false));
+        VIEW.with_borrow_mut(|v| v.set_tool(None));
         self.requested = None;
         self.path = path;
         self.page = 0;
@@ -761,7 +833,7 @@ impl App {
         }
         self.page = page;
         self.reset_canvas("ページを表示中…");
-        if self.highlighter
+        if self.tool.is_some()
             && let Err(e) = self.request_text()
         {
             self.text_failed(&e);
@@ -824,13 +896,13 @@ impl App {
             })
             .map_err(|e| e.to_string())?;
         self.writing = true;
-        VIEW.with_borrow_mut(|v| v.set_tool(false));
+        self.sync_canvas_tool();
         set_text(
             self.ui.status,
             if signed {
                 "署名しています…"
             } else {
-                "ハイライトを保存しています…"
+                "注釈を保存しています…"
             },
         );
         self.controls();
@@ -869,22 +941,21 @@ impl App {
                 revision,
                 page,
                 result,
-            } if revision == self.revision && page == self.page && self.highlighter => match result
-            {
-                Ok(layout) => {
-                    self.text_ready = true;
-                    self.has_text = !layout.is_empty();
-                    VIEW.with_borrow_mut(|v| {
-                        v.set_text_layout(Some(layout));
-                        v.set_tool(!self.writing);
-                    });
-                    self.status();
+            } if revision == self.revision && page == self.page && self.tool.is_some() => {
+                match result {
+                    Ok(layout) => {
+                        self.text_ready = true;
+                        self.has_text = !layout.is_empty();
+                        VIEW.with_borrow_mut(|v| v.set_text_layout(Some(layout)));
+                        self.sync_canvas_tool();
+                        self.status();
+                    }
+                    Err(e) => self.text_failed(&e),
                 }
-                Err(e) => self.text_failed(&e),
-            },
+            }
             Event::Saved { signed, result } => {
                 self.writing = false;
-                VIEW.with_borrow_mut(|v| v.set_tool(self.highlighter && self.text_ready));
+                self.sync_canvas_tool();
                 self.controls();
                 match result {
                     Ok(path) => {
@@ -928,13 +999,30 @@ impl App {
             FIT => self.scale(1.0),
             SIGN => self.save_copy(true)?,
             SAVE_MARKS => self.save_copy(false)?,
-            HIGHLIGHT if !self.writing && self.page_count() > 0 => {
-                self.highlighter = !self.highlighter;
-                if let Err(e) = self.request_text() {
+            HIGHLIGHT | UNDERLINE if !self.writing && self.page_count() > 0 => {
+                let kind = if id == HIGHLIGHT {
+                    MarkKind::Highlight
+                } else {
+                    MarkKind::Underline
+                };
+                let previous = self.tool;
+                self.tool = (previous != Some(kind)).then_some(kind);
+                if previous.is_some() && self.tool.is_some() {
+                    self.sync_canvas_tool();
+                    self.status();
+                } else if let Err(e) = self.request_text() {
                     self.text_failed(&e);
                 }
                 self.controls();
                 canvas::redraw(self.ui.canvas);
+            }
+            COLOR if !self.writing && self.page_count() > 0 => {
+                let index = unsafe { SendMessageW(self.ui.color, CB_GETCURSEL, 0, 0) };
+                if let Some(&color) = MarkColor::ALL.get(index as usize) {
+                    self.color = color;
+                    self.sync_canvas_tool();
+                    self.status();
+                }
             }
             UNDO if !self.writing => {
                 if let Some(mark) = self.marks.pop() {
@@ -1011,7 +1099,11 @@ impl App {
             (true, 0x53) => Some(SIGN),
             (true, 0x5A) => Some(UNDO),
             (false, 0x48) => Some(HIGHLIGHT),
-            (false, VK_ESCAPE) if self.highlighter => Some(HIGHLIGHT),
+            (false, 0x55) => Some(UNDERLINE),
+            (false, VK_ESCAPE) => self.tool.map(|kind| match kind {
+                MarkKind::Highlight => HIGHLIGHT,
+                MarkKind::Underline => UNDERLINE,
+            }),
             (true, VK_ADD | VK_OEM_PLUS) => Some(LARGER),
             (true, VK_SUBTRACT | VK_OEM_MINUS) => Some(SMALLER),
             (true, 0x30 | VK_NUMPAD0) => Some(FIT),
@@ -1025,15 +1117,8 @@ impl App {
     fn process(&mut self) {
         let mut msg = MSG::default();
         loop {
-            if let Some(rects) = VIEW.with_borrow_mut(|v| v.take_new_mark())
-                && self.highlighter
-                && !self.writing
-                && !rects.is_empty()
-            {
-                self.marks.push(Mark {
-                    page: self.page,
-                    rects,
-                });
+            while let Some(mark) = VIEW.with_borrow_mut(|v| v.take_new_mark()) {
+                self.marks.push(mark);
                 self.update_marks();
             }
             // Native file and certificate dialogs have nested message loops.
@@ -1045,6 +1130,13 @@ impl App {
                 break;
             }
             if msg.message == WM_KEYDOWN {
+                // Hand navigation and dismissal to the native color list.
+                let picker_key = msg.hwnd == self.ui.color
+                    && (unsafe { SendMessageW(self.ui.color, CB_GETDROPPEDSTATE, 0, 0) != 0 }
+                        || matches!(
+                            msg.wParam as u16,
+                            VK_LEFT | VK_RIGHT | VK_HOME | VK_END | VK_PRIOR | VK_NEXT
+                        ));
                 if msg.hwnd == self.ui.page_input {
                     if msg.wParam == VK_RETURN as usize {
                         self.jump_to_input();
@@ -1057,7 +1149,7 @@ impl App {
                         }
                         continue;
                     }
-                } else if let Some(id) = self.shortcut(msg.wParam) {
+                } else if !picker_key && let Some(id) = self.shortcut(msg.wParam) {
                     action(self.hwnd, id);
                     continue;
                 }

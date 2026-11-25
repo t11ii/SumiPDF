@@ -19,7 +19,7 @@ pub fn choose(hwnd: HWND, purpose: Purpose<'_>) -> Result<Option<PathBuf>, Strin
     let save = !matches!(purpose, Purpose::Open);
     let title = wide(match purpose {
         Purpose::SignedCopy(_) => "署名済みPDFを新しいファイルに保存",
-        Purpose::HighlightedCopy(_) => "ハイライト付きPDFを新しいファイルに保存",
+        Purpose::HighlightedCopy(_) => "注釈付きPDFを新しいファイルに保存",
         Purpose::Open => "PDFを開く",
     });
     let filter = wide("PDF ファイル (*.pdf)\0*.pdf\0");

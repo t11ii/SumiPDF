@@ -2,7 +2,7 @@
 mod fonts;
 mod standard;
 
-use crate::highlight::{PageGeometry, UnitRect, inherited};
+use crate::highlight::{Direction, PageGeometry, TextRun, UnitRect, inherited};
 use fonts::Font;
 use lopdf::{Dictionary, Document, Object, ObjectId, content::Content};
 use std::collections::HashMap;
@@ -62,14 +62,6 @@ struct Line {
     start: usize,
     bounds: UnitRect,
     direction: Direction,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum Direction {
-    Right,
-    Left,
-    Down,
-    Up,
 }
 
 fn union(a: UnitRect, b: UnitRect) -> UnitRect {
@@ -165,7 +157,7 @@ impl TextLayout {
         Some(line.start + n)
     }
 
-    pub fn range(&self, anchor: usize, x: f32, y: f32) -> Vec<UnitRect> {
+    pub fn range(&self, anchor: usize, x: f32, y: f32) -> Vec<TextRun> {
         if anchor >= self.glyphs.len() {
             return Vec::new();
         }
@@ -181,16 +173,19 @@ impl TextLayout {
                 break;
             }
             let end = self.end(i);
-            if first <= q.start && end <= last + 1 {
-                result.push(q.bounds);
+            let bounds = if first <= q.start && end <= last + 1 {
+                q.bounds
             } else {
-                result.extend(
-                    self.glyphs[first.max(q.start)..(last + 1).min(end)]
-                        .iter()
-                        .copied()
-                        .reduce(union),
-                );
-            }
+                self.glyphs[first.max(q.start)..(last + 1).min(end)]
+                    .iter()
+                    .copied()
+                    .reduce(union)
+                    .unwrap()
+            };
+            result.push(TextRun {
+                bounds,
+                direction: q.direction,
+            });
         }
         result
     }
