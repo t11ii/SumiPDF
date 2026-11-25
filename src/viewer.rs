@@ -1,0 +1,1158 @@
+mod canvas;
+mod dialog;
+mod save;
+mod worker;
+
+use crate::{highlight::Mark, wincrypto::SigningCertificate};
+use canvas::VIEW;
+use std::{
+    ffi::OsString,
+    mem::size_of,
+    os::windows::ffi::OsStringExt,
+    path::PathBuf,
+    ptr::{null, null_mut},
+    sync::mpsc::{self, Receiver, Sender},
+};
+use windows_sys::Win32::{
+    Foundation::*,
+    Graphics::Gdi::*,
+    System::{Com::*, LibraryLoader::GetModuleHandleW},
+    UI::{HiDpi::*, Input::KeyboardAndMouse::*, Shell::*, WindowsAndMessaging::*},
+};
+use worker::{Event, Job};
+
+const OPEN: usize = 101;
+const PREV: usize = 102;
+const NEXT: usize = 103;
+const SMALLER: usize = 104;
+const LARGER: usize = 105;
+const FIT: usize = 106;
+const SIGN: usize = 107;
+const HIGHLIGHT: usize = 108;
+const SAVE_MARKS: usize = 109;
+const PAGE: usize = 111;
+const STATUS: usize = 112;
+const PAGE_INPUT: usize = 113;
+const UNDO: usize = 114;
+const FIRST: usize = 121;
+const LAST: usize = 122;
+const LAYOUT: usize = 123;
+const DPI: usize = 124;
+const CLOSE: usize = 125;
+const END_JUMP: usize = 126;
+const RENDER_TIMER: usize = 1;
+const ACTION: u32 = WM_APP + 1;
+const READY: u32 = WM_APP + 2;
+const DROPPED: u32 = WM_APP + 3;
+const WHEEL: u32 = WM_APP + 4;
+const ZOOM_STEP: f64 = 1.25;
+const MIN_ZOOM: f64 = 0.5;
+const MAX_ZOOM: f64 = 8.0;
+const WINDOW: &str = "SumiPDF.Window";
+const CANVAS_ID: usize = 110;
+const CANVAS: &str = "SumiPDF.Page";
+
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain([0]).collect()
+}
+fn rect(hwnd: HWND) -> RECT {
+    let mut r = RECT::default();
+    unsafe {
+        GetClientRect(hwnd, &mut r);
+    }
+    r
+}
+fn dips(hwnd: HWND, value: i32) -> i32 {
+    let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96) as i32;
+    (value * dpi + 48) / 96
+}
+fn set_text(hwnd: HWND, s: &str) {
+    unsafe {
+        SetWindowTextW(hwnd, wide(s).as_ptr());
+    }
+}
+fn notice(hwnd: HWND, s: &str, error: bool) {
+    unsafe {
+        MessageBoxW(
+            hwnd,
+            wide(s).as_ptr(),
+            wide("SumiPDF").as_ptr(),
+            MB_OK
+                | if error {
+                    MB_ICONERROR
+                } else {
+                    MB_ICONINFORMATION
+                },
+        );
+    }
+}
+fn action(hwnd: HWND, id: usize) {
+    unsafe {
+        PostMessageW(hwnd, ACTION, id, 0);
+    }
+}
+
+// Synchronous native calls (resizing, dialogs, capture) can re-enter this
+// procedure. Changes to the application model run only in the outer loop.
+unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    match msg {
+        WM_COMMAND => {
+            let id = w & 0xffff;
+            if id == PAGE_INPUT {
+                if w >> 16 == EN_KILLFOCUS as usize {
+                    action(hwnd, END_JUMP);
+                }
+            } else if w >> 16 == 0 {
+                action(hwnd, id);
+            }
+            0
+        }
+        WM_SIZE => {
+            if w != SIZE_MINIMIZED as usize {
+                Controls::layout(hwnd);
+                action(hwnd, LAYOUT);
+            }
+            0
+        }
+        WM_EXITSIZEMOVE => {
+            action(hwnd, DPI);
+            0
+        }
+        WM_DPICHANGED => {
+            let r = unsafe { &*(l as *const RECT) };
+            unsafe {
+                SetWindowPos(
+                    hwnd,
+                    null_mut(),
+                    r.left,
+                    r.top,
+                    r.right - r.left,
+                    r.bottom - r.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+            action(hwnd, DPI);
+            0
+        }
+        WM_GETMINMAXINFO => {
+            let info = unsafe { &mut *(l as *mut MINMAXINFO) };
+            info.ptMinTrackSize = POINT {
+                x: dips(hwnd, 680),
+                y: dips(hwnd, 290),
+            };
+            0
+        }
+        WM_CTLCOLORSTATIC => unsafe {
+            SetBkColor(w as HDC, GetSysColor(COLOR_WINDOW));
+            GetSysColorBrush(COLOR_WINDOW) as isize
+        },
+        WM_DROPFILES => {
+            unsafe {
+                PostMessageW(hwnd, DROPPED, w, 0);
+            }
+            0
+        }
+        // A native modal dialog may dispatch this queued message before the
+        // outer loop resumes. Release the shell's file-drop handle in that case.
+        DROPPED => {
+            unsafe {
+                DragFinish(w as HDROP);
+            }
+            0
+        }
+        WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+            unsafe {
+                PostMessageW(hwnd, WHEEL, w, msg as isize);
+            }
+            0
+        }
+        WM_CLOSE => {
+            action(hwnd, CLOSE);
+            0
+        }
+        WM_DESTROY => {
+            unsafe {
+                PostQuitMessage(0);
+            }
+            0
+        }
+        _ => unsafe { DefWindowProcW(hwnd, msg, w, l) },
+    }
+}
+
+fn register(name: &str, procedure: WNDPROC, background: HBRUSH) -> bool {
+    let name = wide(name);
+    let wc = WNDCLASSEXW {
+        cbSize: size_of::<WNDCLASSEXW>() as u32,
+        lpfnWndProc: procedure,
+        hInstance: unsafe { GetModuleHandleW(null()) },
+        hCursor: unsafe { LoadCursorW(null_mut(), IDC_ARROW) },
+        hIcon: unsafe { LoadIconW(null_mut(), IDI_APPLICATION) },
+        hbrBackground: background,
+        lpszClassName: name.as_ptr(),
+        ..Default::default()
+    };
+    unsafe { RegisterClassExW(&wc) != 0 }
+}
+
+fn child(parent: HWND, class: &str, caption: &str, id: usize, style: u32) -> Result<HWND, String> {
+    let hwnd = unsafe {
+        CreateWindowExW(
+            0,
+            wide(class).as_ptr(),
+            wide(caption).as_ptr(),
+            WS_VISIBLE | WS_CHILD | style,
+            0,
+            0,
+            1,
+            1,
+            parent,
+            id as HMENU,
+            GetModuleHandleW(null()),
+            null(),
+        )
+    };
+    if hwnd.is_null() {
+        Err(std::io::Error::last_os_error().to_string())
+    } else {
+        Ok(hwnd)
+    }
+}
+
+fn button(parent: HWND, text: &str, id: usize) -> Result<HWND, String> {
+    child(parent, "BUTTON", text, id, WS_TABSTOP)
+}
+
+struct Controls {
+    canvas: HWND,
+    open: HWND,
+    prev: HWND,
+    page: HWND,
+    page_input: HWND,
+    next: HWND,
+    smaller: HWND,
+    larger: HWND,
+    fit: HWND,
+    highlighter: HWND,
+    undo: HWND,
+    save: HWND,
+    sign: HWND,
+    status: HWND,
+    font: HFONT,
+    headline: HFONT,
+    font_dpi: u32,
+}
+
+impl Controls {
+    fn new(hwnd: HWND) -> Result<Self, String> {
+        let page_input = child(
+            hwnd,
+            "EDIT",
+            "",
+            PAGE_INPUT,
+            WS_BORDER | (ES_NUMBER | ES_CENTER) as u32,
+        )?;
+        unsafe {
+            ShowWindow(page_input, SW_HIDE);
+            SendMessageW(
+                page_input,
+                windows_sys::Win32::UI::Controls::EM_SETLIMITTEXT,
+                10,
+                0,
+            );
+        }
+        Ok(Self {
+            open: button(hwnd, "開く…", OPEN)?,
+            prev: button(hwnd, "前へ", PREV)?,
+            page: button(hwnd, "— / —", PAGE)?,
+            page_input,
+            next: button(hwnd, "次へ", NEXT)?,
+            smaller: button(hwnd, "縮小", SMALLER)?,
+            larger: button(hwnd, "拡大", LARGER)?,
+            fit: button(hwnd, "全体表示", FIT)?,
+            highlighter: child(
+                hwnd,
+                "BUTTON",
+                "蛍光ペン",
+                HIGHLIGHT,
+                WS_TABSTOP | (BS_CHECKBOX | BS_PUSHLIKE) as u32,
+            )?,
+            undo: button(hwnd, "元に戻す", UNDO)?,
+            save: button(hwnd, "注釈を保存…", SAVE_MARKS)?,
+            sign: button(hwnd, "電子署名…", SIGN)?,
+            canvas: child(hwnd, CANVAS, "", CANVAS_ID, 0)?,
+            status: child(
+                hwnd,
+                "STATIC",
+                "PDF を開いて閲覧・署名できます。",
+                STATUS,
+                0x4200,
+            )?, // SS_CENTERIMAGE | SS_PATHELLIPSIS
+            font: null_mut(),
+            headline: null_mut(),
+            font_dpi: 0,
+        })
+    }
+
+    fn fonts(&mut self, hwnd: HWND) {
+        let dpi = unsafe { GetDpiForWindow(hwnd) };
+        if !self.font.is_null() && dpi == self.font_dpi {
+            return;
+        }
+        self.font_dpi = dpi;
+        let make = |h: i32, weight: i32| unsafe {
+            CreateFontW(
+                -dips(hwnd, h),
+                0,
+                0,
+                0,
+                weight,
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET as u32,
+                0,
+                0,
+                CLEARTYPE_QUALITY as u32,
+                0,
+                wide("Yu Gothic UI").as_ptr(),
+            )
+        };
+        let old = (self.font, self.headline);
+        self.font = make(15, 400);
+        self.headline = make(25, 600);
+        VIEW.with_borrow_mut(|v| {
+            v.font = self.font;
+            v.headline = self.headline;
+        });
+        for c in [
+            self.open,
+            self.prev,
+            self.page,
+            self.page_input,
+            self.next,
+            self.smaller,
+            self.larger,
+            self.fit,
+            self.highlighter,
+            self.undo,
+            self.save,
+            self.sign,
+            self.status,
+        ] {
+            unsafe {
+                SendMessageW(c, WM_SETFONT, self.font as usize, 1);
+            }
+        }
+        unsafe {
+            DeleteObject(old.0 as _);
+            DeleteObject(old.1 as _);
+        }
+    }
+
+    fn layout(hwnd: HWND) {
+        let control = |id| unsafe { GetDlgItem(hwnd, id as i32) };
+        if control(STATUS).is_null() {
+            return;
+        }
+        let bounds = rect(hwnd);
+        let s = |n| dips(hwnd, n);
+        let compact = bounds.right < s(865);
+        let top = if compact { 91 } else { 50 };
+        let place = |w, x, y, width, height| unsafe {
+            SetWindowPos(
+                w,
+                null_mut(),
+                x,
+                y,
+                width,
+                height,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        };
+        for (w, x, width) in [
+            (control(OPEN), 10, 67),
+            (control(PREV), 87, 44),
+            (control(PAGE), 134, 72),
+            (control(NEXT), 209, 44),
+            (control(SMALLER), 263, 46),
+            (control(LARGER), 312, 46),
+            (control(FIT), 361, 77),
+        ] {
+            place(w, s(x), s(9), s(width), s(32));
+        }
+        let left = if compact {
+            s(10)
+        } else {
+            bounds.right - s(390)
+        };
+        let y = s(if compact { 50 } else { 9 });
+        for (id, x, width) in [(HIGHLIGHT, 0, 82), (UNDO, 85, 74), (SAVE_MARKS, 162, 100)] {
+            place(control(id), left + s(x), y, s(width), s(32));
+        }
+        place(control(SIGN), bounds.right - s(114), s(9), s(104), s(32));
+        place(control(PAGE_INPUT), s(134), s(12), s(72), s(26));
+        place(
+            control(CANVAS_ID),
+            0,
+            s(top),
+            bounds.right,
+            (bounds.bottom - s(top + 30)).max(1),
+        );
+        place(
+            control(STATUS),
+            s(12),
+            bounds.bottom - s(29),
+            (bounds.right - s(24)).max(1),
+            s(28),
+        );
+        canvas::redraw(control(CANVAS_ID));
+    }
+}
+impl Drop for Controls {
+    fn drop(&mut self) {
+        unsafe {
+            DeleteObject(self.font as _);
+            DeleteObject(self.headline as _);
+        }
+    }
+}
+
+struct App {
+    hwnd: HWND,
+    ui: Controls,
+    worker: Option<Sender<Job>>,
+    events: Sender<Event>,
+    receiver: Receiver<Event>,
+    path: PathBuf,
+    document: Option<worker::OpenedDocument>,
+    revision: u64,
+    ticket: u64,
+    page: u32,
+    zoom: f64,
+    writing: bool,
+    wheel_delta: i32,
+    requested: Option<(u64, u32, (i32, i32), u64)>,
+    marks: Vec<Mark>,
+    saved_marks: Vec<Mark>,
+    highlighter: bool,
+    text_ready: bool,
+    has_text: bool,
+    text_worker: Option<Sender<worker::TextJob>>,
+}
+
+impl App {
+    fn new(hwnd: HWND) -> Result<Self, String> {
+        let (events, receiver) = mpsc::channel();
+        let mut ui = Controls::new(hwnd)?;
+        ui.fonts(hwnd);
+        Controls::layout(hwnd);
+        let app = Self {
+            hwnd,
+            ui,
+            worker: None,
+            events,
+            receiver,
+            path: PathBuf::new(),
+            document: None,
+            revision: 0,
+            ticket: 0,
+            page: 0,
+            zoom: 1.0,
+            writing: false,
+            wheel_delta: 0,
+            requested: None,
+            marks: Vec::new(),
+            saved_marks: Vec::new(),
+            highlighter: false,
+            text_ready: false,
+            has_text: false,
+            text_worker: None,
+        };
+        app.controls();
+        Ok(app)
+    }
+    fn page_count(&self) -> u32 {
+        self.document.as_ref().map_or(0, |d| d.pages)
+    }
+    fn controls(&self) {
+        for (c, enabled) in [
+            (self.ui.open, !self.writing),
+            (self.ui.page, self.page_count() > 0),
+            (self.ui.prev, self.page > 0),
+            (self.ui.next, self.page + 1 < self.page_count()),
+            (self.ui.fit, self.page_count() > 0),
+            (
+                self.ui.smaller,
+                self.page_count() > 0 && self.zoom > MIN_ZOOM,
+            ),
+            (
+                self.ui.larger,
+                self.page_count() > 0 && self.zoom < MAX_ZOOM,
+            ),
+            (self.ui.sign, self.page_count() > 0 && !self.writing),
+            (self.ui.highlighter, self.page_count() > 0 && !self.writing),
+            (self.ui.undo, !self.marks.is_empty() && !self.writing),
+            (
+                self.ui.save,
+                (!self.marks.is_empty() || !self.saved_marks.is_empty()) && !self.writing,
+            ),
+        ] {
+            unsafe {
+                EnableWindow(c, i32::from(enabled));
+            }
+        }
+        let text = if self.page_count() == 0 {
+            "— / —".into()
+        } else {
+            format!("{} / {}", self.page + 1, self.page_count())
+        };
+        set_text(self.ui.page, &text);
+        unsafe {
+            SendMessageW(
+                self.ui.highlighter,
+                BM_SETCHECK,
+                usize::from(self.highlighter),
+                0,
+            );
+        }
+    }
+    fn title(&self) {
+        let name = self.path.file_name().unwrap_or_default().to_string_lossy();
+        let star = if self.marks == self.saved_marks {
+            ""
+        } else {
+            " *"
+        };
+        set_text(self.hwnd, &format!("{name}{star}  —  SumiPDF"));
+    }
+    fn discard_ok(&self) -> bool {
+        self.marks == self.saved_marks
+            || unsafe {
+                MessageBoxW(
+                    self.hwnd,
+                    wide("ハイライトの変更がまだ保存されていません。変更を破棄して続けますか？")
+                        .as_ptr(),
+                    wide("SumiPDF").as_ptr(),
+                    MB_YESNO | MB_DEFBUTTON2 | MB_ICONQUESTION,
+                ) == IDYES
+            }
+    }
+    fn status(&self) {
+        if self.writing {
+            return;
+        }
+        let text = if self.highlighter && !self.text_ready {
+            "蛍光ペン  ·  文字の位置を読み込み中…".into()
+        } else if self.highlighter && !self.has_text {
+            "蛍光ペン  ·  ハイライトする範囲をドラッグ  ·  Esc で終了".into()
+        } else if self.highlighter {
+            "蛍光ペン  ·  文字をドラッグして選択  ·  Esc で終了".into()
+        } else if self.zoom == 1.0 {
+            "ページ全体  ·  ホイールでページ移動".into()
+        } else {
+            let help = if self.zoom < 1.0 {
+                "ホイールでページ移動"
+            } else {
+                "ドラッグで移動"
+            };
+            format!("全体表示の {:.0}%  ·  {help}", self.zoom * 100.0)
+        };
+        set_text(self.ui.status, &text);
+    }
+    fn update_marks(&self) {
+        VIEW.with_borrow_mut(|v| v.set_marks(&self.marks, self.page));
+        canvas::redraw(self.ui.canvas);
+        self.title();
+        self.controls();
+        self.status();
+    }
+    fn release_text(&self) {
+        if let Some(worker) = &self.text_worker {
+            let _ = worker.send(worker::TextJob::Release);
+        }
+    }
+    fn request_text(&mut self) -> Result<(), String> {
+        self.text_ready = false;
+        self.has_text = false;
+        VIEW.with_borrow_mut(|v| {
+            v.set_tool(false);
+            v.set_text_layout(None);
+        });
+        self.status();
+        if !self.highlighter {
+            self.release_text();
+            return Ok(());
+        }
+        let Some(doc) = &self.document else {
+            return Ok(());
+        };
+        let source = doc.source.as_ref().map_err(Clone::clone)?.clone();
+        if self.text_worker.is_none() {
+            let (tx, rx) = mpsc::channel();
+            let events = self.events.clone();
+            let hwnd = self.hwnd as usize;
+            std::thread::Builder::new()
+                .name("pdf-text".into())
+                .spawn(move || worker::text_pages(hwnd, rx, events))
+                .map_err(|e| e.to_string())?;
+            self.text_worker = Some(tx);
+        }
+        self.text_worker
+            .as_ref()
+            .unwrap()
+            .send(worker::TextJob::Page {
+                revision: self.revision,
+                page: self.page,
+                source,
+            })
+            .map_err(|_| "文字位置を取得するスレッドが終了しました。".to_owned())
+    }
+    fn text_failed(&mut self, error: &str) {
+        self.highlighter = false;
+        self.release_text();
+        VIEW.with_borrow_mut(|v| {
+            v.set_tool(false);
+            v.set_text_layout(None);
+        });
+        self.controls();
+        self.status();
+        notice(self.hwnd, error, true);
+    }
+    fn jump_input(&self, show: bool) {
+        unsafe {
+            if show && self.page_count() > 0 {
+                set_text(self.ui.page_input, &(self.page + 1).to_string());
+                ShowWindow(self.ui.page, SW_HIDE);
+                ShowWindow(self.ui.page_input, SW_SHOW);
+                SetFocus(self.ui.page_input);
+                SendMessageW(
+                    self.ui.page_input,
+                    windows_sys::Win32::UI::Controls::EM_SETSEL,
+                    0,
+                    -1,
+                );
+            } else if IsWindowVisible(self.ui.page_input) != 0 {
+                ShowWindow(self.ui.page_input, SW_HIDE);
+                ShowWindow(self.ui.page, SW_SHOW);
+            }
+        }
+    }
+    fn jump_to_input(&mut self) {
+        let mut text = [0u16; 12];
+        let n = unsafe { GetWindowTextW(self.ui.page_input, text.as_mut_ptr(), text.len() as i32) };
+        match String::from_utf16_lossy(&text[..n as usize]).parse::<u32>() {
+            Ok(page) if (1..=self.page_count()).contains(&page) => {
+                self.jump_input(false);
+                self.page_to(page - 1);
+                unsafe {
+                    SetFocus(self.hwnd);
+                }
+            }
+            _ => {
+                set_text(
+                    self.ui.status,
+                    &format!(
+                        "1 ～ {} のページ番号を入力してください。",
+                        self.page_count()
+                    ),
+                );
+                unsafe {
+                    SendMessageW(
+                        self.ui.page_input,
+                        windows_sys::Win32::UI::Controls::EM_SETSEL,
+                        0,
+                        -1,
+                    );
+                }
+            }
+        }
+    }
+    fn reset_canvas(&self, text: &str) {
+        VIEW.with_borrow_mut(|v| {
+            v.reset(false, text);
+            v.zoom = self.zoom;
+            v.set_marks(&self.marks, self.page);
+        });
+        canvas::redraw(self.ui.canvas);
+    }
+    fn open(&mut self, path: PathBuf) {
+        if self.writing || !self.discard_ok() {
+            return;
+        }
+        self.jump_input(false);
+        let path = match std::path::absolute(path) {
+            Ok(p) => p,
+            Err(e) => {
+                notice(self.hwnd, &e.to_string(), true);
+                return;
+            }
+        };
+        if self.worker.is_none() {
+            let (tx, rx) = mpsc::channel();
+            let events = self.events.clone();
+            let hwnd = self.hwnd as usize;
+            if let Err(e) = std::thread::Builder::new()
+                .name("pdf-render".into())
+                .spawn(move || worker::run(hwnd, rx, events))
+            {
+                notice(self.hwnd, &e.to_string(), true);
+                return;
+            }
+            self.worker = Some(tx);
+        }
+        self.revision += 1;
+        self.ticket += 1;
+        self.document = None;
+        self.marks.clear();
+        self.saved_marks.clear();
+        self.highlighter = false;
+        self.text_ready = false;
+        self.has_text = false;
+        self.release_text();
+        VIEW.with_borrow_mut(|v| v.set_tool(false));
+        self.requested = None;
+        self.path = path;
+        self.page = 0;
+        self.zoom = 1.0;
+        self.wheel_delta = 0;
+        self.title();
+        self.reset_canvas("PDF を開いています…");
+        set_text(self.ui.status, "PDF を開いています…");
+        self.controls();
+        self.send(Job::Open {
+            revision: self.revision,
+            path: self.path.clone(),
+        });
+    }
+    fn send(&self, job: Job) {
+        if let Some(w) = &self.worker
+            && w.send(job).is_err()
+        {
+            notice(
+                self.hwnd,
+                "描画スレッドが終了しました。アプリを再起動してください。",
+                true,
+            );
+        }
+    }
+    fn render(&mut self) {
+        if self.page_count() == 0 {
+            return;
+        }
+        let area = canvas::area(self.ui.canvas);
+        let key = (self.revision, self.page, area, self.zoom.to_bits());
+        if self.requested == Some(key) {
+            return;
+        }
+        self.requested = Some(key);
+        self.ticket += 1;
+        self.send(Job::Render {
+            revision: self.revision,
+            ticket: self.ticket,
+            page: self.page,
+            area,
+            zoom: self.zoom,
+        });
+    }
+    fn page_to(&mut self, page: u32) {
+        if self.page_count() == 0 || self.page == page || page >= self.page_count() {
+            return;
+        }
+        self.page = page;
+        self.reset_canvas("ページを表示中…");
+        if self.highlighter
+            && let Err(e) = self.request_text()
+        {
+            self.text_failed(&e);
+        }
+        if !self.writing {
+            set_text(self.ui.status, "ページを表示中…");
+        }
+        self.controls();
+        self.render();
+    }
+    fn scale(&mut self, zoom: f64) {
+        if self.page_count() == 0 {
+            return;
+        }
+        let zoom = zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+        if self.zoom == zoom {
+            return;
+        }
+        self.zoom = zoom;
+        VIEW.with_borrow_mut(|v| {
+            v.zoom = zoom;
+            if zoom <= 1.0 {
+                v.center();
+            }
+        });
+        canvas::redraw(self.ui.canvas);
+        self.controls();
+        self.render();
+    }
+    fn save_copy(&mut self, signed: bool) -> Result<(), String> {
+        if self.writing || (!signed && self.marks.is_empty() && self.saved_marks.is_empty()) {
+            return Ok(());
+        }
+        let Some(doc) = &self.document else {
+            return Ok(());
+        };
+        let source = doc.source.as_ref().map_err(Clone::clone)?.clone();
+        let (cert, purpose) = if signed {
+            let Some(cert) = SigningCertificate::choose(self.hwnd)? else {
+                return Ok(());
+            };
+            (Some(cert), dialog::Purpose::SignedCopy(&self.path))
+        } else {
+            (None, dialog::Purpose::HighlightedCopy(&self.path))
+        };
+        let Some(path) = dialog::choose(self.hwnd, purpose)? else {
+            return Ok(());
+        };
+        let marks = self.marks.clone();
+        let events = self.events.clone();
+        let hwnd = self.hwnd as usize;
+        if self.text_ready {
+            self.release_text();
+        }
+        std::thread::Builder::new()
+            .name("pdf-save".into())
+            .spawn(move || {
+                let result = save::copy(&source, &marks, cert.as_ref(), &path).map(|_| path);
+                worker::report(hwnd, &events, Event::Saved { signed, result });
+            })
+            .map_err(|e| e.to_string())?;
+        self.writing = true;
+        VIEW.with_borrow_mut(|v| v.set_tool(false));
+        set_text(
+            self.ui.status,
+            if signed {
+                "署名しています…"
+            } else {
+                "ハイライトを保存しています…"
+            },
+        );
+        self.controls();
+        Ok(())
+    }
+    fn event(&mut self, event: Event) {
+        match event {
+            Event::Opened(id, result) if id == self.revision => match result {
+                Ok(document) => {
+                    self.document = Some(document);
+                    self.controls();
+                    self.render();
+                }
+                Err(e) => {
+                    self.reset_canvas("この PDF を開けませんでした。");
+                    set_text(self.ui.status, "読み込みエラー");
+                    notice(self.hwnd, &e, true);
+                }
+            },
+            Event::Painted(ticket, result) if ticket == self.ticket => match result {
+                Ok(bitmap) => {
+                    VIEW.with_borrow_mut(|v| {
+                        v.bitmap = Some(bitmap);
+                    });
+                    canvas::redraw(self.ui.canvas);
+                    self.status();
+                }
+                Err(e) => {
+                    VIEW.with_borrow_mut(|v| v.text = "このページを描画できません。".into());
+                    canvas::redraw(self.ui.canvas);
+                    set_text(self.ui.status, &e);
+                    self.requested = None;
+                }
+            },
+            Event::Layout {
+                revision,
+                page,
+                result,
+            } if revision == self.revision && page == self.page && self.highlighter => match result
+            {
+                Ok(layout) => {
+                    self.text_ready = true;
+                    self.has_text = !layout.is_empty();
+                    VIEW.with_borrow_mut(|v| {
+                        v.set_text_layout(Some(layout));
+                        v.set_tool(!self.writing);
+                    });
+                    self.status();
+                }
+                Err(e) => self.text_failed(&e),
+            },
+            Event::Saved { signed, result } => {
+                self.writing = false;
+                VIEW.with_borrow_mut(|v| v.set_tool(self.highlighter && self.text_ready));
+                self.controls();
+                match result {
+                    Ok(path) => {
+                        self.saved_marks.clone_from(&self.marks);
+                        self.title();
+                        self.controls();
+                        let what = if signed {
+                            "署名済みPDF"
+                        } else {
+                            "注釈付きPDF"
+                        };
+                        let s = format!("{what}を保存しました。\n{}", path.display());
+                        set_text(
+                            self.ui.status,
+                            &format!("保存しました  ·  {}", path.display()),
+                        );
+                        notice(self.hwnd, &s, false);
+                    }
+                    Err(e) => {
+                        set_text(self.ui.status, "PDFを保存できませんでした。");
+                        notice(self.hwnd, &e, true);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    fn command(&mut self, id: usize) -> Result<(), String> {
+        match id {
+            OPEN if !self.writing => {
+                if let Some(p) = dialog::choose(self.hwnd, dialog::Purpose::Open)? {
+                    self.open(p);
+                }
+            }
+            PREV => self.page_to(self.page.saturating_sub(1)),
+            NEXT => self.page_to(self.page + 1),
+            FIRST => self.page_to(0),
+            LAST => self.page_to(self.page_count().saturating_sub(1)),
+            SMALLER => self.scale(self.zoom / ZOOM_STEP),
+            LARGER => self.scale(self.zoom * ZOOM_STEP),
+            FIT => self.scale(1.0),
+            SIGN => self.save_copy(true)?,
+            SAVE_MARKS => self.save_copy(false)?,
+            HIGHLIGHT if !self.writing && self.page_count() > 0 => {
+                self.highlighter = !self.highlighter;
+                if let Err(e) = self.request_text() {
+                    self.text_failed(&e);
+                }
+                self.controls();
+                canvas::redraw(self.ui.canvas);
+            }
+            UNDO if !self.writing => {
+                if let Some(mark) = self.marks.pop() {
+                    self.page_to(mark.page);
+                    self.update_marks();
+                }
+            }
+            PAGE => self.jump_input(true),
+            END_JUMP => self.jump_input(false),
+            LAYOUT | DPI => {
+                if id == DPI {
+                    self.ui.fonts(self.hwnd);
+                    Controls::layout(self.hwnd);
+                }
+                if self.page_count() > 0 {
+                    unsafe {
+                        SetTimer(self.hwnd, RENDER_TIMER, 85, None);
+                    }
+                }
+            }
+            CLOSE if self.writing => {
+                notice(self.hwnd, "保存処理が終わるまでお待ちください。", false)
+            }
+            CLOSE if self.discard_ok() => unsafe {
+                DestroyWindow(self.hwnd);
+            },
+            _ => {}
+        }
+        Ok(())
+    }
+    fn wheel(&mut self, w: WPARAM, horizontal: bool) {
+        if self.page_count() == 0 {
+            return;
+        }
+        let delta = ((w >> 16) as i16) as i32;
+        let ctrl = w & 8 != 0;
+        if !ctrl && self.zoom > 1.0 {
+            let distance = delta * dips(self.hwnd, 60) / 120;
+            let (dx, dy) = if horizontal {
+                (-distance, 0)
+            } else if w & 4 != 0 {
+                (distance, 0)
+            } else {
+                (0, distance)
+            };
+            canvas::pan(self.ui.canvas, dx, dy);
+        } else if !horizontal {
+            self.wheel_delta += delta;
+            let ticks = self.wheel_delta / 120;
+            self.wheel_delta %= 120;
+            if ticks == 0 {
+                return;
+            }
+            if ctrl {
+                self.scale(self.zoom * ZOOM_STEP.powi(ticks.clamp(-16, 16)));
+            } else {
+                self.page_to(
+                    (i64::from(self.page) - i64::from(ticks))
+                        .clamp(0, i64::from(self.page_count() - 1)) as u32,
+                );
+            }
+        }
+    }
+    fn shortcut(&self, key: usize) -> Option<usize> {
+        let ctrl = unsafe { GetKeyState(VK_CONTROL as i32) } < 0;
+        let alt = unsafe { GetKeyState(VK_MENU as i32) } < 0;
+        if alt {
+            return None;
+        }
+        match (ctrl, key as u16) {
+            (true, 0x4F) => Some(OPEN),
+            (true, 0x47) => Some(PAGE),
+            (true, 0x53) if unsafe { GetKeyState(VK_SHIFT as i32) } < 0 => Some(SAVE_MARKS),
+            (true, 0x53) => Some(SIGN),
+            (true, 0x5A) => Some(UNDO),
+            (false, 0x48) => Some(HIGHLIGHT),
+            (false, VK_ESCAPE) if self.highlighter => Some(HIGHLIGHT),
+            (true, VK_ADD | VK_OEM_PLUS) => Some(LARGER),
+            (true, VK_SUBTRACT | VK_OEM_MINUS) => Some(SMALLER),
+            (true, 0x30 | VK_NUMPAD0) => Some(FIT),
+            (false, VK_PRIOR | VK_LEFT) => Some(PREV),
+            (false, VK_NEXT | VK_RIGHT) => Some(NEXT),
+            (false, VK_HOME) => Some(FIRST),
+            (false, VK_END) => Some(LAST),
+            _ => None,
+        }
+    }
+    fn process(&mut self) {
+        let mut msg = MSG::default();
+        loop {
+            if let Some(rects) = VIEW.with_borrow_mut(|v| v.take_new_mark())
+                && self.highlighter
+                && !self.writing
+                && !rects.is_empty()
+            {
+                self.marks.push(Mark {
+                    page: self.page,
+                    rects,
+                });
+                self.update_marks();
+            }
+            // Native file and certificate dialogs have nested message loops.
+            // They may consume a wakeup, but never the actual worker event.
+            while let Ok(event) = self.receiver.try_recv() {
+                self.event(event);
+            }
+            if unsafe { GetMessageW(&mut msg, null_mut(), 0, 0) } <= 0 {
+                break;
+            }
+            if msg.message == WM_KEYDOWN {
+                if msg.hwnd == self.ui.page_input {
+                    if msg.wParam == VK_RETURN as usize {
+                        self.jump_to_input();
+                        continue;
+                    }
+                    if msg.wParam == VK_ESCAPE as usize {
+                        self.jump_input(false);
+                        unsafe {
+                            SetFocus(self.hwnd);
+                        }
+                        continue;
+                    }
+                } else if let Some(id) = self.shortcut(msg.wParam) {
+                    action(self.hwnd, id);
+                    continue;
+                }
+                if msg.wParam == VK_TAB as usize
+                    && unsafe { IsDialogMessageW(self.hwnd, &msg) } != 0
+                {
+                    continue;
+                }
+            }
+            match msg.message {
+                ACTION if msg.hwnd == self.hwnd => {
+                    if let Err(e) = self.command(msg.wParam) {
+                        notice(self.hwnd, &e, true);
+                    }
+                }
+                READY if msg.hwnd == self.hwnd => {}
+                WHEEL if msg.hwnd == self.hwnd => {
+                    self.wheel(msg.wParam, msg.lParam == WM_MOUSEHWHEEL as isize)
+                }
+                DROPPED if msg.hwnd == self.hwnd => {
+                    let drop = msg.wParam as HDROP;
+                    let len = unsafe { DragQueryFileW(drop, 0, null_mut(), 0) };
+                    let mut name = vec![0; len as usize + 1];
+                    let n = unsafe { DragQueryFileW(drop, 0, name.as_mut_ptr(), len + 1) };
+                    unsafe {
+                        DragFinish(drop);
+                    }
+                    if n > 0 {
+                        self.open(PathBuf::from(OsString::from_wide(&name[..n as usize])));
+                    }
+                }
+                WM_TIMER if msg.hwnd == self.hwnd && msg.wParam == RENDER_TIMER => {
+                    unsafe {
+                        KillTimer(self.hwnd, RENDER_TIMER);
+                    }
+                    self.render();
+                }
+                _ => unsafe {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                },
+            }
+        }
+    }
+}
+
+pub fn run() {
+    unsafe {
+        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+    let com = unsafe { CoInitializeEx(null(), COINIT_APARTMENTTHREADED as u32) };
+    let result = (|| {
+        if !register(WINDOW, Some(window_proc), unsafe {
+            GetSysColorBrush(COLOR_WINDOW)
+        }) || !register(CANVAS, Some(canvas::procedure), null_mut())
+        {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_CONTROLPARENT,
+                wide(WINDOW).as_ptr(),
+                wide("SumiPDF").as_ptr(),
+                WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                1000,
+                780,
+                null_mut(),
+                null_mut(),
+                GetModuleHandleW(null()),
+                null(),
+            )
+        };
+        if hwnd.is_null() {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let mut app = App::new(hwnd)?;
+        unsafe {
+            DragAcceptFiles(hwnd, 1);
+            ShowWindow(hwnd, SW_SHOW);
+            UpdateWindow(hwnd);
+        }
+        if let Some(path) = std::env::args_os().nth(1) {
+            app.open(path.into());
+        }
+        app.process();
+        Ok(())
+    })();
+    if let Err(e) = result {
+        notice(null_mut(), &e, true);
+    }
+    if com >= 0 {
+        unsafe {
+            CoUninitialize();
+        }
+    }
+}
