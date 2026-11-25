@@ -54,6 +54,7 @@ const ZOOM_STEP: f64 = 1.25;
 const MIN_ZOOM: f64 = 0.5;
 const MAX_ZOOM: f64 = 8.0;
 const WINDOW: &str = "SumiPDF.Window";
+const APP_ICON: *const u16 = 201 as *const u16; // Icon resource ID in assets/app.rc.
 const CANVAS_ID: usize = 110;
 const CANVAS: &str = "SumiPDF.Page";
 
@@ -191,12 +192,13 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
 
 fn register(name: &str, procedure: WNDPROC, background: HBRUSH) -> bool {
     let name = wide(name);
+    let instance = unsafe { GetModuleHandleW(null()) };
     let wc = WNDCLASSEXW {
         cbSize: size_of::<WNDCLASSEXW>() as u32,
         lpfnWndProc: procedure,
-        hInstance: unsafe { GetModuleHandleW(null()) },
+        hInstance: instance,
         hCursor: unsafe { LoadCursorW(null_mut(), IDC_ARROW) },
-        hIcon: unsafe { LoadIconW(null_mut(), IDI_APPLICATION) },
+        hIcon: unsafe { LoadIconW(instance, APP_ICON) },
         hbrBackground: background,
         lpszClassName: name.as_ptr(),
         ..Default::default()

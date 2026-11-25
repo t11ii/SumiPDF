@@ -1,12 +1,15 @@
 [package]
 name = "sumi-pdf"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 publish = false
 
 [[bin]]
 name = "SumiPDF"
 path = "src/main.rs"
+
+[build-dependencies]
+embed-resource = "3.0"
 
 [dependencies]
 lopdf = { version = "0.47", default-features = false }
