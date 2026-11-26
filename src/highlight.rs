@@ -199,6 +199,10 @@ fn page_box(doc: &Document, object: &Object) -> Result<Bounds, String> {
 }
 
 impl PageGeometry {
+    pub(crate) fn rotation(self) -> i64 {
+        self.rotation
+    }
+
     pub(crate) fn from_page(doc: &Document, page: ObjectId) -> Result<Self, String> {
         let media = inherited(doc, page, b"MediaBox")?.ok_or("PDFのページ寸法がありません。")?;
         let media = page_box(doc, media)?;
@@ -237,7 +241,7 @@ impl PageGeometry {
         }
     }
 
-    fn pdf_point(self, s: f32, t: f32) -> (f32, f32) {
+    pub(crate) fn pdf_point(self, s: f32, t: f32) -> (f32, f32) {
         let (u, v) = match self.rotation {
             90 => (t, s),
             180 => (1.0 - s, t),
@@ -357,31 +361,7 @@ pub fn annotate(input: Vec<u8>, marks: &[Mark]) -> Result<Vec<u8>, String> {
         revision.new_document.set_object(id, page);
     }
 
-    // The blend mode in the appearance stream requires PDF 1.4. Existing
-    // higher catalog versions continue to take precedence over older headers.
-    let prev = revision.get_prev_documents();
-    if matches!(prev.version.as_str(), "1.0" | "1.1" | "1.2" | "1.3") {
-        let id = prev
-            .trailer
-            .get(b"Root")
-            .and_then(Object::as_reference)
-            .map_err(pdf_error)?;
-        let mut catalog = prev.get_dictionary(id).map_err(pdf_error)?.clone();
-        let version = catalog
-            .get(b"Version")
-            .ok()
-            .map(|_| {
-                catalog
-                    .get_deref(b"Version", prev)
-                    .and_then(Object::as_name)
-            })
-            .transpose()
-            .map_err(pdf_error)?;
-        if matches!(version, None | Some(b"1.0" | b"1.1" | b"1.2" | b"1.3")) {
-            catalog.set("Version", "1.4");
-            revision.new_document.set_object(id, catalog);
-        }
-    }
+    crate::pdfseal::require_transparency(&mut revision)?;
     let mut result = Vec::new();
     result
         .try_reserve_exact(

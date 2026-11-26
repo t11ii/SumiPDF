@@ -17,6 +17,8 @@ public static class SumiSmoke {
     public static extern IntPtr GetDlgItem(IntPtr parent, int id);
     [DllImport("user32.dll")]
     public static extern bool IsWindowEnabled(IntPtr window);
+    [DllImport("user32.dll")]
+    public static extern bool IsWindowVisible(IntPtr window);
     [StructLayout(LayoutKind.Sequential)]
     struct Rect { public int Left, Top, Right, Bottom; }
     [DllImport("user32.dll", SetLastError=true)]
@@ -55,13 +57,13 @@ public static class SumiSmoke {
     public static void Click(IntPtr window, int id) {
         Post(GetDlgItem(window, id), 0x00F5, 0, IntPtr.Zero); // BM_CLICK
     }
-    public static void PickColor(IntPtr window, uint index) {
-        var picker = GetDlgItem(window, 116);
+    public static void Pick(IntPtr window, int id, uint index) {
+        var picker = GetDlgItem(window, id);
         UIntPtr selected;
         if (picker == IntPtr.Zero || SendMessageTimeoutW(picker, 0x014E, new UIntPtr(index),
             null, 2, 2000, out selected) == IntPtr.Zero || selected.ToUInt64() != index)
-            throw new InvalidOperationException("Could not select the annotation color.");
-        Post(window, 0x0111, (1u << 16) | 116u, picker); // WM_COMMAND / CBN_SELCHANGE
+            throw new InvalidOperationException("Could not select an item in control " + id);
+        Post(window, 0x0111, (1u << 16) | (uint)id, picker); // WM_COMMAND / CBN_SELCHANGE
     }
     static IntPtr Point(int x, int y) {
         return new IntPtr((y << 16) | (x & 0xffff));
@@ -93,10 +95,10 @@ function Write-TestPdf([string]$Path) {
     # Every inserted character is ASCII, so StringBuilder lengths are also byte offsets.
     $pdf = [Text.StringBuilder]::new("%PDF-1.4`n")
     $objects = @(
-        '<< /Type /Catalog /Pages 2 0 R >>'
+        '<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [8 0 R] >> >>'
         '<< /Type /Pages /Count 2 /Kids [3 0 R 4 0 R] >>'
         '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] /Resources << /Font << /F1 7 0 R >> >> /Contents 5 0 R >>'
-        '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] /Resources << >> /Contents 6 0 R >>'
+        '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] /Resources << >> /Contents 6 0 R /Annots [8 0 R] >>'
     )
     foreach ($drawing in @(
         "1 0 0 rg 0 0 150 150 re f`n0 g BT /F1 20 Tf 40 180 Td (Highlight me) Tj ET`n",
@@ -105,6 +107,7 @@ function Write-TestPdf([string]$Path) {
         $objects += "<< /Length $($drawing.Length) >>`nstream`n${drawing}endstream"
     }
     $objects += '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>'
+    $objects += '<< /Type /Annot /Subtype /Widget /FT /Sig /T (Approval) /P 4 0 R /F 4 /Rect [165 150 285 185] >>'
     $size = $objects.Count + 1
     $xref = [Text.StringBuilder]::new("xref`n0 $size`n0000000000 65535 f `n")
     for ($i = 0; $i -lt $objects.Count; $i++) {
@@ -158,6 +161,20 @@ function Wait-HighlightState([Diagnostics.Process]$Viewer, [IntPtr]$Window, [str
     throw "Expected '$ModeText', dirty $Dirty. Status '$status', title '$title', Save $save, Undo $undo."
 }
 
+function Wait-SignatureState([IntPtr]$Window, [string]$StatusText, [bool]$CanSave, [bool]$CanPickImage) {
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        $status = [SumiSmoke]::ReadText([SumiSmoke]::GetDlgItem($Window, 112))
+        $save = [SumiSmoke]::GetDlgItem($Window, 129)
+        $watermark = [SumiSmoke]::GetDlgItem($Window, 128)
+        if ($status.Contains($StatusText) -and [SumiSmoke]::IsWindowVisible($save) -and
+            ([SumiSmoke]::IsWindowEnabled($save) -eq $CanSave) -and
+            ([SumiSmoke]::IsWindowEnabled($watermark) -eq $CanPickImage)) { return }
+        Start-Sleep -Milliseconds 50
+    } while ($timer.Elapsed.TotalSeconds -lt 15)
+    throw "Expected signature status '$StatusText', save $CanSave, watermark $CanPickImage; saw '$status'."
+}
+
 $exe = (Resolve-Path -LiteralPath $Executable).Path
 $dir = Join-Path ([IO.Path]::GetTempPath()) ("SumiPDF-smoke-" + [Guid]::NewGuid().ToString('N'))
 $fixture = Join-Path $dir 'two pages.pdf'
@@ -165,6 +182,7 @@ $viewer = $null
 try {
     [void][IO.Directory]::CreateDirectory($dir)
     Write-TestPdf $fixture
+    & (Join-Path $PSScriptRoot 'signingCli.ps1') -Executable $exe -Pdf $fixture
     Write-Host "Release EXE size $((Get-Item -LiteralPath $exe).Length) bytes."
     # The first observation includes process launch. Both include polling latency.
     $timer = [Diagnostics.Stopwatch]::StartNew()
@@ -182,7 +200,7 @@ try {
     Wait-HighlightState $viewer $window '範囲をドラッグ' $false
     [SumiSmoke]::Click($window, 115)
     Wait-HighlightState $viewer $window '下線（黄）' $false
-    [SumiSmoke]::PickColor($window, 3)
+    [SumiSmoke]::Pick($window, 116, 3)
     Wait-HighlightState $viewer $window '下線（青）' $false
     [SumiSmoke]::DragOnPage($window, 300, 200, 0.62, 0.60, 0.30, 0.60)
     Wait-HighlightState $viewer $window '下線（青）' $true
@@ -205,8 +223,27 @@ try {
     Wait-HighlightState $viewer $window '下線（青）' $false
     [SumiSmoke]::DragOnPage($window, 200, 300, 0.56, 0.38, 0.22, 0.38)
     Wait-HighlightState $viewer $window '文字をドラッグ' $true
+    # Keep the pending underline while switching to signing. The existing empty field is on page 2.
+    [SumiSmoke]::Click($window, 107)
+    Wait-SignatureState $window '青枠が選択した署名欄' $true $true
+    if ([SumiSmoke]::ReadText([SumiSmoke]::GetDlgItem($window, 111)) -ne '2 / 2') {
+        throw 'Selecting the existing field did not navigate to its page.'
+    }
+    [SumiSmoke]::Pick($window, 127, 0)
+    Wait-SignatureState $window '枠の角から' $false $true
+    [SumiSmoke]::DragOnPage($window, 300, 200, 0.83, 0.35, 0.40, 0.15)
+    Wait-SignatureState $window 'ドラッグで描き直す' $true $true
+    [SumiSmoke]::Click($window, 102)
+    Wait-SignatureState $window '署名の位置は 2 ページ' $false $true
+    [SumiSmoke]::Pick($window, 127, 2)
+    Wait-SignatureState $window 'ページに表示しない電子署名' $true $false
+    [SumiSmoke]::Click($window, 130)
+    Wait-HighlightState $viewer $window 'ページ全体' $true
+    if ([SumiSmoke]::IsWindowVisible([SumiSmoke]::GetDlgItem($window, 129))) {
+        throw 'The signature toolbar remained visible after cancellation.'
+    }
     [SumiSmoke]::Click($window, 114)
-    Wait-HighlightState $viewer $window '文字をドラッグ' $false
+    Wait-HighlightState $viewer $window 'ページ全体' $false
     if (-not $viewer.CloseMainWindow() -or -not $viewer.WaitForExit(5000)) {
         throw 'The viewer did not close normally.'
     }

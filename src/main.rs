@@ -1,6 +1,10 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 #[cfg(any(windows, test))]
+mod appearance;
+#[cfg(any(windows, test))]
+mod cli;
+#[cfg(any(windows, test))]
 mod highlight;
 #[cfg(test)]
 mod highlight_roundtrip;
@@ -17,7 +21,47 @@ mod winpdf;
 
 #[cfg(windows)]
 fn main() {
-    viewer::run();
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if cli::is_command(args.first()) {
+        cli::attach_console();
+        if let Err(error) = cli::run(args) {
+            eprintln!("{}", serde_json::json!({"error": error}));
+            std::process::exit(1);
+        }
+    } else {
+        viewer::run();
+    }
+}
+
+#[cfg(any(windows, test))]
+fn write_new(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let folder = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let mut file = tempfile::NamedTempFile::new_in(folder)
+        .map_err(|e| format!("一時ファイルを作成できません。{e}"))?;
+    file.write_all(bytes)
+        .and_then(|()| file.as_file().sync_all())
+        .map_err(|e| format!("ファイルを書き込めません。{e}"))?;
+    file.persist_noclobber(path)
+        .map_err(|e| format!("新しい名前で保存できません。{e}"))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn read_watermark(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut data = Vec::new();
+    std::fs::File::open(path)
+        .and_then(|file| {
+            file.take(appearance::MAX_WATERMARK_BYTES as u64 + 1)
+                .read_to_end(&mut data)
+        })
+        .map_err(|e| format!("透かし画像を読み込めません。{e}"))?;
+    appearance::validate_watermark(&data)?;
+    Ok(data)
 }
 
 #[cfg(not(windows))]

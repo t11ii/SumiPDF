@@ -48,6 +48,362 @@ fn serialize(mut doc: Document, modern: bool) -> Vec<u8> {
     bytes
 }
 
+// Two pages, an indirect fields array, a field inheriting /FT from its parent,
+// and a separate widget on the second page. Preserve the intervening objects.
+fn nested_signature() -> (Document, ObjectId, ObjectId, ObjectId) {
+    let mut doc = document(true);
+    let first = doc.page_iter().next().unwrap();
+    let parent = doc
+        .get_dictionary(first)
+        .unwrap()
+        .get(b"Parent")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    let second = doc.add_object(dictionary! {
+        "Type" => "Page", "Parent" => parent,
+        "MediaBox" => vec![0.into(), 0.into(), 500.into(), 400.into()],
+        "CropBox" => vec![20.into(), 40.into(), 420.into(), 360.into()],
+        "Rotate" => 90, "Resources" => dictionary!{},
+    });
+    let root_field = doc.new_object_id();
+    let field = doc.new_object_id();
+    let widget = doc.add_object(dictionary! {
+        "Subtype" => "Widget", "Type" => "Annot", "Parent" => field,
+        "Rect" => vec![120.into(), 120.into(), 220.into(), 280.into()], "F" => 4, "P" => second,
+        "Contents" => Object::string_literal("existing widget"),
+    });
+    doc.set_object(
+        root_field,
+        dictionary! {
+            "FT" => "Sig", "T" => Object::string_literal("Approvals"), "Kids" => vec![field.into()]
+        },
+    );
+    doc.set_object(field, dictionary! {
+        "Parent" => root_field, "T" => Object::string_literal("Reviewer"), "Kids" => vec![widget.into()]
+    });
+    let pages = doc.get_dictionary_mut(parent).unwrap();
+    pages.set("Kids", vec![first.into(), second.into()]);
+    pages.set("Count", 2);
+    doc.get_dictionary_mut(second)
+        .unwrap()
+        .set("Annots", vec![widget.into()]);
+    let (form, _) = acroform(&doc).unwrap();
+    let fields = doc
+        .get_dictionary(form.unwrap())
+        .unwrap()
+        .get(b"Fields")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    doc.get_object_mut(fields)
+        .unwrap()
+        .as_array_mut()
+        .unwrap()
+        .push(root_field.into());
+    (doc, root_field, field, widget)
+}
+
+fn shape(object: &Object) -> Vec<f32> {
+    object
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o.as_float().unwrap())
+        .collect()
+}
+
+#[test]
+fn signs_only_the_selected_nested_field_and_its_separate_widget() {
+    let (mut doc, root_field, field_id, widget_id) = nested_signature();
+    doc.get_dictionary_mut(field_id)
+        .unwrap()
+        .set("TU", lopdf::text_string("品質保証責任者"));
+    let (form_id, form) = acroform(&doc).unwrap();
+    let original_fields = form.get(b"Fields").unwrap().clone();
+    let second = doc.page_iter().nth(1).unwrap();
+    let original = serialize(doc, true);
+    let inventory = inspect(&original).unwrap();
+    assert_eq!(inventory["pages"], 2);
+    let list = inventory["fields"].as_array().unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0]["name"], "Approvals.Reviewer");
+    assert_eq!(list[0]["tooltip"], "品質保証責任者");
+    assert_eq!(list[0]["page"], 2);
+    let target = Target::Field(list[0]["id"].as_str().unwrap().to_owned());
+    assert_eq!(
+        locate(&original, &target).unwrap(),
+        (2, [0.25, 0.25, 0.75, 0.5])
+    );
+    let signed = sign_visible(original.clone(), &target, "Test Signer", None, |_, _| {
+        Ok(vec![0x30])
+    })
+    .unwrap();
+    assert!(signed.starts_with(&original));
+    let parsed = Document::load_mem(&signed).unwrap();
+    let root = parsed.get_dictionary(root_field).unwrap();
+    let field = parsed.get_dictionary(field_id).unwrap();
+    let widget = parsed.get_dictionary(widget_id).unwrap();
+    assert!(!root.has(b"V") && !field.has(b"AP") && !widget.has(b"V"));
+    assert!(
+        field
+            .get_deref(b"V", &parsed)
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .has_type(b"Sig")
+    );
+    assert_eq!(
+        parsed
+            .get_dictionary(form_id.unwrap())
+            .unwrap()
+            .get(b"Fields")
+            .unwrap(),
+        &original_fields
+    );
+    assert_eq!(
+        array(&parsed, parsed.get_dictionary(second).unwrap(), b"Annots").unwrap(),
+        [widget_id.into()]
+    );
+    assert_eq!(
+        widget.get(b"Contents").unwrap().as_str().unwrap(),
+        b"existing widget"
+    );
+    let ap = widget
+        .get(b"AP")
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get_deref(b"N", &parsed)
+        .unwrap()
+        .as_stream()
+        .unwrap();
+    assert_eq!(shape(ap.dict.get(b"BBox").unwrap()), [0., 0., 160., 100.]);
+    assert_eq!(
+        shape(ap.dict.get(b"Matrix").unwrap()),
+        [0., 1., -1., 0., 100., 0.]
+    );
+}
+
+#[test]
+fn merged_fields_update_in_place_and_restricted_fields_are_never_offered() {
+    let (mut doc, parent, field, widget) = nested_signature();
+    let page = doc.page_iter().nth(1).unwrap();
+    let annotation = doc.get_dictionary(widget).unwrap().clone();
+    let merged = doc.get_dictionary_mut(field).unwrap();
+    merged.remove(b"Kids");
+    for key in [b"Type".as_slice(), b"Subtype", b"Rect", b"F", b"P"] {
+        merged.set(key, annotation.get(key).unwrap().clone());
+    }
+    let null = doc.add_object(Object::Null);
+    let merged = doc.get_dictionary_mut(field).unwrap();
+    merged.set("FT", "Sig");
+    merged.set("V", null);
+    doc.get_dictionary_mut(page)
+        .unwrap()
+        .set("Annots", vec![field.into()]);
+    let source = serialize(doc.clone(), false);
+    let listing = inspect(&source).unwrap();
+    let target = Target::Field(listing["fields"][0]["id"].as_str().unwrap().to_owned());
+    let signed = sign_visible(source, &target, "Reviewer", None, |_, _| Ok(vec![1])).unwrap();
+    let parsed = Document::load_mem(&signed).unwrap();
+    let merged = parsed.get_dictionary(field).unwrap();
+    assert!(merged.has(b"V") && merged.has(b"AP"));
+    for (id, key, value) in [
+        (parent, "Ff", Object::Integer(1)),
+        (parent, "Lock", dictionary! {}.into()),
+        (field, "SV", dictionary! {}.into()),
+        (field, "F", Object::Integer(32)),
+        (field, "F", Object::Integer(128)),
+        (field, "MK", dictionary! { "R" => 90 }.into()),
+        (field, "P", doc.page_iter().next().unwrap().into()),
+        (field, "Rect", vec![Object::Integer(0); 4].into()),
+    ] {
+        let mut restricted = doc.clone();
+        restricted.get_dictionary_mut(id).unwrap().set(key, value);
+        let bytes = serialize(restricted, false);
+        assert!(
+            inspect(&bytes).unwrap()["fields"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "{key}"
+        );
+        assert!(locate(&bytes, &target).is_err());
+        assert!(sign_visible(bytes, &target, "Reviewer", None, |_, _| panic!()).is_err());
+    }
+}
+
+#[test]
+fn new_visible_fields_follow_the_rendered_crop_at_all_quarter_turns() {
+    let unit = [0.125, 0.25, 0.625, 0.75];
+    for (rotation, rect, matrix, bbox) in [
+        (0, [70., 120., 270., 280.], None, [0., 0., 200., 160.]),
+        (
+            90,
+            [120., 80., 320., 240.],
+            Some([0., 1., -1., 0., 200., 0.]),
+            [0., 0., 160., 200.],
+        ),
+        (
+            180,
+            [170., 120., 370., 280.],
+            Some([-1., 0., 0., -1., 200., 160.]),
+            [0., 0., 200., 160.],
+        ),
+        (
+            270,
+            [120., 160., 320., 320.],
+            Some([0., -1., 1., 0., 0., 160.]),
+            [0., 0., 160., 200.],
+        ),
+    ] {
+        let (mut doc, ..) = nested_signature();
+        let page = doc.page_iter().nth(1).unwrap();
+        let parent = doc
+            .get_dictionary(page)
+            .unwrap()
+            .get(b"Parent")
+            .unwrap()
+            .as_reference()
+            .unwrap();
+        doc.get_dictionary_mut(page).unwrap().remove(b"Rotate");
+        doc.get_dictionary_mut(parent)
+            .unwrap()
+            .set("Rotate", rotation);
+        let original = serialize(doc, false);
+        let target = Target::Area {
+            page: 2,
+            rect: unit,
+        };
+        assert_eq!(locate(&original, &target).unwrap(), (2, unit));
+        let signed =
+            sign_visible(original, &target, "Test Signer", None, |_, _| Ok(vec![1])).unwrap();
+        let parsed = Document::load_mem(&signed).unwrap();
+        let annots = array(&parsed, parsed.get_dictionary(page).unwrap(), b"Annots").unwrap();
+        assert_eq!(annots.len(), 2);
+        let widget = parsed
+            .dereference(annots.last().unwrap())
+            .unwrap()
+            .1
+            .as_dict()
+            .unwrap();
+        assert_eq!(shape(widget.get(b"Rect").unwrap()), rect);
+        let ap = widget
+            .get(b"AP")
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get_deref(b"N", &parsed)
+            .unwrap()
+            .as_stream()
+            .unwrap();
+        assert_eq!(shape(ap.dict.get(b"BBox").unwrap()), bbox);
+        if let Some(matrix) = matrix {
+            assert_eq!(shape(ap.dict.get(b"Matrix").unwrap()), matrix);
+        } else if let Ok(identity) = ap.dict.get(b"Matrix") {
+            assert_eq!(shape(identity), [1., 0., 0., 1., 0., 0.]);
+        }
+    }
+}
+
+#[test]
+fn ambiguous_widgets_and_duplicate_terminal_names_cannot_be_selected() {
+    let (doc, parent, field, widget) = nested_signature();
+    let page = doc.page_iter().nth(1).unwrap();
+    let bytes = serialize(doc.clone(), false);
+    let listing = inspect(&bytes).unwrap();
+    let id = Target::Field(listing["fields"][0]["id"].as_str().unwrap().into());
+    for shared_terminal in [true, false] {
+        let mut doc = doc.clone();
+        let mut second = doc.get_dictionary(widget).unwrap().clone();
+        let second_id = doc.new_object_id();
+        if shared_terminal {
+            doc.get_dictionary_mut(field)
+                .unwrap()
+                .set("Kids", vec![widget.into(), second_id.into()]);
+        } else {
+            second.set("Parent", parent);
+            second.set("T", Object::string_literal("Reviewer"));
+            doc.get_dictionary_mut(parent)
+                .unwrap()
+                .set("Kids", vec![field.into(), second_id.into()]);
+        }
+        doc.set_object(second_id, second);
+        doc.get_dictionary_mut(page)
+            .unwrap()
+            .set("Annots", vec![widget.into(), second_id.into()]);
+        let bytes = serialize(doc, false);
+        assert_eq!(
+            inspect(&bytes).unwrap()["fields"].as_array().unwrap().len(),
+            0
+        );
+        assert!(sign_visible(bytes, &id, "Test", None, |_, _| panic!()).is_err());
+    }
+}
+
+#[test]
+fn a_transparent_signature_upgrades_an_older_catalog_and_keeps_its_new_form() {
+    let mut doc = document(false);
+    doc.version = "1.3".into();
+    let target = Target::Area {
+        page: 1,
+        rect: [0.0, 0.0, 0.8, 0.3],
+    };
+    let bytes = sign_visible(serialize(doc, false), &target, "Test", None, |_, _| {
+        Ok(vec![1])
+    })
+    .unwrap();
+    let parsed = Document::load_mem(&bytes).unwrap();
+    assert_eq!(
+        parsed
+            .catalog()
+            .unwrap()
+            .get(b"Version")
+            .unwrap()
+            .as_name()
+            .unwrap(),
+        b"1.4"
+    );
+    assert_eq!(
+        array(&parsed, &acroform(&parsed).unwrap().1, b"Fields")
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn new_field_name_accounts_for_anonymous_form_groups() {
+    let (mut doc, parent, child, _) = nested_signature();
+    doc.get_dictionary_mut(parent).unwrap().remove(b"T");
+    doc.get_dictionary_mut(child)
+        .unwrap()
+        .set("T", Object::string_literal("Signature2"));
+    let (_, form) = acroform(&doc).unwrap();
+    assert_eq!(
+        next_field_name(&doc, &array(&doc, &form, b"Fields").unwrap()).unwrap(),
+        "Signature3"
+    );
+}
+
+#[test]
+fn refuses_invalid_area_before_calling_the_provider() {
+    let bytes = serialize(document(false), false);
+    for (page, rect) in [
+        (0, [0., 0., 1., 1.]),
+        (2, [0., 0., 1., 1.]),
+        (1, [0., 0., 1., f32::NAN]),
+        (1, [0., 0., 1.1, 1.]),
+        (1, [0., 0.2, 0.8, 0.2]),
+        (1, [1., 1., 0., 0.]),
+    ] {
+        let target = Target::Area { page, rect };
+        assert!(locate(&bytes, &target).is_err());
+        assert!(sign_visible(bytes.clone(), &target, "Test", None, |_, _| panic!()).is_err());
+    }
+}
+
 #[test]
 fn covers_every_byte_except_contents_and_preserves_forms_and_pages() {
     for modern in [false, true] {
@@ -208,7 +564,7 @@ fn verify_with_openssl_and_poppler() {
     );
     let original = serialize(document(false), false);
     fs::write(dir.join("original.pdf"), &original).unwrap();
-    let signed = sign_pdf(original, |a, b| {
+    let signer = |a: &[u8], b: &[u8]| {
         fs::write(dir.join("content.bin"), [a, b].concat()).unwrap();
         run(
             dir,
@@ -232,8 +588,8 @@ fn verify_with_openssl_and_poppler() {
             ],
         );
         Ok(fs::read(dir.join("signature.der")).unwrap())
-    })
-    .unwrap();
+    };
+    let signed = sign_pdf(original, signer).unwrap();
     fs::write(dir.join("signed.pdf"), &signed).unwrap();
     let report = run(
         dir,
@@ -254,6 +610,20 @@ fn verify_with_openssl_and_poppler() {
         fs::read(dir.join("original.ppm")).unwrap(),
         fs::read(dir.join("signed.ppm")).unwrap()
     );
+    let (doc, ..) = nested_signature();
+    let unsigned = serialize(doc, true);
+    let fields = inspect(&unsigned).unwrap();
+    let target = Target::Field(fields["fields"][0]["id"].as_str().unwrap().into());
+    let approved = sign_visible(unsigned, &target, "SumiPDF Test", None, signer).unwrap();
+    fs::write(dir.join("approved.pdf"), approved).unwrap();
+    let report = run(
+        dir,
+        "pdfsig",
+        &["-nssdir", "sql:.", "-nocert", "approved.pdf"],
+    );
+    assert!(report.contains("Signature is Valid."), "{report}");
+    assert!(report.contains("Approvals.Reviewer"), "{report}");
+    assert!(report.contains("Total document signed"), "{report}");
     // Make one visible drawing coordinate differ, without changing offsets.
     let mut tampered = signed;
     let pos = tampered.windows(5).position(|s| s == b"80 60").unwrap();
@@ -266,4 +636,73 @@ fn verify_with_openssl_and_poppler() {
         .unwrap();
     let report = String::from_utf8_lossy(&check.stdout);
     assert!(report.contains("Digest Mismatch"), "{report}");
+}
+
+#[test]
+#[ignore = "requires pdftoppm"]
+fn renders_the_same_upright_stamp_at_all_page_rotations() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path();
+    let target = Target::Area {
+        page: 1,
+        rect: [0.125, 0.25, 0.875, 0.5],
+    };
+    let mut reference: Option<Vec<[u8; 3]>> = None;
+    for rotation in [0, 90, 180, 270] {
+        let mut doc = document(false);
+        let page_id = doc.page_iter().next().unwrap();
+        let page = doc.get_dictionary_mut(page_id).unwrap();
+        page.remove(b"Contents");
+        page.set("MediaBox", vec![0.into(), 0.into(), 400.into(), 400.into()]);
+        page.set(
+            "CropBox",
+            vec![30.into(), 40.into(), 350.into(), 360.into()],
+        );
+        page.set("Rotate", rotation);
+        let result = sign_visible(
+            serialize(doc, false),
+            &target,
+            "Test Signer",
+            None,
+            |_, _| Ok(vec![1]),
+        )
+        .unwrap();
+        fs::write(dir.join("test.pdf"), result).unwrap();
+        run(
+            dir,
+            "pdftoppm",
+            &["-cropbox", "-r", "72", "-singlefile", "test.pdf", "render"],
+        );
+        let ppm = fs::read(dir.join("render.ppm")).unwrap();
+        let (pixels, tail) = ppm
+            .strip_prefix(b"P6\n320 320\n255\n")
+            .unwrap()
+            .as_chunks::<3>();
+        assert!(tail.is_empty());
+        let mut ink = 0;
+        for (i, rgb) in pixels.iter().enumerate() {
+            if rgb.iter().any(|&channel| channel < 230) {
+                assert!(
+                    (40..280).contains(&(i % 320)) && (80..160).contains(&(i / 320)),
+                    "stamp escaped target at rotation {rotation}"
+                );
+                ink += 1;
+            }
+        }
+        assert!(ink > 100, "missing visible stamp at rotation {rotation}");
+        if let Some(first) = &reference {
+            // Different seconds on the on-stamp clock can change the last digits.
+            let changed = pixels
+                .iter()
+                .zip(first)
+                .filter(|(a, b)| a.iter().zip(b.iter()).any(|(v, w)| v.abs_diff(*w) > 20))
+                .count();
+            assert!(
+                changed <= ink / 10,
+                "{changed} different pixels at rotation {rotation}"
+            );
+        } else {
+            reference = Some(pixels.to_vec());
+        }
+    }
 }

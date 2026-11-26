@@ -1,6 +1,7 @@
 mod canvas;
 mod dialog;
 mod save;
+mod signing;
 mod worker;
 
 use crate::{
@@ -45,6 +46,10 @@ const LAYOUT: usize = 123;
 const DPI: usize = 124;
 const CLOSE: usize = 125;
 const END_JUMP: usize = 126;
+const SIGN_POSITION: usize = 127;
+const WATERMARK: usize = 128;
+const SIGN_SAVE: usize = 129;
+const SIGN_CANCEL: usize = 130;
 const RENDER_TIMER: usize = 1;
 const ACTION: u32 = WM_APP + 1;
 const READY: u32 = WM_APP + 2;
@@ -108,9 +113,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 if w >> 16 == EN_KILLFOCUS as usize {
                     action(hwnd, END_JUMP);
                 }
-            } else if id == COLOR {
+            } else if id == COLOR || id == SIGN_POSITION {
                 if matches!((w >> 16) as u32, CBN_SELCHANGE | CBN_CLOSEUP) {
-                    action(hwnd, COLOR);
+                    action(hwnd, id);
                 }
             } else if w >> 16 == 0 {
                 action(hwnd, id);
@@ -250,6 +255,10 @@ struct Controls {
     undo: HWND,
     save: HWND,
     sign: HWND,
+    position: HWND,
+    watermark: HWND,
+    sign_save: HWND,
+    sign_cancel: HWND,
     status: HWND,
     font: HFONT,
     headline: HFONT,
@@ -297,7 +306,7 @@ impl Controls {
                 0,
             );
         }
-        Ok(Self {
+        let ui = Self {
             open: button(hwnd, "開く…", OPEN)?,
             prev: button(hwnd, "前へ", PREV)?,
             page: button(hwnd, "— / —", PAGE)?,
@@ -324,6 +333,16 @@ impl Controls {
             undo: button(hwnd, "元に戻す", UNDO)?,
             save: button(hwnd, "注釈を保存…", SAVE_MARKS)?,
             sign: button(hwnd, "電子署名…", SIGN)?,
+            position: child(
+                hwnd,
+                "COMBOBOX",
+                "",
+                SIGN_POSITION,
+                WS_TABSTOP | CBS_DROPDOWNLIST as u32,
+            )?,
+            watermark: button(hwnd, "透かし：標準 ▾", WATERMARK)?,
+            sign_save: button(hwnd, "署名して保存…", SIGN_SAVE)?,
+            sign_cancel: button(hwnd, "キャンセル", SIGN_CANCEL)?,
             canvas: child(hwnd, CANVAS, "", CANVAS_ID, 0)?,
             status: child(
                 hwnd,
@@ -335,7 +354,20 @@ impl Controls {
             font: null_mut(),
             headline: null_mut(),
             font_dpi: 0,
-        })
+        };
+        ui.show_signing(false);
+        Ok(ui)
+    }
+
+    fn show_signing(&self, show: bool) {
+        for control in [
+            self.position,
+            self.watermark,
+            self.sign_save,
+            self.sign_cancel,
+        ] {
+            unsafe { ShowWindow(control, if show { SW_SHOW } else { SW_HIDE }) };
+        }
     }
 
     fn fonts(&mut self, hwnd: HWND) {
@@ -384,6 +416,10 @@ impl Controls {
             self.undo,
             self.save,
             self.sign,
+            self.position,
+            self.watermark,
+            self.sign_save,
+            self.sign_cancel,
             self.status,
         ] {
             unsafe {
@@ -404,7 +440,7 @@ impl Controls {
         let bounds = rect(hwnd);
         let s = |n| dips(hwnd, n);
         let compact = bounds.right < s(995);
-        let top = if compact { 91 } else { 50 };
+        let toolbar = if compact { 91 } else { 50 };
         let place = |w, x, y, width, height| unsafe {
             SetWindowPos(
                 w,
@@ -444,6 +480,27 @@ impl Controls {
         place(control(COLOR), left + s(137), y + s(4), s(81), s(140));
         place(control(SIGN), bounds.right - s(114), s(9), s(104), s(32));
         place(control(PAGE_INPUT), s(134), s(12), s(72), s(26));
+        let mut top = toolbar;
+        if unsafe { GetWindowLongW(control(SIGN_POSITION), GWL_STYLE) } as u32 & WS_VISIBLE != 0 {
+            let width = (bounds.right - s(363)).min(s(390)).max(s(160));
+            place(control(SIGN_POSITION), s(10), s(toolbar + 2), width, s(280));
+            place(control(WATERMARK), width + s(17), s(toolbar), s(123), s(32));
+            place(
+                control(SIGN_SAVE),
+                width + s(147),
+                s(toolbar),
+                s(108),
+                s(32),
+            );
+            place(
+                control(SIGN_CANCEL),
+                width + s(262),
+                s(toolbar),
+                s(87),
+                s(32),
+            );
+            top += 41;
+        }
         place(
             control(CANVAS_ID),
             0,
@@ -492,6 +549,8 @@ struct App {
     text_ready: bool,
     has_text: bool,
     text_worker: Option<Sender<worker::TextJob>>,
+    signing: Option<signing::Session>,
+    checking_fields: Option<u64>,
 }
 
 impl App {
@@ -522,6 +581,8 @@ impl App {
             text_ready: false,
             has_text: false,
             text_worker: None,
+            signing: None,
+            checking_fields: None,
         };
         app.controls();
         Ok(app)
@@ -530,6 +591,7 @@ impl App {
         self.document.as_ref().map_or(0, |d| d.pages)
     }
     fn controls(&self) {
+        let annotate = self.signing.is_none() && !self.writing;
         for (c, enabled) in [
             (self.ui.open, !self.writing),
             (self.ui.page, self.page_count() > 0),
@@ -544,14 +606,27 @@ impl App {
                 self.ui.larger,
                 self.page_count() > 0 && self.zoom < MAX_ZOOM,
             ),
-            (self.ui.sign, self.page_count() > 0 && !self.writing),
-            (self.ui.highlighter, self.page_count() > 0 && !self.writing),
-            (self.ui.underline, self.page_count() > 0 && !self.writing),
-            (self.ui.color, self.page_count() > 0 && !self.writing),
-            (self.ui.undo, !self.marks.is_empty() && !self.writing),
+            (self.ui.sign, self.page_count() > 0 && annotate),
+            (
+                self.ui.position,
+                self.signing.as_ref().is_some_and(|s| s.ready) && !self.writing,
+            ),
+            (
+                self.ui.watermark,
+                self.signing
+                    .as_ref()
+                    .is_some_and(|s| s.ready && !s.invisible())
+                    && !self.writing,
+            ),
+            (self.ui.sign_save, self.can_sign_here() && !self.writing),
+            (self.ui.sign_cancel, !self.writing),
+            (self.ui.highlighter, self.page_count() > 0 && annotate),
+            (self.ui.underline, self.page_count() > 0 && annotate),
+            (self.ui.color, self.page_count() > 0 && annotate),
+            (self.ui.undo, !self.marks.is_empty() && annotate),
             (
                 self.ui.save,
-                (!self.marks.is_empty() || !self.saved_marks.is_empty()) && !self.writing,
+                (!self.marks.is_empty() || !self.saved_marks.is_empty()) && annotate,
             ),
         ] {
             unsafe {
@@ -597,7 +672,9 @@ impl App {
         if self.writing {
             return;
         }
-        let text = if let Some(kind) = self.tool {
+        let text = if let Some(signing) = &self.signing {
+            signing.instructions(self.page)
+        } else if let Some(kind) = self.tool {
             let name = match kind {
                 MarkKind::Highlight => "蛍光ペン",
                 MarkKind::Underline => "下線",
@@ -778,6 +855,7 @@ impl App {
         self.revision += 1;
         self.ticket += 1;
         self.document = None;
+        self.end_signing();
         self.marks.clear();
         self.saved_marks.clear();
         self.tool = None;
@@ -835,6 +913,7 @@ impl App {
         }
         self.page = page;
         self.reset_canvas("ページを表示中…");
+        self.sync_signature();
         if self.tool.is_some()
             && let Err(e) = self.request_text()
         {
@@ -866,7 +945,12 @@ impl App {
         self.render();
     }
     fn save_copy(&mut self, signed: bool) -> Result<(), String> {
-        if self.writing || (!signed && self.marks.is_empty() && self.saved_marks.is_empty()) {
+        if self.writing
+            || (signed && !self.can_sign_here())
+            || (!signed
+                && (self.signing.is_some()
+                    || (self.marks.is_empty() && self.saved_marks.is_empty())))
+        {
             return Ok(());
         }
         let Some(doc) = &self.document else {
@@ -885,6 +969,7 @@ impl App {
             return Ok(());
         };
         let marks = self.marks.clone();
+        let appearance = self.signing.as_ref().and_then(signing::Session::appearance);
         let events = self.events.clone();
         let hwnd = self.hwnd as usize;
         if self.text_ready {
@@ -893,12 +978,14 @@ impl App {
         std::thread::Builder::new()
             .name("pdf-save".into())
             .spawn(move || {
-                let result = save::copy(&source, &marks, cert.as_ref(), &path).map(|_| path);
+                let signature = cert.as_ref().map(|cert| (cert, appearance.as_ref()));
+                let result = save::copy(&source, &marks, signature, &path).map(|_| path);
                 worker::report(hwnd, &events, Event::Saved { signed, result });
             })
             .map_err(|e| e.to_string())?;
         self.writing = true;
         self.sync_canvas_tool();
+        self.sync_signature();
         set_text(
             self.ui.status,
             if signed {
@@ -931,6 +1018,9 @@ impl App {
                     });
                     canvas::redraw(self.ui.canvas);
                     self.status();
+                    if self.signing.is_some() {
+                        self.controls();
+                    }
                 }
                 Err(e) => {
                     VIEW.with_borrow_mut(|v| v.text = "このページを描画できません。".into());
@@ -955,12 +1045,28 @@ impl App {
                     Err(e) => self.text_failed(&e),
                 }
             }
+            Event::SignatureFields { revision, result }
+                if self.checking_fields == Some(revision) =>
+            {
+                self.checking_fields = None;
+                if revision == self.revision
+                    && self.signing.is_some()
+                    && let Err(e) = result.and_then(|fields| self.show_fields(fields))
+                {
+                    self.end_signing();
+                    notice(self.hwnd, &e, true);
+                }
+            }
             Event::Saved { signed, result } => {
                 self.writing = false;
                 self.sync_canvas_tool();
+                self.sync_signature();
                 self.controls();
                 match result {
                     Ok(path) => {
+                        if signed {
+                            self.end_signing();
+                        }
                         self.saved_marks.clone_from(&self.marks);
                         self.title();
                         self.controls();
@@ -999,9 +1105,15 @@ impl App {
             SMALLER => self.scale(self.zoom / ZOOM_STEP),
             LARGER => self.scale(self.zoom * ZOOM_STEP),
             FIT => self.scale(1.0),
-            SIGN => self.save_copy(true)?,
+            SIGN => self.begin_signing()?,
+            SIGN_POSITION if !self.writing => self.choose_position(),
+            WATERMARK if !self.writing => self.choose_watermark()?,
+            SIGN_SAVE => self.save_copy(true)?,
+            SIGN_CANCEL if !self.writing => self.end_signing(),
             SAVE_MARKS => self.save_copy(false)?,
-            HIGHLIGHT | UNDERLINE if !self.writing && self.page_count() > 0 => {
+            HIGHLIGHT | UNDERLINE
+                if !self.writing && self.signing.is_none() && self.page_count() > 0 =>
+            {
                 let kind = if id == HIGHLIGHT {
                     MarkKind::Highlight
                 } else {
@@ -1018,7 +1130,7 @@ impl App {
                 self.controls();
                 canvas::redraw(self.ui.canvas);
             }
-            COLOR if !self.writing && self.page_count() > 0 => {
+            COLOR if !self.writing && self.signing.is_none() && self.page_count() > 0 => {
                 let index = unsafe { SendMessageW(self.ui.color, CB_GETCURSEL, 0, 0) };
                 if let Some(&color) = MarkColor::ALL.get(index as usize) {
                     self.color = color;
@@ -1026,7 +1138,7 @@ impl App {
                     self.status();
                 }
             }
-            UNDO if !self.writing => {
+            UNDO if !self.writing && self.signing.is_none() => {
                 if let Some(mark) = self.marks.pop() {
                     self.page_to(mark.page);
                     self.update_marks();
@@ -1098,10 +1210,15 @@ impl App {
             (true, 0x4F) => Some(OPEN),
             (true, 0x47) => Some(PAGE),
             (true, 0x53) if unsafe { GetKeyState(VK_SHIFT as i32) } < 0 => Some(SAVE_MARKS),
-            (true, 0x53) => Some(SIGN),
+            (true, 0x53) => Some(if self.signing.is_some() {
+                SIGN_SAVE
+            } else {
+                SIGN
+            }),
             (true, 0x5A) => Some(UNDO),
             (false, 0x48) => Some(HIGHLIGHT),
             (false, 0x55) => Some(UNDERLINE),
+            (false, VK_ESCAPE) if self.signing.is_some() => Some(SIGN_CANCEL),
             (false, VK_ESCAPE) => self.tool.map(|kind| match kind {
                 MarkKind::Highlight => HIGHLIGHT,
                 MarkKind::Underline => UNDERLINE,
@@ -1123,6 +1240,15 @@ impl App {
                 self.marks.push(mark);
                 self.update_marks();
             }
+            if let Some((page, area)) = VIEW.with_borrow_mut(|v| v.take_signature())
+                && let Some(session) = &mut self.signing
+                && session.drawing()
+            {
+                session.drawn = Some((page, area));
+                self.sync_signature();
+                self.controls();
+                self.status();
+            }
             // Native file and certificate dialogs have nested message loops.
             // They may consume a wakeup, but never the actual worker event.
             while let Ok(event) = self.receiver.try_recv() {
@@ -1133,8 +1259,8 @@ impl App {
             }
             if msg.message == WM_KEYDOWN {
                 // Hand navigation and dismissal to the native color list.
-                let picker_key = msg.hwnd == self.ui.color
-                    && (unsafe { SendMessageW(self.ui.color, CB_GETDROPPEDSTATE, 0, 0) != 0 }
+                let picker_key = (msg.hwnd == self.ui.color || msg.hwnd == self.ui.position)
+                    && (unsafe { SendMessageW(msg.hwnd, CB_GETDROPPEDSTATE, 0, 0) != 0 }
                         || matches!(
                             msg.wParam as u16,
                             VK_LEFT | VK_RIGHT | VK_HOME | VK_END | VK_PRIOR | VK_NEXT

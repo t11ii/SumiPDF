@@ -1,6 +1,7 @@
 //! On-demand positions of painted PDF glyphs in display coordinates.
 mod fonts;
 mod standard;
+pub(crate) const HELVETICA_WIDTHS: &[u16; 95] = &standard::HELVETICA;
 
 use crate::highlight::{Direction, PageGeometry, TextRun, UnitRect, inherited};
 use fonts::Font;

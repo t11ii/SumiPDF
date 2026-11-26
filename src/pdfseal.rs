@@ -1,6 +1,8 @@
-//! Create an invisible PDF approval signature in an incremental revision.
+//! Create a PDF approval signature in an incremental revision.
 //! The callback signs exactly the two slices declared by /ByteRange.
-use lopdf::{Dictionary, Document, IncrementalDocument, Object, StringFormat, Writer};
+mod fields;
+
+use lopdf::{Dictionary, Document, IncrementalDocument, Object, ObjectId, StringFormat, Writer};
 use lopdf::{decode_text_string, dictionary};
 use memchr::memmem;
 use std::collections::HashSet;
@@ -12,6 +14,29 @@ const ALREADY_SIGNED: &str = "このPDFには既存の署名または証明に�
 const PLACEHOLDER_ERROR: &str = "PDFの署名領域を特定できませんでした。";
 const TOO_LARGE: &str = "署名済みPDFが4 GiBに達する文書には対応していません。";
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum Target {
+    Field(String),
+    /// One-based page and rectangle on the rendered crop, measured from its top left.
+    Area {
+        page: u32,
+        rect: [f32; 4],
+    },
+}
+
+pub fn inspect(input: &[u8]) -> Result<serde_json::Value, String> {
+    let doc = editable_document(input)?;
+    let (_, form) = acroform(&doc)?;
+    fields::inspect(&doc, &array(&doc, &form, b"Fields")?)
+}
+
+pub fn locate(input: &[u8], target: &Target) -> Result<(u32, [f32; 4]), String> {
+    let doc = editable_document(input)?;
+    let (_, form) = acroform(&doc)?;
+    let placement = fields::resolve(&doc, &array(&doc, &form, b"Fields")?, target)?;
+    Ok((placement.page, placement.unit))
+}
+
 pub(crate) fn pdf_error(error: impl std::fmt::Display) -> String {
     format!("PDFの構造を読み書きできませんでした。\n{error}")
 }
@@ -20,12 +45,44 @@ pub fn sign_pdf(
     input: Vec<u8>,
     signer: impl FnOnce(&[u8], &[u8]) -> Result<Vec<u8>, String>,
 ) -> Result<Vec<u8>, String> {
+    sign(input, None, signer)
+}
+
+struct Visible<'a> {
+    target: &'a Target,
+    name: &'a str,
+    watermark: Option<&'a [u8]>,
+}
+
+pub fn sign_visible(
+    input: Vec<u8>,
+    target: &Target,
+    name: &str,
+    watermark: Option<&[u8]>,
+    signer: impl FnOnce(&[u8], &[u8]) -> Result<Vec<u8>, String>,
+) -> Result<Vec<u8>, String> {
+    sign(
+        input,
+        Some(Visible {
+            target,
+            name,
+            watermark,
+        }),
+        signer,
+    )
+}
+
+fn sign(
+    input: Vec<u8>,
+    visible: Option<Visible<'_>>,
+    signer: impl FnOnce(&[u8], &[u8]) -> Result<Vec<u8>, String>,
+) -> Result<Vec<u8>, String> {
     let original_len = input.len();
     // lopdf serializes cross-reference offsets into u32 fields.
     if original_len.saturating_add(CMS_CAPACITY * 2) > u32::MAX as usize {
         return Err(TOO_LARGE.into());
     }
-    let (mut output, signature_body) = prepare_revision(input)?;
+    let (mut output, signature_body) = prepare_revision(input, visible)?;
     if output.len() > u32::MAX as usize {
         return Err(TOO_LARGE.into());
     }
@@ -92,25 +149,15 @@ pub(crate) fn editable_document(input: &[u8]) -> Result<Document, String> {
         return Err("PDFの相互参照が不完全なため、元の内容を保って編集できません。".into());
     }
     if doc.catalog().map_err(pdf_error)?.has(b"Perms")
-        || doc.objects.values().any(contains_signature)
+        || doc.objects.values().any(|o| contains_signature(&doc, o))
     {
         return Err(ALREADY_SIGNED.into());
     }
     Ok(doc)
 }
 
-fn prepare_revision(input: Vec<u8>) -> Result<(Vec<u8>, Vec<u8>), String> {
-    let doc = editable_document(&input)?;
-    let root_id = doc
-        .trailer
-        .get(b"Root")
-        .and_then(Object::as_reference)
-        .map_err(pdf_error)?;
-    let mut root = doc.get_dictionary(root_id).map_err(pdf_error)?.clone();
-    let page_id = doc.page_iter().next().ok_or("PDFにページがありません。")?;
-    let mut page = doc.get_dictionary(page_id).map_err(pdf_error)?.clone();
-    let mut annotations = array(&doc, &page, b"Annots")?;
-    let (existing_form_id, mut form) = match root.get(b"AcroForm").ok() {
+fn acroform(doc: &Document) -> Result<(Option<ObjectId>, Dictionary), String> {
+    let (id, form) = match doc.catalog().map_err(pdf_error)?.get(b"AcroForm").ok() {
         None | Some(Object::Null) => (None, Dictionary::new()),
         Some(object) => {
             let (id, form) = doc.dereference(object).map_err(pdf_error)?;
@@ -120,8 +167,52 @@ fn prepare_revision(input: Vec<u8>) -> Result<(Vec<u8>, Vec<u8>), String> {
     if form.has(b"XFA") {
         return Err("XFA形式のフォームへの署名には対応していません。".into());
     }
+    Ok((id, form))
+}
+
+/// Blend mode and image soft masks in annotation appearances require PDF 1.4.
+pub(crate) fn require_transparency(revision: &mut IncrementalDocument) -> Result<(), String> {
+    let original = revision.get_prev_documents();
+    if !matches!(original.version.as_str(), "1.0" | "1.1" | "1.2" | "1.3") {
+        return Ok(());
+    }
+    let catalog = original.catalog().map_err(pdf_error)?;
+    if catalog.has(b"Version") {
+        let version = catalog
+            .get_deref(b"Version", original)
+            .and_then(Object::as_name)
+            .map_err(pdf_error)?;
+        if !matches!(version, b"1.0" | b"1.1" | b"1.2" | b"1.3") {
+            return Ok(());
+        }
+    }
+    let root = original
+        .trailer
+        .get(b"Root")
+        .and_then(Object::as_reference)
+        .map_err(pdf_error)?;
+    revision
+        .opt_clone_object_to_new_document(root)
+        .map_err(pdf_error)?;
+    revision
+        .new_document
+        .get_dictionary_mut(root)
+        .map_err(pdf_error)?
+        .set("Version", "1.4");
+    Ok(())
+}
+
+fn prepare_revision(
+    input: Vec<u8>,
+    visible: Option<Visible<'_>>,
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let doc = editable_document(&input)?;
+    let (existing_form_id, mut form) = acroform(&doc)?;
     let mut fields = array(&doc, &form, b"Fields")?;
-    let field_name = next_field_name(&doc, &fields)?;
+    let placement = visible
+        .as_ref()
+        .map(|v| fields::resolve(&doc, &fields, v.target).map(|p| (v, p)))
+        .transpose()?;
     let flags = form
         .get(b"SigFlags")
         .ok()
@@ -132,7 +223,6 @@ fn prepare_revision(input: Vec<u8>) -> Result<(Vec<u8>, Vec<u8>), String> {
 
     let original_len = input.len();
     let mut revision = IncrementalDocument::create_from(input, doc);
-    let update = &mut revision.new_document;
     let now = OffsetDateTime::now_utc();
     let date = format!(
         "D:{:04}{:02}{:02}{:02}{:02}{:02}Z",
@@ -153,26 +243,66 @@ fn prepare_revision(input: Vec<u8>) -> Result<(Vec<u8>, Vec<u8>), String> {
     });
     let mut signature_body = Vec::new();
     Writer::write_object(&mut signature_body, &signature).map_err(pdf_error)?;
-    let signature_id = update.try_add_object(signature).map_err(pdf_error)?;
-    let field_id = update
-        .try_add_object(dictionary! {
-            "Type" => "Annot", "Subtype" => "Widget", "FT" => "Sig",
-            "Rect" => vec![Object::Integer(0); 4], "F" => 132,
-            "T" => Object::string_literal(field_name), "V" => signature_id, "P" => page_id,
-        })
+    let signature_id = revision
+        .new_document
+        .try_add_object(signature)
         .map_err(pdf_error)?;
-    annotations.push(field_id.into());
-    fields.push(field_id.into());
-    page.set("Annots", annotations);
-    form.set("Fields", fields);
-    form.set("SigFlags", flags | 3);
-    update.set_object(page_id, page);
-    if let Some(id) = existing_form_id {
-        update.set_object(id, form);
+    let new_widget = if let Some((visible, p)) = placement {
+        let appearance = visible_appearance(&mut revision.new_document, &p, visible, now)?;
+        if let Some((field, widget)) = p.existing {
+            fill_field(&mut revision, field, widget, signature_id, appearance)?;
+            None
+        } else {
+            Some(append_widget(
+                &mut revision,
+                &fields,
+                p.page_id,
+                p.rect.map(Object::Real).to_vec(),
+                signature_id,
+                Some(appearance),
+            )?)
+        }
     } else {
-        let id = update.try_add_object(form).map_err(pdf_error)?;
-        root.set("AcroForm", id);
-        update.set_object(root_id, root);
+        let page = revision
+            .get_prev_documents()
+            .page_iter()
+            .next()
+            .ok_or("PDFにページがありません。")?;
+        Some(append_widget(
+            &mut revision,
+            &fields,
+            page,
+            vec![Object::Integer(0); 4],
+            signature_id,
+            None,
+        )?)
+    };
+    if let Some(id) = new_widget {
+        fields.push(id.into());
+        form.set("Fields", fields);
+    }
+    form.set("SigFlags", flags | 3);
+    if let Some(id) = existing_form_id {
+        revision.new_document.set_object(id, form);
+    } else {
+        let root_id = revision
+            .get_prev_documents()
+            .trailer
+            .get(b"Root")
+            .and_then(Object::as_reference)
+            .map_err(pdf_error)?;
+        revision
+            .opt_clone_object_to_new_document(root_id)
+            .map_err(pdf_error)?;
+        let update = &mut revision.new_document;
+        let form_id = update.try_add_object(form).map_err(pdf_error)?;
+        update
+            .get_dictionary_mut(root_id)
+            .map_err(pdf_error)?
+            .set("AcroForm", form_id);
+    }
+    if visible.is_some() {
+        require_transparency(&mut revision)?;
     }
 
     // Leave headroom for the changed form, page and xref to avoid a
@@ -183,6 +313,105 @@ fn prepare_revision(input: Vec<u8>) -> Result<(Vec<u8>, Vec<u8>), String> {
         .map_err(|_| "署名に必要なメモリを確保できません。")?;
     revision.save_to(&mut output).map_err(pdf_error)?;
     Ok((output, signature_body))
+}
+
+fn fill_field(
+    revision: &mut IncrementalDocument,
+    field: ObjectId,
+    widget: ObjectId,
+    signature: ObjectId,
+    appearance: ObjectId,
+) -> Result<(), String> {
+    revision
+        .opt_clone_object_to_new_document(field)
+        .map_err(pdf_error)?;
+    revision
+        .opt_clone_object_to_new_document(widget)
+        .map_err(pdf_error)?;
+    let update = &mut revision.new_document;
+    update
+        .get_dictionary_mut(field)
+        .map_err(pdf_error)?
+        .set("V", signature);
+    let annot = update.get_dictionary_mut(widget).map_err(pdf_error)?;
+    annot.remove(b"AS");
+    annot.set("AP", dictionary! { "N" => appearance });
+    Ok(())
+}
+
+fn append_widget(
+    revision: &mut IncrementalDocument,
+    fields: &[Object],
+    page_id: ObjectId,
+    rect: Vec<Object>,
+    signature: ObjectId,
+    appearance: Option<ObjectId>,
+) -> Result<ObjectId, String> {
+    let doc = revision.get_prev_documents();
+    let field_name = next_field_name(doc, fields)?;
+    let mut page = doc.get_dictionary(page_id).map_err(pdf_error)?.clone();
+    let mut annotations = array(doc, &page, b"Annots")?;
+    let mut widget = dictionary! {
+        "Type" => "Annot", "Subtype" => "Widget", "FT" => "Sig",
+        "Rect" => rect, "F" => 132, "P" => page_id,
+        "T" => Object::string_literal(field_name), "V" => signature,
+    };
+    if let Some(id) = appearance {
+        widget.set("AP", dictionary! { "N" => id });
+    }
+    let update = &mut revision.new_document;
+    let field_id = update.try_add_object(widget).map_err(pdf_error)?;
+    annotations.push(field_id.into());
+    page.set("Annots", annotations);
+    update.set_object(page_id, page);
+    Ok(field_id)
+}
+
+fn visible_appearance(
+    update: &mut Document,
+    p: &fields::Placement,
+    visible: &Visible<'_>,
+    now: OffsetDateTime,
+) -> Result<ObjectId, String> {
+    let [left, bottom, right, top] = p.rect;
+    let (w, h) = (right - left, top - bottom);
+    let (width, height) = if p.rotation % 180 == 0 {
+        (w, h)
+    } else {
+        (h, w)
+    };
+    let date = format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+        now.year(),
+        now.month() as u8,
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second()
+    );
+    let id = crate::appearance::make(
+        update,
+        width,
+        height,
+        visible.name,
+        &date,
+        visible.watermark,
+    )?;
+    // The viewer rotates the whole page clockwise. Rotate local appearance
+    // coordinates back to default user space so the stamp stays upright.
+    let matrix = match p.rotation {
+        90 => [0., 1., -1., 0., w, 0.],
+        180 => [-1., 0., 0., -1., w, h],
+        270 => [0., -1., 1., 0., 0., h],
+        _ => return Ok(id),
+    };
+    update
+        .get_object_mut(id)
+        .and_then(Object::as_stream_mut)
+        .map_err(pdf_error)?
+        .dict
+        .set("Matrix", matrix.map(Object::Real).to_vec());
+    Ok(id)
 }
 
 pub(crate) fn array(doc: &Document, dict: &Dictionary, key: &[u8]) -> Result<Vec<Object>, String> {
@@ -196,16 +425,17 @@ pub(crate) fn array(doc: &Document, dict: &Dictionary, key: &[u8]) -> Result<Vec
     }
 }
 
-fn contains_signature(object: &Object) -> bool {
+fn contains_signature(doc: &Document, object: &Object) -> bool {
     match object {
-        Object::Array(items) => items.iter().any(contains_signature),
+        Object::Array(items) => items.iter().any(|o| contains_signature(doc, o)),
         Object::Dictionary(dict) => {
             dict.has_type(b"Sig")
                 || dict.has_type(b"DocTimeStamp")
                 || (dict.has(b"ByteRange") && dict.has(b"Contents"))
-                || (dict.get(b"FT").and_then(Object::as_name).ok() == Some(b"Sig")
-                    && dict.get(b"V").is_ok_and(|v| !v.is_null()))
-                || dict.iter().any(|(_, child)| contains_signature(child))
+                || (dict.get_deref(b"FT", doc).and_then(Object::as_name).ok() == Some(b"Sig")
+                    && dict.has(b"V")
+                    && !dict.get_deref(b"V", doc).is_ok_and(Object::is_null))
+                || dict.iter().any(|(_, child)| contains_signature(doc, child))
         }
         // References are visited when scanning the loaded indirect objects.
         _ => false,
@@ -214,17 +444,30 @@ fn contains_signature(object: &Object) -> bool {
 
 fn next_field_name(doc: &Document, fields: &[Object]) -> Result<String, String> {
     let mut names = HashSet::new();
-    for field in fields {
-        let dict = doc
-            .dereference(field)
-            .and_then(|(_, o)| o.as_dict())
-            .map_err(pdf_error)?;
+    let mut seen = HashSet::new();
+    let mut pending: Vec<_> = fields.iter().collect();
+    while let Some(field) = pending.pop() {
+        let (id, object) = doc.dereference(field).map_err(pdf_error)?;
+        if id.is_some_and(|id| !seen.insert(id)) {
+            continue;
+        }
+        let dict = object.as_dict().map_err(pdf_error)?;
         if dict.has(b"T") {
             let name = dict
                 .get_deref(b"T", doc)
                 .and_then(decode_text_string)
                 .map_err(pdf_error)?;
-            names.insert(name);
+            if !name.is_empty() {
+                names.insert(name);
+                continue;
+            }
+        }
+        // Descendants of an unnamed branch are also in the root namespace.
+        if dict.has(b"Kids") {
+            let kids = dict.get_deref(b"Kids", doc).map_err(pdf_error)?;
+            if !kids.is_null() {
+                pending.extend(kids.as_array().map_err(pdf_error)?);
+            }
         }
     }
     for number in 1..=names.len() + 1 {

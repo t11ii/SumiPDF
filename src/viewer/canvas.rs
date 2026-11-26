@@ -24,6 +24,7 @@ const RELEASE_IDLE_CAPTURE: u32 = WM_APP + 41;
 #[derive(Clone, Copy)]
 enum Drag {
     Pan((i32, i32)),
+    Signature((f32, f32)),
     Highlight {
         origin: (f32, f32),
         glyph: Option<usize>,
@@ -75,6 +76,10 @@ pub struct Canvas {
     marks: Vec<Mark>,
     preview: Vec<TextRun>,
     completed: VecDeque<Mark>,
+    draw_signature: bool,
+    signature: Option<UnitRect>,
+    signature_preview: Option<UnitRect>,
+    placed_signature: Option<(u32, UnitRect)>,
     pub font: HFONT,
     pub headline: HFONT,
 }
@@ -115,6 +120,18 @@ impl Canvas {
         }
     }
 
+    pub fn set_signature(&mut self, draw: bool, area: Option<UnitRect>) {
+        if self.draw_signature != draw || self.signature != area {
+            self.cancel_drag();
+            self.draw_signature = draw;
+            self.signature = area;
+        }
+    }
+
+    pub fn take_signature(&mut self) -> Option<(u32, UnitRect)> {
+        self.placed_signature.take()
+    }
+
     pub fn set_marks(&mut self, marks: &[Mark], page: u32) {
         self.page = page;
         self.marks.clear();
@@ -141,7 +158,8 @@ impl Canvas {
                 PostMessageW(self.capture_window, RELEASE_IDLE_CAPTURE, 0, 0);
             }
         }
-        if !self.preview.is_empty() {
+        let had_signature_preview = self.signature_preview.take().is_some();
+        if !self.preview.is_empty() || had_signature_preview {
             redraw(self.capture_window);
         }
         self.preview.clear();
@@ -170,7 +188,9 @@ impl Canvas {
 
     fn start_drag(&mut self, hwnd: HWND, point: (i32, i32)) -> bool {
         let page = self.layout(hwnd);
-        self.drag = if self.tool.is_some() && page.contains(point) {
+        self.drag = if self.draw_signature && page.contains(point) {
+            Some(Drag::Signature(page.normalized(point)))
+        } else if self.tool.is_some() && page.contains(point) {
             let origin = page.normalized(point);
             let glyph = self
                 .text_layout
@@ -188,6 +208,35 @@ impl Canvas {
     }
 
     fn update_preview(&mut self, hwnd: HWND, point: (i32, i32)) {
+        if let Some(Drag::Signature((x0, y0))) = self.drag {
+            let page = self.layout(hwnd);
+            if page.w <= 0 || page.h <= 0 {
+                return;
+            }
+            let (x, y) = page.normalized(point);
+            let minimum = dips(hwnd, 3) as f32;
+            let area = ((x - x0).abs() * page.w as f32 >= minimum
+                && (y - y0).abs() * page.h as f32 >= minimum)
+                .then_some(UnitRect {
+                    left: x.min(x0),
+                    top: y.min(y0),
+                    right: x.max(x0),
+                    bottom: y.max(y0),
+                });
+            if self.signature_preview != area {
+                for bounds in [
+                    self.signature_preview.or(self.signature),
+                    area.or(self.signature),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    unsafe { InvalidateRect(hwnd, &page.pixels(&bounds), 0) };
+                }
+                self.signature_preview = area;
+            }
+            return;
+        }
         let Some(Drag::Highlight { origin, glyph }) = self.drag else {
             return;
         };
@@ -386,6 +435,23 @@ fn paint(hwnd: HWND, state: &mut Canvas) {
                 SRCCOPY,
             );
             paint_highlights(dc, ps.rcPaint, page, state);
+            if let Some(area) = state.signature_preview.or(state.signature) {
+                let mut bounds = page.pixels(&area);
+                let brush = GetStockObject(DC_BRUSH) as HBRUSH;
+                SetDCBrushColor(dc, 0x00ab5419);
+                FrameRect(dc, &bounds, brush);
+                InflateRect(&mut bounds, -1, -1);
+                SetDCBrushColor(dc, 0x00ffffff);
+                FrameRect(dc, &bounds, brush);
+                InflateRect(&mut bounds, -1, -1);
+                SetDCBrushColor(dc, 0x00ab5419);
+                FrameRect(dc, &bounds, brush);
+                if bounds.right - bounds.left > dips(hwnd, 70)
+                    && bounds.bottom - bounds.top > dips(hwnd, 20)
+                {
+                    line(dc, state.font, 0x00ab5419, bounds, "電子署名の位置");
+                }
+            }
         } else {
             fill(dc, &bounds, 0x00f7f7f4);
             let cy = bounds.bottom / 2;
@@ -431,7 +497,9 @@ pub unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, w: WPARAM, l: LPAR
         WM_ERASEBKGND => 1,
         WM_SETCURSOR
             if (l as u16) == HTCLIENT as u16
-                && VIEW.with_borrow(|v| v.tool.is_some() && v.bitmap.is_some()) =>
+                && VIEW.with_borrow(|v| {
+                    (v.draw_signature || v.tool.is_some()) && v.bitmap.is_some()
+                }) =>
         {
             unsafe {
                 SetCursor(LoadCursorW(null_mut(), IDC_CROSS));
@@ -450,7 +518,7 @@ pub unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, w: WPARAM, l: LPAR
         WM_MOUSEMOVE => {
             let previous = VIEW.with_borrow_mut(|v| match &mut v.drag {
                 Some(Drag::Pan(p)) => Some(std::mem::replace(p, point)),
-                Some(Drag::Highlight { .. }) => {
+                Some(Drag::Highlight { .. } | Drag::Signature(_)) => {
                     v.update_preview(hwnd, point);
                     None
                 }
@@ -465,6 +533,12 @@ pub unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, w: WPARAM, l: LPAR
             let marked = VIEW.with_borrow_mut(|v| {
                 v.update_preview(hwnd, point);
                 v.drag = None;
+                if let Some(area) = v.signature_preview.take() {
+                    v.placed_signature = Some((v.page, area));
+                    v.signature = Some(area);
+                    redraw(hwnd);
+                    return true;
+                }
                 if v.preview.is_empty() {
                     return false;
                 }
@@ -498,7 +572,7 @@ pub unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, w: WPARAM, l: LPAR
         WM_CAPTURECHANGED | WM_CANCELMODE => {
             let preview = VIEW.with_borrow_mut(|v| {
                 v.drag = None;
-                let visible = !v.preview.is_empty();
+                let visible = v.signature_preview.take().is_some() || !v.preview.is_empty();
                 v.preview.clear();
                 visible
             });

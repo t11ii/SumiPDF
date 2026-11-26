@@ -10,20 +10,28 @@ use windows_sys::Win32::{Foundation::HWND, UI::Controls::Dialogs::*};
 
 pub enum Purpose<'a> {
     Open,
+    Watermark,
     SignedCopy(&'a Path),
     HighlightedCopy(&'a Path),
 }
 
 pub fn choose(hwnd: HWND, purpose: Purpose<'_>) -> Result<Option<PathBuf>, String> {
     let mut buffer = vec![0u16; 32768];
-    let save = !matches!(purpose, Purpose::Open);
+    let save = matches!(
+        purpose,
+        Purpose::SignedCopy(_) | Purpose::HighlightedCopy(_)
+    );
     let title = wide(match purpose {
         Purpose::SignedCopy(_) => "署名済みPDFを新しいファイルに保存",
         Purpose::HighlightedCopy(_) => "注釈付きPDFを新しいファイルに保存",
         Purpose::Open => "PDFを開く",
+        Purpose::Watermark => "電子署名の背景に使う PNG 画像を選択",
     });
-    let filter = wide("PDF ファイル (*.pdf)\0*.pdf\0");
-    let ext = wide("pdf");
+    let (filter, ext) = if matches!(purpose, Purpose::Watermark) {
+        (wide("PNG 画像 (*.png)\0*.png\0"), wide("png"))
+    } else {
+        (wide("PDF ファイル (*.pdf)\0*.pdf\0"), wide("pdf"))
+    };
     let mut directory = Vec::new();
     if let Purpose::SignedCopy(path) | Purpose::HighlightedCopy(path) = purpose {
         let mut name = path

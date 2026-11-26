@@ -95,9 +95,9 @@ fn windows_signs_the_viewed_pdf_and_preserves_existing_files() {
             let (source_path, target, taken) = (&source_path, &target, &taken);
             scope
                 .spawn(move || {
-                    copy(&source, &[], Some(&cert), target).unwrap();
-                    assert!(copy(&source, &[], Some(&cert), taken).is_err());
-                    assert!(copy(&source, &[], Some(&cert), source_path).is_err());
+                    copy(&source, &[], Some((&cert, None)), target).unwrap();
+                    assert!(copy(&source, &[], Some((&cert, None)), taken).is_err());
+                    assert!(copy(&source, &[], Some((&cert, None)), source_path).is_err());
                 })
                 .join()
                 .unwrap();
@@ -153,7 +153,7 @@ fn windows_reopens_visible_highlights_in_unsigned_and_signed_copies() {
     ];
     copy(&source, &marks, None, &annotated).unwrap();
     wincrypto::tests::with_test_certificate(|cert| {
-        copy(&source, &marks, Some(&cert), &signed).unwrap()
+        copy(&source, &marks, Some((&cert, None)), &signed).unwrap()
     });
     assert_eq!(fs::read(&input).unwrap(), original);
 
@@ -226,4 +226,107 @@ fn windows_reopens_visible_highlights_in_unsigned_and_signed_copies() {
         assert_eq!(pixel(&image, 96, 80), [255; 3]);
         assert_eq!(pixel(&image, 96, 94), [255, 0, 0]); // BGRA
     }
+}
+
+#[test]
+fn windows_signs_the_selected_field_with_a_custom_watermark_and_pending_markup() {
+    let _apartment = winpdf::initialize().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let source_path = dir.path().join("form.pdf");
+    let destination = dir.path().join("signed-form.pdf");
+    let mut form = Document::load_mem(&source_pdf()).unwrap();
+    let page = form.page_iter().next().unwrap();
+    let field = form.add_object(dictionary! {
+        "Type" => "Annot", "Subtype" => "Widget", "FT" => "Sig", "T" => Object::string_literal("Approval"),
+        "Rect" => vec![6.into(), 46.into(), 66.into(), 68.into()], "P" => page, "F" => 4,
+    });
+    form.get_object_mut(page)
+        .unwrap()
+        .as_dict_mut()
+        .unwrap()
+        .set("Annots", vec![Object::Reference(field)]);
+    form.catalog_mut().unwrap().set(
+        "AcroForm",
+        dictionary! { "Fields" => vec![Object::Reference(field)] },
+    );
+    let mut original = Vec::new();
+    form.save_to(&mut original).unwrap();
+    fs::write(&source_path, &original).unwrap();
+    let fields = crate::pdfseal::inspect(&original).unwrap();
+    let id = fields["fields"][0]["id"].as_str().unwrap();
+    let mut image = Vec::new();
+    let mut encoder = png::Encoder::new(&mut image, 1, 1);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder
+        .write_header()
+        .unwrap()
+        .write_image_data(&[255, 0, 0, 180])
+        .unwrap();
+    let appearance = super::Appearance {
+        target: crate::pdfseal::Target::Field(id.to_owned()),
+        watermark: Some(image.into()),
+    };
+    let doc = winpdf::Document::open_file(&source_path).unwrap();
+    let source = doc.signing_source().unwrap();
+    let mark = Mark {
+        page: 0,
+        style: MarkStyle::default(),
+        runs: vec![TextRun::horizontal(UnitRect {
+            left: 0.6,
+            top: 0.7,
+            right: 0.9,
+            bottom: 0.8,
+        })],
+    };
+    wincrypto::tests::with_test_certificate(|cert| {
+        copy(
+            &source,
+            &[mark],
+            Some((&cert, Some(&appearance))),
+            &destination,
+        )
+        .unwrap();
+    });
+    let bytes = fs::read(&destination).unwrap();
+    assert!(bytes.starts_with(&original));
+    assert_eq!(fs::read(&source_path).unwrap(), original);
+    check_saved_signature(&bytes);
+    let pdf = Document::load_mem(&bytes).unwrap();
+    let widget = pdf.get_object(field).unwrap().as_dict().unwrap();
+    assert!(
+        widget
+            .get_deref(b"V", &pdf)
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .has_type(b"Sig")
+    );
+    assert!(widget.has(b"AP"));
+    assert!(
+        pdf.get_page_annotations(page).unwrap().iter().any(|ann| ann
+            .get(b"Subtype")
+            .and_then(Object::as_name)
+            .ok()
+            == Some(b"Highlight"))
+    );
+    assert!(
+        pdf.objects
+            .values()
+            .any(|obj| obj.as_stream().is_ok_and(|s| s.dict.has(b"SMask")))
+    );
+    let before = doc.render_fit(0, (288, 288), 1.0).unwrap();
+    let after = winpdf::Document::open_file(&destination)
+        .unwrap()
+        .render_fit(0, (288, 288), 1.0)
+        .unwrap();
+    // Check only the interior of the widget, well above the highlight and page artwork.
+    let changed = (20..96).any(|y| {
+        let begin = (y * 288 + 28) * 4;
+        let end = (y * 288 + 260) * 4;
+        before.pixels[begin..end] != after.pixels[begin..end]
+    });
+    assert!(
+        changed,
+        "Windows did not render the populated signature field."
+    );
 }

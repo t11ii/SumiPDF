@@ -28,6 +28,10 @@ pub struct OpenedDocument {
 pub enum Event {
     Opened(u64, Result<OpenedDocument, String>),
     Painted(u64, Result<Bitmap, String>),
+    SignatureFields {
+        revision: u64,
+        result: Result<Vec<super::signing::Field>, String>,
+    },
     Saved {
         signed: bool,
         result: Result<PathBuf, String>,
