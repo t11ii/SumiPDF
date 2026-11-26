@@ -66,6 +66,14 @@ try {
     if (Test-Path $signed) { throw 'Hash mismatch produced a signed file' }
     $result = Invoke-SignCli ($signArgs + $first.sha256)
     if ($result.signer -ne $reviewerName -or $result.page -ne 2 -or $result.sha256 -ne (Get-FileHash $signed).Hash) { throw 'Second signature output mismatch' }
+    $signedPng = Join-Path $folder 'signed-page.png'
+    $preview = Invoke-SignCli @('--preview',$signed,'--page','2','--out',$signedPng)
+    $pageImage = [Drawing.Bitmap]::new($signedPng)
+    try {
+        if ($preview.sha256 -ne $result.sha256 -or $preview.width -ne $pageImage.Width -or $preview.height -ne $pageImage.Height) {
+            throw 'Signed page preview does not match its source or output dimensions'
+        }
+    } finally { $pageImage.Dispose() }
     $prefix = [IO.MemoryStream]::new([IO.File]::ReadAllBytes($signed), 0, [int](Get-Item $area).Length, $false)
     try {
         if ((Get-FileHash -InputStream $prefix).Hash -ne $first.sha256) { throw 'Second signer rewrote the first revision' }

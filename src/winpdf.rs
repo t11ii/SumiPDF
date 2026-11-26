@@ -29,8 +29,7 @@ use windows::{
     core::{AgileReference, Array, Error, HSTRING, Result as WinResult},
 };
 
-const MAX_EDGE: u32 = 8192;
-const MAX_PIXELS: u64 = 8 * 1024 * 1024;
+use crate::raster_size::{bitmap_size, decoded_size};
 
 /// WinRT initialization and shutdown must occur on the same thread.
 pub struct Apartment(PhantomData<Rc<()>>);
@@ -164,8 +163,9 @@ impl Document {
         let fit = (f64::from(area.0) / f64::from(size.Width))
             .min(f64::from(area.1) / f64::from(size.Height));
         let width = (f64::from(size.Width) * fit * zoom).round().max(1.0) as u32;
-        let (w, h) = bitmap_size(size, width);
-        rasterize(&page.0, w, h).map_err(|e| format!("ページを表示できませんでした。\n{e}"))
+        let (w, h) = bitmap_size(f64::from(size.Width), f64::from(size.Height), width);
+        rasterize(&page.0, w, h)
+            .map_err(|e| format!("{} ページを表示できませんでした。 {e}", index + 1))
     }
 }
 
@@ -189,19 +189,6 @@ fn checked_size(page: &PdfPage) -> Result<Size, String> {
     Ok(size)
 }
 
-fn bitmap_size(size: Size, requested_width: u32) -> (u32, u32) {
-    let width = f64::from(requested_width.clamp(1, MAX_EDGE));
-    let height = width * f64::from(size.Height) / f64::from(size.Width);
-    let scale = 1.0_f64
-        .min(f64::from(MAX_EDGE) / height)
-        .min((MAX_PIXELS as f64 / (width * height)).sqrt());
-    // Round down to stay within both caps. Even a very slender page gets one pixel.
-    (
-        (width * scale).floor().max(1.0) as u32,
-        (height * scale).floor().max(1.0) as u32,
-    )
-}
-
 fn rasterize(page: &PdfPage, width: u32, height: u32) -> WinResult<Bitmap> {
     let stream = InMemoryRandomAccessStream::new()?;
     let options = PdfPageRenderOptions::new()?;
@@ -210,29 +197,63 @@ fn rasterize(page: &PdfPage, width: u32, height: u32) -> WinResult<Bitmap> {
     options.SetBitmapEncoderId(BitmapEncoder::BmpEncoderId()?)?;
     page.RenderWithOptionsToStreamAsync(&stream, &options)?
         .join()?;
+    decode_page_bitmap(&stream, (width, height))
+}
+
+fn decode_page_bitmap(
+    stream: &InMemoryRandomAccessStream,
+    requested: (u32, u32),
+) -> WinResult<Bitmap> {
     stream.Seek(0)?;
-    let decoder = BitmapDecoder::CreateAsync(&stream)?.join()?;
-    let (actual_width, actual_height) = (decoder.PixelWidth()?, decoder.PixelHeight()?);
-    if actual_width != width || actual_height != height {
-        return Err(Error::new(
+    let decoder = BitmapDecoder::CreateAsync(stream)?.join()?;
+    let actual = (decoder.PixelWidth()?, decoder.PixelHeight()?);
+    let dimensions = || {
+        format!(
+            "要求 {}×{}、実画像 {}×{} px",
+            requested.0, requested.1, actual.0, actual.1
+        )
+    };
+    let (width, height) = decoded_size(requested, actual).ok_or_else(|| {
+        Error::new(
             E_UNEXPECTED,
-            "Windows が予期しない寸法のビットマップを返しました。",
-        ));
-    }
-    let data = decoder
-        .GetPixelDataTransformedAsync(
-            BitmapPixelFormat::Bgra8,
-            BitmapAlphaMode::Ignore,
-            &BitmapTransform::new()?,
-            ExifOrientationMode::IgnoreExifOrientation,
-            ColorManagementMode::DoNotColorManage,
-        )?
-        .join()?
-        .DetachPixelData()?;
+            format!("ページ画像の寸法がゼロです（{}）。", dimensions()),
+        )
+    })?;
+    let decode = || -> WinResult<Array<u8>> {
+        let transform = BitmapTransform::new()?;
+        if (width, height) != actual {
+            transform.SetScaledWidth(width)?;
+            transform.SetScaledHeight(height)?;
+        }
+        decoder
+            .GetPixelDataTransformedAsync(
+                BitmapPixelFormat::Bgra8,
+                BitmapAlphaMode::Ignore,
+                &transform,
+                ExifOrientationMode::IgnoreExifOrientation,
+                ColorManagementMode::DoNotColorManage,
+            )?
+            .join()?
+            .DetachPixelData()
+    };
+    let data = decode().map_err(|error| {
+        Error::new(
+            error.code(),
+            format!(
+                "ページ画像を展開できません（{}）。 {}",
+                dimensions(),
+                error.message()
+            ),
+        )
+    })?;
     if data.len() != (u64::from(width) * u64::from(height) * 4) as usize {
         return Err(Error::new(
             E_UNEXPECTED,
-            "Windows が不完全なビットマップを返しました。",
+            format!(
+                "ページ画像のデータ長が一致しません（{}、出力 {width}×{height} px、{} バイト）。",
+                dimensions(),
+                data.len()
+            ),
         ));
     }
     Ok(Bitmap {
@@ -248,32 +269,64 @@ mod tests {
     use std::io::Write;
 
     #[test]
-    fn bounds_large_and_extremely_tall_pages_before_rendering() {
-        for ratio in [0.0001, 0.1, 1.0, 1.5, 100.0, 1.0e30] {
-            let (w, h) = bitmap_size(
-                Size {
-                    Width: 1.0,
-                    Height: ratio,
-                },
-                u32::MAX,
-            );
-            assert!((1..=MAX_EDGE).contains(&w) && (1..=MAX_EDGE).contains(&h));
-            assert!(u64::from(w) * u64::from(h) <= MAX_PIXELS);
+    fn reads_the_real_bmp_rows_when_windows_returns_a_different_size() {
+        let _apartment = initialize().unwrap();
+        // The second BMP exceeds the edge limit but requires only 128 KiB of test pixels.
+        for (w, h, requested, expected) in [
+            (201, 100, (200, 100), (201, 100)),
+            (8193, 4, (4096, 3000), (4096, 1)),
+        ] {
+            let mut pixels = vec![255; (w * h * 4) as usize];
+            for row in pixels.chunks_exact_mut(w as usize * 4) {
+                row.as_chunks_mut::<4>().0[..w as usize / 2].fill([0, 0, 255, 255]);
+            }
+            let stream = InMemoryRandomAccessStream::new().unwrap();
+            let encoder =
+                BitmapEncoder::CreateAsync(BitmapEncoder::BmpEncoderId().unwrap(), &stream)
+                    .unwrap()
+                    .join()
+                    .unwrap();
+            encoder
+                .SetPixelData(
+                    BitmapPixelFormat::Bgra8,
+                    BitmapAlphaMode::Ignore,
+                    w,
+                    h,
+                    96.0,
+                    96.0,
+                    &pixels,
+                )
+                .unwrap();
+            encoder.FlushAsync().unwrap().join().unwrap();
+            drop(encoder);
+            let image = decode_page_bitmap(&stream, requested).unwrap();
+            assert_eq!((image.width, image.height), expected);
+            let stride = image.width as usize * 4;
+            assert_eq!(image.pixels.len(), stride * image.height as usize);
+            for row in image.pixels.chunks_exact(stride) {
+                assert_eq!(&row[..3], &[0, 0, 255]);
+                assert_eq!(&row[stride - 4..stride - 1], &[255, 255, 255]);
+            }
         }
     }
 
     #[test]
-    fn windows_renders_a_red_lower_left_quadrant_into_top_down_bgra() {
+    fn windows_renders_unsigned_graphics_and_text_only_a4_pages_at_fit_and_minimum_zoom() {
         let _apartment = initialize().unwrap();
-        let content = "1 0 0 rg 0 0 36 36 re f\n";
+        let content = "1 0 0 rg 0 0 297.64 420.945 re f\n";
+        let text = "BT /F1 36 Tf 64 700 Td (Text-only PDF) Tj ET\n";
         let objects = [
             "<< /Type /Catalog /Pages 2 0 R >>".to_owned(),
-            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_owned(),
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 72 72] /Resources << >> /Contents 4 0 R >>".to_owned(),
+            "<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 >>".to_owned(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595.28 841.89] /Resources << >> /Contents 4 0 R >>".to_owned(),
             format!("<< /Length {} >>\nstream\n{content}endstream", content.len()),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595.28 841.89] /Resources << /Font << /F1 7 0 R >> >> /Contents 6 0 R >>".to_owned(),
+            format!("<< /Length {} >>\nstream\n{text}endstream", text.len()),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_owned(),
         ];
         let mut pdf = b"%PDF-1.4\n".to_vec();
-        let mut xref = String::from("xref\n0 5\n0000000000 65535 f \n");
+        let size = objects.len() + 1;
+        let mut xref = format!("xref\n0 {size}\n0000000000 65535 f \n");
         for (i, object) in objects.iter().enumerate() {
             xref.push_str(&format!("{:010} 00000 n \n", pdf.len()));
             writeln!(pdf, "{} 0 obj\n{object}\nendobj", i + 1).unwrap();
@@ -281,18 +334,33 @@ mod tests {
         let offset = pdf.len();
         writeln!(
             pdf,
-            "{xref}trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{offset}\n%%EOF"
+            "{xref}trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{offset}\n%%EOF"
         )
         .unwrap();
         let path = std::env::temp_dir().join(format!("winPdfTest-文書-{}.pdf", std::process::id()));
         std::fs::write(&path, &pdf).unwrap();
         let document = Document::open_file(&path).unwrap();
-        assert_eq!(document.page_count(), 1);
-        let image = document.render_fit(0, (160, 128), 1.0).unwrap();
-        assert_eq!((image.width, image.height), (128, 128));
-        let pixel = |x, y| &image.pixels[(y * 128 + x) * 4..(y * 128 + x) * 4 + 3];
-        assert_eq!(pixel(32usize, 96usize), &[0, 0, 255]);
-        assert_eq!(pixel(32usize, 32usize), &[255, 255, 255]);
+        assert_eq!(document.page_count(), 2);
+        for zoom in [1.0, 0.5] {
+            let image = document.render_fit(0, (721, 850), zoom).unwrap();
+            let (w, h) = (image.width as usize, image.height as usize);
+            assert!(w > 0 && h > w);
+            assert!((w as f64 / h as f64 - 595.28 / 841.89).abs() < 0.01);
+            let pixel = |x, y| &image.pixels[(y * w + x) * 4..(y * w + x) * 4 + 3];
+            assert_eq!(pixel(w / 4, 3 * h / 4), &[0, 0, 255]);
+            assert_eq!(pixel(w / 4, h / 4), &[255, 255, 255]);
+            let paper = document.render_fit(1, (721, 850), zoom).unwrap();
+            let top_half = &paper.pixels[..(paper.height / 2 * paper.width * 4) as usize];
+            assert!(
+                top_half
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .filter(|p| p[0] < 100 && p[1] < 100 && p[2] < 100)
+                    .count()
+                    > 50
+            );
+        }
         let source = document.signing_source().unwrap();
         drop(document);
         let read = std::thread::spawn(move || source.read_bytes())

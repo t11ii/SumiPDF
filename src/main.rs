@@ -11,6 +11,8 @@ mod highlight_roundtrip;
 #[cfg(any(windows, test))]
 mod pdfseal;
 #[cfg(any(windows, test))]
+mod raster_size;
+#[cfg(any(windows, test))]
 mod textselect;
 #[cfg(windows)]
 mod viewer;
