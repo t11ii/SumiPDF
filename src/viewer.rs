@@ -2,6 +2,7 @@ mod canvas;
 mod dialog;
 mod save;
 mod signing;
+mod toolbar;
 mod worker;
 
 use crate::{
@@ -152,7 +153,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
         WM_GETMINMAXINFO => {
             let info = unsafe { &mut *(l as *mut MINMAXINFO) };
             info.ptMinTrackSize = POINT {
-                x: dips(hwnd, 680),
+                x: dips(hwnd, 440),
                 y: dips(hwnd, 290),
             };
             0
@@ -235,10 +236,6 @@ fn child(parent: HWND, class: &str, caption: &str, id: usize, style: u32) -> Res
     }
 }
 
-fn button(parent: HWND, text: &str, id: usize) -> Result<HWND, String> {
-    child(parent, "BUTTON", text, id, WS_TABSTOP)
-}
-
 struct Controls {
     canvas: HWND,
     open: HWND,
@@ -262,6 +259,8 @@ struct Controls {
     status: HWND,
     font: HFONT,
     headline: HFONT,
+    icon_font: HFONT,
+    toolbar: toolbar::Toolbar,
     font_dpi: u32,
 }
 
@@ -306,33 +305,22 @@ impl Controls {
                 0,
             );
         }
+        let mut toolbar = toolbar::Toolbar::new(hwnd)?;
         let ui = Self {
-            open: button(hwnd, "開く…", OPEN)?,
-            prev: button(hwnd, "前へ", PREV)?,
-            page: button(hwnd, "— / —", PAGE)?,
+            open: toolbar.button(OPEN, toolbar::OPEN_FILE)?,
+            prev: toolbar.button(PREV, toolbar::PREVIOUS)?,
+            page: child(hwnd, "BUTTON", "— / —", PAGE, WS_TABSTOP)?,
             page_input,
-            next: button(hwnd, "次へ", NEXT)?,
-            smaller: button(hwnd, "縮小", SMALLER)?,
-            larger: button(hwnd, "拡大", LARGER)?,
-            fit: button(hwnd, "全体表示", FIT)?,
-            highlighter: child(
-                hwnd,
-                "BUTTON",
-                "蛍光ペン",
-                HIGHLIGHT,
-                WS_TABSTOP | (BS_CHECKBOX | BS_PUSHLIKE) as u32,
-            )?,
-            underline: child(
-                hwnd,
-                "BUTTON",
-                "下線",
-                UNDERLINE,
-                WS_TABSTOP | (BS_CHECKBOX | BS_PUSHLIKE) as u32,
-            )?,
+            next: toolbar.button(NEXT, toolbar::NEXT_PAGE)?,
+            smaller: toolbar.button(SMALLER, toolbar::ZOOM_OUT)?,
+            larger: toolbar.button(LARGER, toolbar::ZOOM_IN)?,
+            fit: toolbar.button(FIT, toolbar::FIT_PAGE)?,
+            highlighter: toolbar.button(HIGHLIGHT, toolbar::MARKER)?,
+            underline: toolbar.button(UNDERLINE, toolbar::UNDERLINE_TEXT)?,
             color: Self::color_picker(hwnd)?,
-            undo: button(hwnd, "元に戻す", UNDO)?,
-            save: button(hwnd, "注釈を保存…", SAVE_MARKS)?,
-            sign: button(hwnd, "電子署名…", SIGN)?,
+            undo: toolbar.button(UNDO, toolbar::UNDO_MARK)?,
+            save: toolbar.button(SAVE_MARKS, toolbar::SAVE_ANNOTATIONS)?,
+            sign: toolbar.button(SIGN, toolbar::SIGN_PDF)?,
             position: child(
                 hwnd,
                 "COMBOBOX",
@@ -340,9 +328,9 @@ impl Controls {
                 SIGN_POSITION,
                 WS_TABSTOP | CBS_DROPDOWNLIST as u32,
             )?,
-            watermark: button(hwnd, "透かし：標準 ▾", WATERMARK)?,
-            sign_save: button(hwnd, "署名して保存…", SIGN_SAVE)?,
-            sign_cancel: button(hwnd, "キャンセル", SIGN_CANCEL)?,
+            watermark: toolbar.button(WATERMARK, toolbar::DEFAULT_WATERMARK)?,
+            sign_save: toolbar.button(SIGN_SAVE, toolbar::CONFIRM)?,
+            sign_cancel: toolbar.button(SIGN_CANCEL, toolbar::CANCEL)?,
             canvas: child(hwnd, CANVAS, "", CANVAS_ID, 0)?,
             status: child(
                 hwnd,
@@ -353,8 +341,11 @@ impl Controls {
             )?, // SS_CENTERIMAGE | SS_PATHELLIPSIS
             font: null_mut(),
             headline: null_mut(),
+            icon_font: null_mut(),
+            toolbar,
             font_dpi: 0,
         };
+        ui.toolbar.page_tip(ui.page)?;
         ui.show_signing(false);
         Ok(ui)
     }
@@ -376,7 +367,7 @@ impl Controls {
             return;
         }
         self.font_dpi = dpi;
-        let make = |h: i32, weight: i32| unsafe {
+        let make = |face: &str, h: i32, weight: i32| unsafe {
             CreateFontW(
                 -dips(hwnd, h),
                 0,
@@ -391,35 +382,23 @@ impl Controls {
                 0,
                 CLEARTYPE_QUALITY as u32,
                 0,
-                wide("Yu Gothic UI").as_ptr(),
+                wide(face).as_ptr(),
             )
         };
-        let old = (self.font, self.headline);
-        self.font = make(15, 400);
-        self.headline = make(25, 600);
+        let old = (self.font, self.headline, self.icon_font);
+        self.font = make("Yu Gothic UI", 15, 400);
+        self.headline = make("Yu Gothic UI", 25, 600);
+        self.icon_font = make("Segoe MDL2 Assets", 16, 400);
+        self.toolbar.set_font(self.icon_font);
         VIEW.with_borrow_mut(|v| {
             v.font = self.font;
             v.headline = self.headline;
         });
         for c in [
-            self.open,
-            self.prev,
             self.page,
             self.page_input,
-            self.next,
-            self.smaller,
-            self.larger,
-            self.fit,
-            self.highlighter,
-            self.underline,
             self.color,
-            self.undo,
-            self.save,
-            self.sign,
             self.position,
-            self.watermark,
-            self.sign_save,
-            self.sign_cancel,
             self.status,
         ] {
             unsafe {
@@ -429,6 +408,7 @@ impl Controls {
         unsafe {
             DeleteObject(old.0 as _);
             DeleteObject(old.1 as _);
+            DeleteObject(old.2 as _);
         }
     }
 
@@ -439,7 +419,7 @@ impl Controls {
         }
         let bounds = rect(hwnd);
         let s = |n| dips(hwnd, n);
-        let compact = bounds.right < s(995);
+        let compact = bounds.right < s(650);
         let toolbar = if compact { 91 } else { 50 };
         let place = |w, x, y, width, height| unsafe {
             SetWindowPos(
@@ -452,53 +432,44 @@ impl Controls {
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
         };
-        for (w, x, width) in [
-            (control(OPEN), 10, 67),
-            (control(PREV), 87, 44),
-            (control(PAGE), 134, 72),
-            (control(NEXT), 209, 44),
-            (control(SMALLER), 263, 46),
-            (control(LARGER), 312, 46),
-            (control(FIT), 361, 77),
+        let button = 36;
+        let page_x = 91;
+        let page_width = 80;
+        for (id, x, width) in [
+            (OPEN, 10, button),
+            (PREV, 52, button),
+            (PAGE, page_x, page_width),
+            (NEXT, 174, button),
+            (SMALLER, 221, button),
+            (LARGER, 260, button),
+            (FIT, 299, button),
         ] {
-            place(w, s(x), s(9), s(width), s(32));
+            place(control(id), s(x), s(9), s(width), s(32));
         }
+        place(control(PAGE_INPUT), s(page_x), s(12), s(page_width), s(26));
         let left = if compact {
             s(10)
         } else {
-            bounds.right - s(540)
+            bounds.right - s(300)
         };
         let y = s(if compact { 50 } else { 9 });
-        for (id, x, width) in [
-            (HIGHLIGHT, 0, 78),
-            (UNDERLINE, 81, 53),
-            (UNDO, 222, 74),
-            (SAVE_MARKS, 299, 100),
+        for (id, x) in [
+            (HIGHLIGHT, 0),
+            (UNDERLINE, 39),
+            (UNDO, 168),
+            (SAVE_MARKS, 207),
         ] {
-            place(control(id), left + s(x), y, s(width), s(32));
+            place(control(id), left + s(x), y, s(button), s(32));
         }
-        place(control(COLOR), left + s(137), y + s(4), s(81), s(140));
-        place(control(SIGN), bounds.right - s(114), s(9), s(104), s(32));
-        place(control(PAGE_INPUT), s(134), s(12), s(72), s(26));
+        place(control(COLOR), left + s(78), y + s(4), s(82), s(140));
+        place(control(SIGN), bounds.right - s(46), s(9), s(button), s(32));
         let mut top = toolbar;
         if unsafe { GetWindowLongW(control(SIGN_POSITION), GWL_STYLE) } as u32 & WS_VISIBLE != 0 {
-            let width = (bounds.right - s(363)).min(s(390)).max(s(160));
+            let width = (bounds.right - s(149)).min(s(390));
             place(control(SIGN_POSITION), s(10), s(toolbar + 2), width, s(280));
-            place(control(WATERMARK), width + s(17), s(toolbar), s(123), s(32));
-            place(
-                control(SIGN_SAVE),
-                width + s(147),
-                s(toolbar),
-                s(108),
-                s(32),
-            );
-            place(
-                control(SIGN_CANCEL),
-                width + s(262),
-                s(toolbar),
-                s(87),
-                s(32),
-            );
+            for (id, x) in [(WATERMARK, 17), (SIGN_SAVE, 64), (SIGN_CANCEL, 103)] {
+                place(control(id), width + s(x), s(toolbar), s(button), s(32));
+            }
             top += 41;
         }
         place(
@@ -523,6 +494,7 @@ impl Drop for Controls {
         unsafe {
             DeleteObject(self.font as _);
             DeleteObject(self.headline as _);
+            DeleteObject(self.icon_font as _);
         }
     }
 }
@@ -1177,6 +1149,7 @@ impl App {
                 notice(self.hwnd, "保存処理が終わるまでお待ちください。", false)
             }
             CLOSE if self.discard_ok() => unsafe {
+                self.ui.toolbar.clear_names();
                 DestroyWindow(self.hwnd);
             },
             _ => {}

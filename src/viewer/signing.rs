@@ -1,4 +1,4 @@
-use super::{App, Controls, Event, VIEW, canvas, dialog, notice, save, set_text, wide, worker};
+use super::{App, Controls, Event, VIEW, canvas, dialog, notice, save, wide, worker};
 use crate::{highlight::UnitRect, pdfseal};
 use std::{os::windows::ffi::OsStrExt, path::Path, ptr::null, sync::Arc};
 use windows_sys::Win32::{
@@ -210,7 +210,7 @@ impl App {
         self.request_text()?;
         self.signing = Some(Session::default());
         self.ui.show_signing(true);
-        set_text(self.ui.watermark, "透かし：標準 ▾");
+        self.ui.toolbar.watermark(self.ui.watermark, false)?;
         Controls::layout(self.hwnd);
         self.controls();
         self.status();
@@ -314,14 +314,9 @@ impl App {
             3 => return open_designer(self.hwnd),
             _ => return Ok(()),
         }
-        set_text(
-            self.ui.watermark,
-            if session.watermark.is_some() {
-                "透かし：指定画像 ▾"
-            } else {
-                "透かし：標準 ▾"
-            },
-        );
+        self.ui
+            .toolbar
+            .watermark(self.ui.watermark, session.watermark.is_some())?;
         Ok(())
     }
 }
