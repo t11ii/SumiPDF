@@ -199,6 +199,7 @@ fn merged_fields_update_in_place_and_restricted_fields_are_never_offered() {
     let merged = doc.get_dictionary_mut(field).unwrap();
     merged.set("FT", "Sig");
     merged.set("V", null);
+    merged.set("F", 132); // Printable and Locked; filling preserves widget properties.
     doc.get_dictionary_mut(page)
         .unwrap()
         .set("Annots", vec![field.into()]);
@@ -209,12 +210,17 @@ fn merged_fields_update_in_place_and_restricted_fields_are_never_offered() {
     let parsed = Document::load_mem(&signed).unwrap();
     let merged = parsed.get_dictionary(field).unwrap();
     assert!(merged.has(b"V") && merged.has(b"AP"));
+    assert_eq!(merged.get(b"F").unwrap().as_i64().unwrap(), 132);
+    assert_eq!(
+        merged.get(b"Rect").unwrap(),
+        annotation.get(b"Rect").unwrap()
+    );
     for (id, key, value) in [
         (parent, "Ff", Object::Integer(1)),
         (parent, "Lock", dictionary! {}.into()),
         (field, "SV", dictionary! {}.into()),
         (field, "F", Object::Integer(32)),
-        (field, "F", Object::Integer(128)),
+        (field, "F", Object::Integer(512)),
         (field, "MK", dictionary! { "R" => 90 }.into()),
         (field, "P", doc.page_iter().next().unwrap().into()),
         (field, "Rect", vec![Object::Integer(0); 4].into()),
@@ -484,13 +490,13 @@ fn covers_every_byte_except_contents_and_preserves_forms_and_pages() {
 }
 
 #[test]
-fn refuses_existing_signatures_encryption_and_bad_containers_before_signing() {
+fn refuses_malformed_signature_ranges_encryption_and_bad_containers_before_signing() {
     let original = serialize(document(false), false);
-    let signed = sign_pdf(original, |_, _| Ok(vec![1])).unwrap();
-    assert_eq!(
-        sign_pdf(signed, |_, _| panic!()).unwrap_err(),
-        ALREADY_SIGNED
-    );
+    let mut signed = sign_pdf(original, |_, _| Ok(vec![1])).unwrap();
+    let marker = b"/ByteRange[";
+    let start = memmem::find(&signed, marker).unwrap() + marker.len();
+    signed[start] = b'1'; // The signature no longer covers the start of the PDF.
+    assert!(sign_pdf(signed, |_, _| panic!()).is_err());
     assert!(sign_pdf(b"not a PDF".to_vec(), |_, _| panic!()).is_err());
 
     for password in ["", "reader"] {
@@ -537,12 +543,12 @@ fn run(cwd: &Path, tool: &str, args: &[&str]) -> String {
     String::from_utf8_lossy(&result.stdout).into_owned()
 }
 
-#[test]
-#[ignore = "requires openssl, NSS certutil, pdfsig and pdftoppm"]
-fn verify_with_openssl_and_poppler() {
-    let temp = tempfile::tempdir().unwrap();
-    let dir = temp.path();
-    run(dir, "certutil", &["-N", "-d", "sql:.", "--empty-password"]);
+fn openssl_signer<'a>(
+    dir: &'a Path,
+    name: &str,
+) -> impl Fn(&[u8], &[u8]) -> Result<Vec<u8>, String> + 'a {
+    let key = format!("{name}-key.pem");
+    let cert = format!("{name}-cert.pem");
     run(
         dir,
         "openssl",
@@ -553,18 +559,16 @@ fn verify_with_openssl_and_poppler() {
             "rsa:2048",
             "-nodes",
             "-keyout",
-            "key.pem",
+            &key,
             "-out",
-            "cert.pem",
+            &cert,
             "-days",
             "1",
             "-subj",
-            "/CN=SumiPDF Test",
+            &format!("/CN={name}"),
         ],
     );
-    let original = serialize(document(false), false);
-    fs::write(dir.join("original.pdf"), &original).unwrap();
-    let signer = |a: &[u8], b: &[u8]| {
+    move |a, b| {
         fs::write(dir.join("content.bin"), [a, b].concat()).unwrap();
         run(
             dir,
@@ -576,9 +580,9 @@ fn verify_with_openssl_and_poppler() {
                 "-md",
                 "sha256",
                 "-signer",
-                "cert.pem",
+                &cert,
                 "-inkey",
-                "key.pem",
+                &key,
                 "-in",
                 "content.bin",
                 "-outform",
@@ -588,8 +592,57 @@ fn verify_with_openssl_and_poppler() {
             ],
         );
         Ok(fs::read(dir.join("signature.der")).unwrap())
-    };
-    let signed = sign_pdf(original, signer).unwrap();
+    }
+}
+
+fn render_page(dir: &Path, pdf: &str, page: u32) -> Vec<u8> {
+    let page = page.to_string();
+    run(
+        dir,
+        "pdftoppm",
+        &[
+            "-f",
+            &page,
+            "-l",
+            &page,
+            "-singlefile",
+            "-r",
+            "72",
+            pdf,
+            "page",
+        ],
+    );
+    fs::read(dir.join("page.ppm")).unwrap()
+}
+
+fn tampered_report(dir: &Path, pdf: &str) -> String {
+    let check = Command::new("pdfsig")
+        .current_dir(dir)
+        .args(["-nssdir", "sql:.", "-nocert", pdf])
+        .output()
+        .unwrap();
+    String::from_utf8(check.stdout).unwrap()
+}
+
+fn signature_report<'a>(report: &'a str, signer: &str) -> &'a str {
+    report
+        .split("Signature #")
+        .skip(1)
+        .find(|s| s.contains(signer))
+        .unwrap_or_else(|| panic!("Missing {signer} in {report}"))
+}
+
+#[test]
+#[ignore = "requires openssl, NSS certutil and pk12util, pdfsig and pdftoppm"]
+fn verify_with_openssl_and_poppler() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path();
+    run(dir, "certutil", &["-N", "-d", "sql:.", "--empty-password"]);
+    let alice = openssl_signer(dir, "SumiPDF Alice");
+    let bob = openssl_signer(dir, "SumiPDF Bob");
+    let original = serialize(document(false), false);
+    fs::write(dir.join("original.pdf"), &original).unwrap();
+    let signed = sign_pdf(original, &alice).unwrap();
     fs::write(dir.join("signed.pdf"), &signed).unwrap();
     let report = run(
         dir,
@@ -598,43 +651,163 @@ fn verify_with_openssl_and_poppler() {
     );
     assert!(report.contains("Signature is Valid."), "{report}");
     assert!(report.contains("Total document signed"), "{report}");
-    assert!(report.contains("SumiPDF Test"), "{report}");
-    for stem in ["original", "signed"] {
-        run(
-            dir,
-            "pdftoppm",
-            &["-r", "72", "-singlefile", &format!("{stem}.pdf"), stem],
-        );
-    }
+    assert!(report.contains("SumiPDF Alice"), "{report}");
     assert_eq!(
-        fs::read(dir.join("original.ppm")).unwrap(),
-        fs::read(dir.join("signed.ppm")).unwrap()
+        render_page(dir, "original.pdf", 1),
+        render_page(dir, "signed.pdf", 1)
     );
-    let (doc, ..) = nested_signature();
+    let (doc, _, existing_field, existing_widget) = nested_signature();
     let unsigned = serialize(doc, true);
-    let fields = inspect(&unsigned).unwrap();
-    let target = Target::Field(fields["fields"][0]["id"].as_str().unwrap().into());
-    let approved = sign_visible(unsigned, &target, "SumiPDF Test", None, signer).unwrap();
-    fs::write(dir.join("approved.pdf"), approved).unwrap();
-    let report = run(
+    fs::write(dir.join("unsigned.pdf"), &unsigned).unwrap();
+    // Let an independent PDF writer produce the first approval in the prepared field.
+    run(
+        dir,
+        "openssl",
+        &[
+            "pkcs12",
+            "-export",
+            "-in",
+            "SumiPDF Alice-cert.pem",
+            "-inkey",
+            "SumiPDF Alice-key.pem",
+            "-name",
+            "alice",
+            "-passout",
+            "pass:test",
+            "-out",
+            "alice.p12",
+        ],
+    );
+    run(
+        dir,
+        "pk12util",
+        &["-d", "sql:.", "-i", "alice.p12", "-W", "test"],
+    );
+    run(
         dir,
         "pdfsig",
-        &["-nssdir", "sql:.", "-nocert", "approved.pdf"],
+        &[
+            "-nssdir",
+            "sql:.",
+            "-nick",
+            "alice",
+            "-sign",
+            "Approvals.Reviewer",
+            "unsigned.pdf",
+            "external.pdf",
+        ],
     );
-    assert!(report.contains("Signature is Valid."), "{report}");
-    assert!(report.contains("Approvals.Reviewer"), "{report}");
-    assert!(report.contains("Total document signed"), "{report}");
+    let fields = inspect(&unsigned).unwrap();
+    let existing = Target::Field(fields["fields"][0]["id"].as_str().unwrap().into());
+    let area = Target::Area {
+        page: 1,
+        rect: [0.1, 0.1, 0.9, 0.3],
+    };
+    for (first_target, second_target) in [(&existing, &area), (&area, &existing)] {
+        let first = if first_target == &existing {
+            fs::read(dir.join("external.pdf")).unwrap()
+        } else {
+            sign_visible(
+                unsigned.clone(),
+                first_target,
+                "SumiPDF Alice",
+                None,
+                &alice,
+            )
+            .unwrap()
+        };
+        assert!(first.starts_with(&unsigned));
+        let inventory = inspect(&first).unwrap();
+        let available = inventory["fields"].as_array().unwrap();
+        let before = Document::load_mem(&first).unwrap();
+        let (first_field, first_widget, first_name, second_name) = if first_target == &existing {
+            assert!(available.is_empty());
+            (
+                existing_field,
+                existing_widget,
+                "Approvals.Reviewer",
+                "Signature2",
+            )
+        } else {
+            assert_eq!(available, fields["fields"].as_array().unwrap());
+            let roots = array(&before, &acroform(&before).unwrap().1, b"Fields").unwrap();
+            let added = roots.last().unwrap().as_reference().unwrap();
+            (added, added, "Signature2", "Approvals.Reviewer")
+        };
+        let first_id = Target::Field(format!("field-{}-{}", first_field.0, first_field.1));
+        assert!(
+            sign_visible(
+                first.clone(),
+                &first_id,
+                "SumiPDF Bob",
+                None,
+                |_, _| panic!()
+            )
+            .is_err()
+        );
+
+        let both = sign_visible(first.clone(), second_target, "SumiPDF Bob", None, &bob).unwrap();
+        assert!(both.starts_with(&first));
+        let after = Document::load_mem(&both).unwrap();
+        assert!(after.xref_recovery.is_none());
+        assert_eq!(after.revision_count(), before.revision_count() + 1);
+        let sig = before
+            .get_dictionary(first_field)
+            .unwrap()
+            .get(b"V")
+            .unwrap()
+            .as_reference()
+            .unwrap();
+        for object in [first_field, first_widget, sig] {
+            assert_eq!(
+                after.get_object(object).unwrap(),
+                before.get_object(object).unwrap()
+            );
+        }
+        fs::write(dir.join("first.pdf"), &first).unwrap();
+        fs::write(dir.join("both.pdf"), &both).unwrap();
+        // Each visible signature changes only its own page, in either signing order.
+        let first_page = locate(&unsigned, first_target).unwrap().0;
+        for page in [1, 2] {
+            let original_pixels = render_page(dir, "unsigned.pdf", page);
+            let first_pixels = render_page(dir, "first.pdf", page);
+            let both_pixels = render_page(dir, "both.pdf", page);
+            assert_eq!(original_pixels != first_pixels, page == first_page);
+            assert_eq!(first_pixels != both_pixels, page != first_page);
+        }
+        let report = run(dir, "pdfsig", &["-nssdir", "sql:.", "-nocert", "both.pdf"]);
+        for (signer, field, total) in [
+            ("SumiPDF Alice", first_name, false),
+            ("SumiPDF Bob", second_name, true),
+        ] {
+            let block = signature_report(&report, signer);
+            assert!(
+                block.contains(field) && block.contains("Signature is Valid."),
+                "{report}"
+            );
+            assert_eq!(block.contains("Total document signed"), total, "{report}");
+        }
+        // Change the second revision only. The first signature should still verify.
+        let mut altered = both;
+        let date = memmem::find(&altered[first.len()..], b"D:").unwrap() + first.len() + 2;
+        altered[date] = b'1'; // change the year without changing offsets
+        fs::write(dir.join("altered.pdf"), altered).unwrap();
+        let report = tampered_report(dir, "altered.pdf");
+        assert!(
+            signature_report(&report, "SumiPDF Alice").contains("Signature is Valid."),
+            "{report}"
+        );
+        assert!(
+            signature_report(&report, "SumiPDF Bob").contains("Digest Mismatch"),
+            "{report}"
+        );
+    }
     // Make one visible drawing coordinate differ, without changing offsets.
     let mut tampered = signed;
     let pos = tampered.windows(5).position(|s| s == b"80 60").unwrap();
     tampered[pos] = b'5';
     fs::write(dir.join("tampered.pdf"), tampered).unwrap();
-    let check = Command::new("pdfsig")
-        .current_dir(dir)
-        .args(["-nssdir", "sql:.", "-nocert", "tampered.pdf"])
-        .output()
-        .unwrap();
-    let report = String::from_utf8_lossy(&check.stdout);
+    let report = tampered_report(dir, "tampered.pdf");
     assert!(report.contains("Digest Mismatch"), "{report}");
 }
 

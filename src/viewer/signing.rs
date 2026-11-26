@@ -6,24 +6,37 @@ use windows_sys::Win32::{
     UI::{Input::KeyboardAndMouse::SetFocus, Shell::ShellExecuteW, WindowsAndMessaging::*},
 };
 
-pub(super) struct Field {
+struct Field {
     id: String,
     name: String,
     page: u32, // zero-based, same as the canvas
     area: UnitRect,
 }
 
-fn inspect_fields(bytes: &[u8]) -> Result<Vec<Field>, String> {
-    let info = pdfseal::inspect(bytes)?;
-    let invalid = || "PDF の署名欄の位置を読み取れませんでした。".to_owned();
-    info["fields"]
-        .as_array()
-        .ok_or_else(invalid)?
-        .iter()
-        .map(|field| {
+pub(super) struct Choices {
+    positions: Vec<Position>,
+    already_signed: bool,
+}
+
+enum Position {
+    Draw,
+    Field(Field),
+    Invisible,
+}
+
+impl Choices {
+    fn from_inspection(info: &serde_json::Value) -> Result<Self, String> {
+        let invalid = || "PDF の署名欄と署名の制限を読み取れませんでした。".to_owned();
+        let new_field = info["allowsNewField"].as_bool().ok_or_else(invalid)?;
+        let already_signed = info["alreadySigned"].as_bool().ok_or_else(invalid)?;
+        let mut positions = Vec::new();
+        if new_field {
+            positions.push(Position::Draw);
+        }
+        for field in info["fields"].as_array().ok_or_else(invalid)? {
             let [left, top, right, bottom]: [f32; 4] =
                 serde_json::from_value(field["rect"].clone()).map_err(|_| invalid())?;
-            Ok(Field {
+            positions.push(Position::Field(Field {
                 id: field["id"].as_str().ok_or_else(invalid)?.to_string(),
                 name: field["name"].as_str().ok_or_else(invalid)?.to_string(),
                 page: field["page"]
@@ -37,17 +50,28 @@ fn inspect_fields(bytes: &[u8]) -> Result<Vec<Field>, String> {
                     right,
                     bottom,
                 },
-            })
+            }));
+        }
+        if new_field {
+            positions.push(Position::Invisible);
+        }
+        Ok(Self {
+            positions,
+            already_signed,
         })
-        .collect()
-}
+    }
 
-#[derive(Clone, Copy, Default, PartialEq)]
-enum Position {
-    #[default]
-    Draw,
-    Field(usize),
-    Invisible,
+    fn preferred(&self, page: u32) -> Option<usize> {
+        self.positions
+            .iter()
+            .position(|p| matches!(p, Position::Field(f) if f.page == page))
+            .or_else(|| {
+                self.positions
+                    .iter()
+                    .position(|p| matches!(p, Position::Field(_)))
+            })
+            .or_else(|| (!self.positions.is_empty()).then_some(0))
+    }
 }
 
 struct Watermark {
@@ -57,53 +81,70 @@ struct Watermark {
 
 #[derive(Default)]
 pub(super) struct Session {
-    pub ready: bool,
-    fields: Vec<Field>,
-    position: Position,
+    choices: Option<Choices>,
+    selected: Option<usize>,
     pub drawn: Option<(u32, UnitRect)>,
     watermark: Option<Watermark>,
 }
 
 impl Session {
-    pub fn drawing(&self) -> bool {
-        self.ready && self.position == Position::Draw
+    pub fn has_positions(&self) -> bool {
+        self.choices
+            .as_ref()
+            .is_some_and(|c| !c.positions.is_empty())
     }
 
-    pub fn invisible(&self) -> bool {
-        self.position == Position::Invisible
+    fn position(&self) -> Option<&Position> {
+        self.choices.as_ref()?.positions.get(self.selected?)
+    }
+
+    pub fn drawing(&self) -> bool {
+        matches!(self.position(), Some(Position::Draw))
+    }
+
+    pub fn can_pick_watermark(&self) -> bool {
+        matches!(self.position(), Some(Position::Draw | Position::Field(_)))
     }
 
     fn placement(&self) -> Option<(u32, UnitRect)> {
-        match self.position {
+        match self.position()? {
             Position::Draw => self.drawn,
-            Position::Field(index) => self.fields.get(index).map(|f| (f.page, f.area)),
+            Position::Field(field) => Some((field.page, field.area)),
             Position::Invisible => None,
         }
     }
 
-    pub fn appearance(&self) -> Option<save::Appearance> {
-        let target = match self.position {
+    pub fn appearance(&self) -> Result<Option<save::Appearance>, String> {
+        let target = match self.position().ok_or("署名位置を選び直してください。")? {
             Position::Draw => {
-                let (page, r) = self.drawn?;
+                let (page, r) = self
+                    .drawn
+                    .ok_or("署名を表示する位置をドラッグしてください。")?;
                 pdfseal::Target::Area {
                     page: page + 1,
                     rect: [r.left, r.top, r.right, r.bottom],
                 }
             }
-            Position::Field(index) => pdfseal::Target::Field(self.fields.get(index)?.id.clone()),
-            Position::Invisible => return None,
+            Position::Field(field) => pdfseal::Target::Field(field.id.clone()),
+            Position::Invisible => return Ok(None),
         };
-        Some(save::Appearance {
+        Ok(Some(save::Appearance {
             target,
             watermark: self.watermark.as_ref().map(|w| w.bytes.clone()),
-        })
+        }))
     }
 
     pub fn instructions(&self, current_page: u32) -> String {
-        if !self.ready {
+        if self.choices.is_none() {
             return "空の署名欄を確認しています…".into();
         }
-        if self.invisible() {
+        if !self.has_positions() {
+            return "この PDF には追加署名に使える空の署名欄がありません。".into();
+        }
+        if self.position().is_none() {
+            return "署名位置を選び直してください。".into();
+        }
+        if matches!(self.position(), Some(Position::Invisible)) {
             return "ページに表示しない電子署名を作成します。「署名して保存」で証明書を選択します。".into();
         }
         match self.placement() {
@@ -121,8 +162,9 @@ impl Session {
 impl App {
     pub(super) fn can_sign_here(&self) -> bool {
         self.signing.as_ref().is_some_and(|s| {
-            s.ready
-                && (s.invisible()
+            let index = unsafe { SendMessageW(self.ui.position, CB_GETCURSEL, 0, 0) };
+            s.selected == usize::try_from(index).ok()
+                && (matches!(s.position(), Some(Position::Invisible))
                     || (s.placement().is_some_and(|(p, _)| p == self.page)
                         && VIEW.with_borrow(|v| v.bitmap.is_some())))
         })
@@ -156,7 +198,9 @@ impl App {
             std::thread::Builder::new()
                 .name("pdf-signature-fields".into())
                 .spawn(move || {
-                    let result = source.read_bytes().and_then(|bytes| inspect_fields(&bytes));
+                    let result = source
+                        .read_bytes()
+                        .and_then(|bytes| Choices::from_inspection(&pdfseal::inspect(&bytes)?));
                     worker::report(hwnd, &events, Event::SignatureFields { revision, result });
                 })
                 .map_err(|e| e.to_string())?;
@@ -192,51 +236,46 @@ impl App {
         }
     }
 
-    pub(super) fn show_fields(&mut self, fields: Vec<Field>) -> Result<(), String> {
+    pub(super) fn show_fields(&mut self, choices: Choices) -> Result<(), String> {
         let Some(session) = &mut self.signing else {
             return Ok(());
         };
-        let preferred = fields
-            .iter()
-            .position(|f| f.page == self.page)
-            .or_else(|| (!fields.is_empty()).then_some(0));
-        let add = |label: &str| -> Result<(), String> {
+        self.known_signed = choices.already_signed;
+        if choices.already_signed && !self.marks.is_empty() {
+            return Err("署名済みの PDF には注釈を追加できません。「元に戻す」で注釈をすべて取り消してから署名してください。".into());
+        }
+        let preferred = choices.preferred(self.page);
+        for position in &choices.positions {
+            let label = match position {
+                Position::Draw => "署名位置をドラッグして指定".to_owned(),
+                Position::Field(f) => format!("{} ページの署名欄：{}", f.page + 1, f.name),
+                Position::Invisible => "ページに表示しない署名".to_owned(),
+            };
             let index = unsafe {
                 SendMessageW(
                     self.ui.position,
                     CB_ADDSTRING,
                     0,
-                    wide(label).as_ptr() as isize,
+                    wide(&label).as_ptr() as isize,
                 )
             };
             if index < 0 {
-                Err("署名位置の選択肢を表示できませんでした。".into())
-            } else {
-                Ok(())
+                return Err("署名位置の選択肢を表示できませんでした。".into());
             }
-        };
-        add("署名位置をドラッグして指定")?;
-        for field in &fields {
-            add(&format!(
-                "{} ページの署名欄：{}",
-                field.page + 1,
-                field.name
-            ))?;
         }
-        add("ページに表示しない署名")?;
-        session.fields = fields;
-        session.ready = true;
-        unsafe {
-            SendMessageW(
-                self.ui.position,
-                CB_SETCURSEL,
-                preferred.map_or(0, |i| i + 1),
-                0,
-            );
+        session.choices = Some(choices);
+        if let Some(index) = preferred {
+            unsafe {
+                SendMessageW(self.ui.position, CB_SETCURSEL, index, 0);
+            }
         }
         self.choose_position();
         unsafe {
-            SetFocus(self.ui.position);
+            SetFocus(if preferred.is_some() {
+                self.ui.position
+            } else {
+                self.ui.sign_cancel
+            });
         }
         Ok(())
     }
@@ -245,20 +284,8 @@ impl App {
         let Some(session) = &mut self.signing else {
             return;
         };
-        if !session.ready {
-            return;
-        }
         let index = unsafe { SendMessageW(self.ui.position, CB_GETCURSEL, 0, 0) };
-        if index < 0 {
-            return;
-        }
-        session.position = if index == 0 {
-            Position::Draw
-        } else if index as usize <= session.fields.len() {
-            Position::Field(index as usize - 1)
-        } else {
-            Position::Invisible
-        };
+        session.selected = usize::try_from(index).ok();
         if let Some((page, _)) = session.placement() {
             self.page_to(page);
             self.scale(1.0);
@@ -272,7 +299,7 @@ impl App {
         let Some(session) = &mut self.signing else {
             return Ok(());
         };
-        if !session.ready || session.invisible() {
+        if !session.can_pick_watermark() {
             return Ok(());
         }
         let name = session.watermark.as_ref().map(|w| w.name.as_str());
@@ -380,4 +407,55 @@ fn open_designer(owner: HWND) -> Result<(), String> {
         return Err("透かし画像の作成画面をブラウザーで開けませんでした。".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn restricted_picker_only_resolves_permitted_fields() {
+        let choices = Choices::from_inspection(&json!({
+            "alreadySigned": true, "allowsNewField": false,
+            "fields": [{"id":"field-8-0", "name":"Approval", "page":2, "rect":[0.1,0.2,0.5,0.4]}]
+        }))
+        .unwrap();
+        let mut session = Session {
+            selected: choices.preferred(0),
+            choices: Some(choices),
+            ..Session::default()
+        };
+        assert_eq!(session.selected, Some(0));
+        assert!(!session.drawing());
+        assert_eq!(session.placement().unwrap().0, 1);
+        assert_eq!(
+            session.appearance().unwrap().unwrap().target,
+            pdfseal::Target::Field("field-8-0".into())
+        );
+
+        session.selected = Some(1);
+        assert!(session.appearance().is_err());
+        assert!(!session.can_pick_watermark());
+    }
+
+    #[test]
+    fn restricted_document_without_a_field_explains_why_signing_is_unavailable() {
+        let choices = Choices::from_inspection(&json!({
+            "alreadySigned": true, "allowsNewField": false, "fields": []
+        }))
+        .unwrap();
+        let session = Session {
+            selected: choices.preferred(0),
+            choices: Some(choices),
+            ..Session::default()
+        };
+        assert!(!session.has_positions());
+        assert!(
+            session
+                .instructions(0)
+                .contains("使える空の署名欄がありません")
+        );
+        assert!(session.appearance().is_err());
+    }
 }

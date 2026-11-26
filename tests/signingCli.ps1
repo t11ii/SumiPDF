@@ -1,4 +1,4 @@
-param([Parameter(Mandatory)][string]$Executable, [Parameter(Mandatory)][string]$Pdf)
+param([Parameter(Mandatory)][string]$Executable, [Parameter(Mandatory)][string]$Pdf, [string]$SignedGuiFixture)
 $ErrorActionPreference = 'Stop'
 $binary = (Resolve-Path -LiteralPath $Executable).Path
 $inputPdf = (Resolve-Path -LiteralPath $Pdf).Path
@@ -27,7 +27,12 @@ function Invoke-SignCli([string[]]$Arguments, [switch]$ExpectError) {
     } finally { $proc.Dispose() }
 }
 
+function New-TestSigner([string]$Subject) {
+    New-SelfSignedCertificate -Type Custom -Subject "CN=$Subject" -KeyAlgorithm RSA -KeyLength 2048 -KeyUsage DigitalSignature -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.36') -CertStoreLocation Cert:\CurrentUser\My
+}
+
 $cert = $null
+$reviewer = $null
 try {
     $info = Invoke-SignCli @('--inspect', $inputPdf)
     $field = @($info.fields | Where-Object name -eq 'Approval')
@@ -38,7 +43,9 @@ try {
     $preview = Invoke-SignCli @('--preview', $inputPdf, '--field', $field[0].id, '--out', $previewPath)
     if ($preview.sha256 -ne $info.sha256 -or $preview.page -ne 2 -or !(Test-Path $previewPath)) { throw 'Preview mismatch' }
     $subject = "SumiPDF CLI 試験 " + [guid]::NewGuid()
-    $cert = New-SelfSignedCertificate -Type Custom -Subject "CN=$subject" -KeyAlgorithm RSA -KeyLength 2048 -KeyUsage DigitalSignature -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.36') -CertStoreLocation Cert:\CurrentUser\My
+    $cert = New-TestSigner $subject
+    $reviewerName = "SumiPDF 承認 " + [guid]::NewGuid()
+    $reviewer = New-TestSigner $reviewerName
     $list = Invoke-SignCli @('--certificates')
     if (@($list.certificates | Where-Object thumbprint -eq $cert.Thumbprint).Count -ne 1) { throw 'Certificate missing from list' }
 
@@ -46,18 +53,33 @@ try {
     Add-Type -AssemblyName System.Drawing
     $bmp = [Drawing.Bitmap]::new(16, 16)
     try { $bmp.SetPixel(8, 8, [Drawing.Color]::Red); $bmp.Save($logo, [Drawing.Imaging.ImageFormat]::Png) } finally { $bmp.Dispose() }
+    $area = Join-Path $folder 'free area.pdf'
+    $first = Invoke-SignCli @('--sign',$inputPdf,'--page','1','--rect','0.1,0.2,0.7,0.4','--out',$area,'--certificate',$cert.Thumbprint)
+    if ($first.signer -ne $subject -or $first.page -ne 1 -or $first.sha256 -ne (Get-FileHash $area).Hash) { throw 'Manual placement failed' }
+    $secondInfo = Invoke-SignCli @('--inspect', $area)
+    if ($secondInfo.sha256 -ne $first.sha256 -or @($secondInfo.fields).Count -ne 1 -or $secondInfo.fields[0].id -ne $field[0].id) {
+        throw 'The original empty field is unavailable for the second signer'
+    }
     $signed = Join-Path $folder '契約書 署名済.pdf'
-    $signArgs = @('--sign',$inputPdf,'--out',$signed,'--field',$field[0].id,'--watermark',$logo,'--certificate',$cert.Thumbprint,'--expect-sha256')
+    $signArgs = @('--sign',$area,'--out',$signed,'--field',$field[0].id,'--watermark',$logo,'--certificate',$reviewer.Thumbprint,'--expect-sha256')
     Invoke-SignCli -Arguments ($signArgs + ('0'*64)) -ExpectError
     if (Test-Path $signed) { throw 'Hash mismatch produced a signed file' }
-    $result = Invoke-SignCli ($signArgs + $info.sha256)
-    if ($result.signer -ne $subject -or $result.page -ne 2 -or $result.sha256 -ne (Get-FileHash $signed).Hash) { throw 'Signed output mismatch' }
-    Invoke-SignCli -Arguments ($signArgs + $info.sha256) -ExpectError
-    $area = Join-Path $folder 'free area.pdf'
-    $result = Invoke-SignCli @('--sign',$inputPdf,'--page','1','--rect','0.1,0.2,0.7,0.4','--out',$area,'--certificate',$cert.Thumbprint)
-    if ($result.page -ne 1 -or $result.sha256 -ne (Get-FileHash $area).Hash) { throw 'Manual placement failed' }
-    Write-Host 'CLI verified field discovery, page preview, source digest, Windows certificate signing, custom PNG, free placement and no overwrite.'
+    $result = Invoke-SignCli ($signArgs + $first.sha256)
+    if ($result.signer -ne $reviewerName -or $result.page -ne 2 -or $result.sha256 -ne (Get-FileHash $signed).Hash) { throw 'Second signature output mismatch' }
+    $prefix = [IO.MemoryStream]::new([IO.File]::ReadAllBytes($signed), 0, [int](Get-Item $area).Length, $false)
+    try {
+        if ((Get-FileHash -InputStream $prefix).Hash -ne $first.sha256) { throw 'Second signer rewrote the first revision' }
+    } finally { $prefix.Dispose() }
+    $complete = Invoke-SignCli @('--inspect',$signed)
+    if (@($complete.fields).Count -ne 0) { throw 'An occupied field is still writable' }
+    Invoke-SignCli -Arguments ($signArgs + $first.sha256) -ExpectError
+    if ((Get-FileHash $signed).Hash -ne $result.sha256 -or (Get-FileHash $area).Hash -ne $first.sha256 -or (Get-FileHash $inputPdf).Hash -ne $info.sha256) {
+        throw 'An existing PDF was overwritten'
+    }
+    if ($SignedGuiFixture) { [IO.File]::Copy($area, $SignedGuiFixture) }
+    Write-Host 'CLI verified two different Windows signers, both placements, field discovery, preview, exact revision preservation, source digest, custom PNG and no overwrite.'
 } finally {
+    if ($null -ne $reviewer) { Remove-Item -LiteralPath ("Cert:\CurrentUser\My\" + $reviewer.Thumbprint) -DeleteKey -Force }
     if ($null -ne $cert) { Remove-Item -LiteralPath ("Cert:\CurrentUser\My\" + $cert.Thumbprint) -DeleteKey -Force }
     [IO.Directory]::Delete($folder, $true)
 }

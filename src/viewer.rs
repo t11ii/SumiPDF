@@ -551,6 +551,7 @@ struct App {
     text_worker: Option<Sender<worker::TextJob>>,
     signing: Option<signing::Session>,
     checking_fields: Option<u64>,
+    known_signed: bool,
 }
 
 impl App {
@@ -583,6 +584,7 @@ impl App {
             text_worker: None,
             signing: None,
             checking_fields: None,
+            known_signed: false,
         };
         app.controls();
         Ok(app)
@@ -591,7 +593,8 @@ impl App {
         self.document.as_ref().map_or(0, |d| d.pages)
     }
     fn controls(&self) {
-        let annotate = self.signing.is_none() && !self.writing;
+        let editing = self.signing.is_none() && !self.writing;
+        let annotate = editing && !self.known_signed;
         for (c, enabled) in [
             (self.ui.open, !self.writing),
             (self.ui.page, self.page_count() > 0),
@@ -606,16 +609,16 @@ impl App {
                 self.ui.larger,
                 self.page_count() > 0 && self.zoom < MAX_ZOOM,
             ),
-            (self.ui.sign, self.page_count() > 0 && annotate),
+            (self.ui.sign, self.page_count() > 0 && editing),
             (
                 self.ui.position,
-                self.signing.as_ref().is_some_and(|s| s.ready) && !self.writing,
+                self.signing.as_ref().is_some_and(|s| s.has_positions()) && !self.writing,
             ),
             (
                 self.ui.watermark,
                 self.signing
                     .as_ref()
-                    .is_some_and(|s| s.ready && !s.invisible())
+                    .is_some_and(|s| s.can_pick_watermark())
                     && !self.writing,
             ),
             (self.ui.sign_save, self.can_sign_here() && !self.writing),
@@ -623,7 +626,7 @@ impl App {
             (self.ui.highlighter, self.page_count() > 0 && annotate),
             (self.ui.underline, self.page_count() > 0 && annotate),
             (self.ui.color, self.page_count() > 0 && annotate),
-            (self.ui.undo, !self.marks.is_empty() && annotate),
+            (self.ui.undo, !self.marks.is_empty() && editing),
             (
                 self.ui.save,
                 (!self.marks.is_empty() || !self.saved_marks.is_empty()) && annotate,
@@ -853,6 +856,7 @@ impl App {
             self.worker = Some(tx);
         }
         self.revision += 1;
+        self.known_signed = false;
         self.ticket += 1;
         self.document = None;
         self.end_signing();
@@ -948,7 +952,8 @@ impl App {
         if self.writing
             || (signed && !self.can_sign_here())
             || (!signed
-                && (self.signing.is_some()
+                && (self.known_signed
+                    || self.signing.is_some()
                     || (self.marks.is_empty() && self.saved_marks.is_empty())))
         {
             return Ok(());
@@ -957,19 +962,27 @@ impl App {
             return Ok(());
         };
         let source = doc.source.as_ref().map_err(Clone::clone)?.clone();
-        let (cert, purpose) = if signed {
+        let (cert, purpose, appearance) = if signed {
+            let appearance = self
+                .signing
+                .as_ref()
+                .ok_or("署名位置を選んでください。")?
+                .appearance()?;
             let Some(cert) = SigningCertificate::choose(self.hwnd)? else {
                 return Ok(());
             };
-            (Some(cert), dialog::Purpose::SignedCopy(&self.path))
+            (
+                Some(cert),
+                dialog::Purpose::SignedCopy(&self.path),
+                appearance,
+            )
         } else {
-            (None, dialog::Purpose::HighlightedCopy(&self.path))
+            (None, dialog::Purpose::HighlightedCopy(&self.path), None)
         };
         let Some(path) = dialog::choose(self.hwnd, purpose)? else {
             return Ok(());
         };
         let marks = self.marks.clone();
-        let appearance = self.signing.as_ref().and_then(signing::Session::appearance);
         let events = self.events.clone();
         let hwnd = self.hwnd as usize;
         if self.text_ready {
@@ -1112,7 +1125,10 @@ impl App {
             SIGN_CANCEL if !self.writing => self.end_signing(),
             SAVE_MARKS => self.save_copy(false)?,
             HIGHLIGHT | UNDERLINE
-                if !self.writing && self.signing.is_none() && self.page_count() > 0 =>
+                if !self.writing
+                    && !self.known_signed
+                    && self.signing.is_none()
+                    && self.page_count() > 0 =>
             {
                 let kind = if id == HIGHLIGHT {
                     MarkKind::Highlight

@@ -30,7 +30,7 @@ pub enum Event {
     Painted(u64, Result<Bitmap, String>),
     SignatureFields {
         revision: u64,
-        result: Result<Vec<super::signing::Field>, String>,
+        result: Result<super::signing::Choices, String>,
     },
     Saved {
         signed: bool,

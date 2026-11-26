@@ -1,10 +1,12 @@
-use super::{Target, array, pdf_error};
+use super::{Permissions, Target, array, pdf_error};
 use crate::highlight::PageGeometry;
 use lopdf::{Dictionary, Document, Object, ObjectId, decode_text_string};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 const INVALID_TARGET: &str = "指定された署名欄が見つからないか、この欄には署名できません。";
+pub(super) const EXISTING_ONLY: &str =
+    "この PDF には署名位置の制限があります。記入が許可された既存の空の署名欄を選んでください。";
 const INVALID_RECT: &str = "署名の範囲はページ内にある正の面積の長方形を指定してください。";
 const INVALID_TREE: &str = "PDFのフォーム階層に循環、重複、または深すぎる階層があります。";
 
@@ -229,9 +231,9 @@ impl<'a> Inventory<'a> {
             .transpose()
             .map_err(pdf_error)?
             .unwrap_or(0);
-        // Invisible, Hidden, NoZoom, NoRotate, NoView, ReadOnly, Locked,
-        // ToggleNoView and LockedContents are unsuitable for a fixed visible stamp.
-        if flags & (1 | 2 | 8 | 16 | 32 | 64 | 128 | 256 | 512) != 0 || dict.has(b"OC") {
+        // Locked (128) protects the widget's geometry and flags, while still
+        // permitting a form value. Filling it updates only its value and appearance.
+        if flags & (1 | 2 | 8 | 16 | 32 | 64 | 256 | 512) != 0 || dict.has(b"OC") {
             return Ok(());
         }
         // A widget's /MK /R is independent of the page's /Rotate. Such
@@ -301,10 +303,25 @@ fn parent_matches(dict: &Dictionary, expected: Option<ObjectId>) -> bool {
     }
 }
 
-pub(super) fn inspect(doc: &Document, fields: &[Object]) -> Result<Value, String> {
+/// Identity of each usable field in this revision, before applying earlier signers' locks.
+pub(super) fn eligible_fields(doc: &Document) -> Result<HashMap<String, ObjectId>, String> {
+    let (_, form) = super::acroform(doc)?;
+    let fields = array(doc, &form, b"Fields")?;
+    Ok(Inventory::load(doc, &doc.get_pages(), &fields)?
+        .into_iter()
+        .filter_map(|c| Some((c.name, c.placement.existing?.0)))
+        .collect())
+}
+
+pub(super) fn inspect(
+    doc: &Document,
+    fields: &[Object],
+    permissions: &Permissions,
+) -> Result<Value, String> {
     let pages = doc.get_pages();
     let rows: Vec<_> = Inventory::load(doc, &pages, fields)?
         .into_iter()
+        .filter(|c| permissions.allows_field(&c.name))
         .map(|c| {
             let name = if c.name.is_empty() {
                 "署名欄"
@@ -316,22 +333,27 @@ pub(super) fn inspect(doc: &Document, fields: &[Object]) -> Result<Value, String
             row
         })
         .collect();
-    Ok(json!({ "pages": pages.len(), "fields": rows }))
+    Ok(json!({ "pages": pages.len(), "fields": rows,
+        "alreadySigned": permissions.signed(), "allowsNewField": permissions.allows_new_field() }))
 }
 
 pub(super) fn resolve(
     doc: &Document,
     fields: &[Object],
     target: &Target,
+    permissions: &Permissions,
 ) -> Result<Placement, String> {
     let pages = doc.get_pages();
     match target {
         Target::Field(id) => Inventory::load(doc, &pages, fields)?
             .into_iter()
-            .find(|c| c.id == *id)
+            .find(|c| c.id == *id && permissions.allows_field(&c.name))
             .map(|c| c.placement)
             .ok_or_else(|| INVALID_TARGET.into()),
         Target::Area { page, rect } => {
+            if !permissions.allows_new_field() {
+                return Err(EXISTING_ONLY.into());
+            }
             if !valid_unit(*rect) {
                 return Err(INVALID_RECT.into());
             }

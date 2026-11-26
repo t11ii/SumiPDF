@@ -1,16 +1,18 @@
 //! Create a PDF approval signature in an incremental revision.
 //! The callback signs exactly the two slices declared by /ByteRange.
 mod fields;
+mod permissions;
 
 use lopdf::{Dictionary, Document, IncrementalDocument, Object, ObjectId, StringFormat, Writer};
 use lopdf::{decode_text_string, dictionary};
 use memchr::memmem;
+use permissions::Permissions;
 use std::collections::HashSet;
 use time::OffsetDateTime;
 
 const CMS_CAPACITY: usize = 32 * 1024;
 const ENCRYPTED: &str = "暗号化されたPDFは編集できません。";
-const ALREADY_SIGNED: &str = "このPDFには既存の署名または証明による制限があります。";
+const ALREADY_SIGNED: &str = "署名や証明で保護された PDF には注釈を追加できません。署名を追加するには「電子署名…」を選んでください。";
 const PLACEHOLDER_ERROR: &str = "PDFの署名領域を特定できませんでした。";
 const TOO_LARGE: &str = "署名済みPDFが4 GiBに達する文書には対応していません。";
 
@@ -25,15 +27,15 @@ pub enum Target {
 }
 
 pub fn inspect(input: &[u8]) -> Result<serde_json::Value, String> {
-    let doc = editable_document(input)?;
+    let (doc, permissions) = signing_document(input)?;
     let (_, form) = acroform(&doc)?;
-    fields::inspect(&doc, &array(&doc, &form, b"Fields")?)
+    fields::inspect(&doc, &array(&doc, &form, b"Fields")?, &permissions)
 }
 
 pub fn locate(input: &[u8], target: &Target) -> Result<(u32, [f32; 4]), String> {
-    let doc = editable_document(input)?;
+    let (doc, permissions) = signing_document(input)?;
     let (_, form) = acroform(&doc)?;
-    let placement = fields::resolve(&doc, &array(&doc, &form, b"Fields")?, target)?;
+    let placement = fields::resolve(&doc, &array(&doc, &form, b"Fields")?, target, &permissions)?;
     Ok((placement.page, placement.unit))
 }
 
@@ -134,8 +136,7 @@ fn sign(
     Ok(output)
 }
 
-/// Load the source for an incremental edit, preserving signature and encryption restrictions.
-pub(crate) fn editable_document(input: &[u8]) -> Result<Document, String> {
+fn load_document(input: &[u8]) -> Result<Document, String> {
     let doc = Document::load_mem(input).map_err(|e| match e {
         lopdf::Error::InvalidPassword | lopdf::Error::UnsupportedSecurityHandler(_) => {
             ENCRYPTED.into()
@@ -148,12 +149,27 @@ pub(crate) fn editable_document(input: &[u8]) -> Result<Document, String> {
     if !input.starts_with(b"%PDF-") || doc.xref_recovery.is_some() || doc.xref_start == 0 {
         return Err("PDFの相互参照が不完全なため、元の内容を保って編集できません。".into());
     }
+    Ok(doc)
+}
+
+/// Annotation changes are still limited to unsigned documents.
+pub(crate) fn editable_document(input: &[u8]) -> Result<Document, String> {
+    let doc = load_document(input)?;
     if doc.catalog().map_err(pdf_error)?.has(b"Perms")
         || doc.objects.values().any(|o| contains_signature(&doc, o))
     {
         return Err(ALREADY_SIGNED.into());
     }
     Ok(doc)
+}
+
+fn signing_document(input: &[u8]) -> Result<(Document, Permissions), String> {
+    let doc = load_document(input)?;
+    let permissions = Permissions::read(&doc, input)?;
+    if !permissions.allows_new_field() && needs_transparency_upgrade(&doc)? {
+        return Err("この PDF は署名の外観を表示するために文書のバージョン変更が必要ですが、既存の署名がその変更を制限しています。".into());
+    }
+    Ok((doc, permissions))
 }
 
 fn acroform(doc: &Document) -> Result<(Option<ObjectId>, Dictionary), String> {
@@ -173,18 +189,8 @@ fn acroform(doc: &Document) -> Result<(Option<ObjectId>, Dictionary), String> {
 /// Blend mode and image soft masks in annotation appearances require PDF 1.4.
 pub(crate) fn require_transparency(revision: &mut IncrementalDocument) -> Result<(), String> {
     let original = revision.get_prev_documents();
-    if !matches!(original.version.as_str(), "1.0" | "1.1" | "1.2" | "1.3") {
+    if !needs_transparency_upgrade(original)? {
         return Ok(());
-    }
-    let catalog = original.catalog().map_err(pdf_error)?;
-    if catalog.has(b"Version") {
-        let version = catalog
-            .get_deref(b"Version", original)
-            .and_then(Object::as_name)
-            .map_err(pdf_error)?;
-        if !matches!(version, b"1.0" | b"1.1" | b"1.2" | b"1.3") {
-            return Ok(());
-        }
     }
     let root = original
         .trailer
@@ -202,17 +208,35 @@ pub(crate) fn require_transparency(revision: &mut IncrementalDocument) -> Result
     Ok(())
 }
 
+fn needs_transparency_upgrade(doc: &Document) -> Result<bool, String> {
+    if !matches!(doc.version.as_str(), "1.0" | "1.1" | "1.2" | "1.3") {
+        return Ok(false);
+    }
+    let catalog = doc.catalog().map_err(pdf_error)?;
+    if !catalog.has(b"Version") {
+        return Ok(true);
+    }
+    let version = catalog
+        .get_deref(b"Version", doc)
+        .and_then(Object::as_name)
+        .map_err(pdf_error)?;
+    Ok(matches!(version, b"1.0" | b"1.1" | b"1.2" | b"1.3"))
+}
+
 fn prepare_revision(
     input: Vec<u8>,
     visible: Option<Visible<'_>>,
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
-    let doc = editable_document(&input)?;
+    let (doc, permissions) = signing_document(&input)?;
     let (existing_form_id, mut form) = acroform(&doc)?;
     let mut fields = array(&doc, &form, b"Fields")?;
     let placement = visible
         .as_ref()
-        .map(|v| fields::resolve(&doc, &fields, v.target).map(|p| (v, p)))
+        .map(|v| fields::resolve(&doc, &fields, v.target, &permissions).map(|p| (v, p)))
         .transpose()?;
+    if placement.is_none() && !permissions.allows_new_field() {
+        return Err(fields::EXISTING_ONLY.into());
+    }
     let flags = form
         .get(b"SigFlags")
         .ok()
@@ -281,25 +305,34 @@ fn prepare_revision(
         fields.push(id.into());
         form.set("Fields", fields);
     }
-    form.set("SigFlags", flags | 3);
-    if let Some(id) = existing_form_id {
-        revision.new_document.set_object(id, form);
-    } else {
-        let root_id = revision
-            .get_prev_documents()
-            .trailer
-            .get(b"Root")
-            .and_then(Object::as_reference)
-            .map_err(pdf_error)?;
-        revision
-            .opt_clone_object_to_new_document(root_id)
-            .map_err(pdf_error)?;
-        let update = &mut revision.new_document;
-        let form_id = update.try_add_object(form).map_err(pdf_error)?;
-        update
-            .get_dictionary_mut(root_id)
-            .map_err(pdf_error)?
-            .set("AcroForm", form_id);
+    // Filling a prepared field in a signed document should change only the
+    // field, its widget appearance and the new signature objects.
+    if !permissions.signed() || new_widget.is_some() {
+        form.set("SigFlags", flags | 3);
+        if let Some(id) = existing_form_id {
+            revision.new_document.set_object(id, form);
+        } else {
+            let root_id = revision
+                .get_prev_documents()
+                .trailer
+                .get(b"Root")
+                .and_then(Object::as_reference)
+                .map_err(pdf_error)?;
+            revision
+                .opt_clone_object_to_new_document(root_id)
+                .map_err(pdf_error)?;
+            let update = &mut revision.new_document;
+            // Keep a direct AcroForm direct when updating an already-signed catalog.
+            let value = if permissions.signed() {
+                Object::Dictionary(form)
+            } else {
+                update.try_add_object(form).map_err(pdf_error)?.into()
+            };
+            update
+                .get_dictionary_mut(root_id)
+                .map_err(pdf_error)?
+                .set("AcroForm", value);
+        }
     }
     if visible.is_some() {
         require_transparency(&mut revision)?;

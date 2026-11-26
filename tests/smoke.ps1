@@ -178,11 +178,12 @@ function Wait-SignatureState([IntPtr]$Window, [string]$StatusText, [bool]$CanSav
 $exe = (Resolve-Path -LiteralPath $Executable).Path
 $dir = Join-Path ([IO.Path]::GetTempPath()) ("SumiPDF-smoke-" + [Guid]::NewGuid().ToString('N'))
 $fixture = Join-Path $dir 'two pages.pdf'
+$signedFixture = Join-Path $dir 'signed once.pdf'
 $viewer = $null
 try {
     [void][IO.Directory]::CreateDirectory($dir)
     Write-TestPdf $fixture
-    & (Join-Path $PSScriptRoot 'signingCli.ps1') -Executable $exe -Pdf $fixture
+    & (Join-Path $PSScriptRoot 'signingCli.ps1') -Executable $exe -Pdf $fixture -SignedGuiFixture $signedFixture
     Write-Host "Release EXE size $((Get-Item -LiteralPath $exe).Length) bytes."
     # The first observation includes process launch. Both include polling latency.
     $timer = [Diagnostics.Stopwatch]::StartNew()
@@ -248,6 +249,32 @@ try {
         throw 'The viewer did not close normally.'
     }
     if ($viewer.ExitCode -ne 0) { throw "The viewer exited with code $($viewer.ExitCode)." }
+    $viewer.Dispose()
+    $viewer = $null
+
+    # A PDF with an ordinary approval signature can use the remaining field or a new position.
+    $timer.Restart()
+    $viewer = Start-Process -FilePath $exe -ArgumentList ('"{0}"' -f $signedFixture) -PassThru
+    $window = Wait-Page $viewer 'signed once.pdf' '1 / 2' $timer
+    [SumiSmoke]::Click($window, 107)
+    Wait-SignatureState $window '青枠が選択した署名欄' $true $true
+    if ([SumiSmoke]::ReadText([SumiSmoke]::GetDlgItem($window, 111)) -ne '2 / 2') {
+        throw 'Co-signing did not navigate to the remaining Approval field.'
+    }
+    [SumiSmoke]::Pick($window, 127, 0)
+    Wait-SignatureState $window '枠の角から' $false $true
+    [SumiSmoke]::Pick($window, 127, 2)
+    Wait-SignatureState $window 'ページに表示しない電子署名' $true $false
+    [SumiSmoke]::Click($window, 130)
+    Wait-HighlightState $viewer $window 'ページ全体' $false
+    foreach ($id in @(108, 115)) {
+        if ([SumiSmoke]::IsWindowEnabled([SumiSmoke]::GetDlgItem($window, $id))) {
+            throw 'Annotation tools were enabled after identifying an existing signature.'
+        }
+    }
+    if (-not $viewer.CloseMainWindow() -or -not $viewer.WaitForExit(5000) -or $viewer.ExitCode -ne 0) {
+        throw 'The viewer did not close the signed document normally.'
+    }
 } finally {
     if ($null -ne $viewer) {
         if (-not $viewer.HasExited) { $viewer.Kill(); $viewer.WaitForExit() }
