@@ -6,6 +6,12 @@ using System.Runtime.InteropServices;
 public static class ScrollSettings {
     [DllImport("user32.dll", SetLastError = true)]
     static extern bool SystemParametersInfoW(uint action, uint param, out int value, uint settings);
+    [DllImport("user32.dll", EntryPoint="SystemParametersInfoW", SetLastError=true)]
+    static extern bool SetParameter(uint action, uint param, IntPtr value, uint flags);
+    public static void ClientAnimations(bool enabled) {
+        if (!SetParameter(0x1043, 0, new IntPtr(enabled ? 1 : 0), 0))
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+    }
     [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr window);
     public static bool ClientAnimations() {
         int enabled;

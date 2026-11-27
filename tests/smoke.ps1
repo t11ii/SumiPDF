@@ -170,6 +170,28 @@ public static class SumiSmoke {
     public static void CloseDialog(IntPtr dialog) {
         Post(dialog, 0x0010, 0, IntPtr.Zero); // WM_CLOSE
     }
+    public static void DismissSaveConfirmation(int pid, IntPtr owner) {
+        var timer = System.Diagnostics.Stopwatch.StartNew();
+        while (timer.ElapsedMilliseconds < 8000) {
+            var dialog = Dialog(pid, "SumiPDF");
+            if (dialog != IntPtr.Zero) {
+                bool saved = false;
+                EnumChildWindows(dialog, (control, unused) => {
+                    saved = ClassName(control) == "Static" && ReadText(control).StartsWith("Saved the signed PDF.");
+                    return !saved;
+                }, IntPtr.Zero);
+                if (saved) {
+                    CloseDialog(dialog);
+                    while (timer.ElapsedMilliseconds < 8000 && !IsWindowEnabled(owner))
+                        System.Threading.Thread.Sleep(20);
+                    if (IsWindowEnabled(owner)) return;
+                    break;
+                }
+            }
+            System.Threading.Thread.Sleep(20);
+        }
+        throw new InvalidOperationException("The signed-copy confirmation did not close.");
+    }
     public static void Click(IntPtr window, int id) {
         Post(GetDlgItem(window, id), 0x00F5, 0, IntPtr.Zero); // BM_CLICK
     }

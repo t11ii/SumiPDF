@@ -106,6 +106,13 @@ function Test-ReadingTabs([Diagnostics.Process]$Viewer, [IntPtr]$Window, [string
             throw "A quarter-detent wheel did not smoothly shift the page boundary: $movement samples."
         }
         $savedStripe = Test-ScrollMotion $Window $savedStripe
+        # Exercise both Windows motion preferences on the disposable hosted runner.
+        if ($env:RUNNER_ENVIRONMENT -eq 'github-hosted' -and ![ScrollSettings]::ClientAnimations()) {
+            try {
+                [ScrollSettings]::ClientAnimations($true)
+                $savedStripe = Test-ScrollMotion $Window $savedStripe
+            } finally { [ScrollSettings]::ClientAnimations($false) }
+        }
     }
     if ($ScreenshotPath) {
         try { Save-ReadingScreenshot $Window $ScreenshotPath }

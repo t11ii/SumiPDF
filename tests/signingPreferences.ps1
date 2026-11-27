@@ -117,14 +117,9 @@ function Test-SigningPreferences([string]$ExecutablePath, [string]$InputPdf, [st
             $dialog = Wait-Dialog $viewer.Id 'Save a signed copy'
             $out = Join-Path $Folder "Preference test $run-signed.pdf"
             [SumiSmoke]::AcceptFileDialog($dialog)
-            $notice = Wait-Dialog $viewer.Id 'SumiPDF'
+            [SumiSmoke]::DismissSaveConfirmation($viewer.Id, $window)
             $expectedWatermark = @('pdf', 'png', 'pdf', 'builtin')[$run - 1]
             Assert-GuiSignature $out $Identity.Thumbprint $expectedWatermark
-            [SumiSmoke]::Click($notice, 1)
-            $timer = [Diagnostics.Stopwatch]::StartNew()
-            while (![SumiSmoke]::IsWindowEnabled($window) -and $timer.ElapsedMilliseconds -lt 5000) {
-                Start-Sleep -Milliseconds 25
-            }
             if ($run -lt 4) {
                 [SumiSmoke]::Click($window, 107)
                 Wait-SignatureState $window "Signer: $($Identity.Name)" $true $true
