@@ -26,6 +26,7 @@ public static class ReadingProbe {
     [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr window, out Rect rect);
     [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr window, uint command);
     [DllImport("user32.dll")] static extern bool IsWindow(IntPtr window);
+    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr window);
     [DllImport("user32.dll", CharSet=CharSet.Unicode, ExactSpelling=true)]
     static extern IntPtr FindWindowExW(IntPtr parent, IntPtr after, string kind, string name);
     [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", ExactSpelling=true, CharSet=CharSet.Unicode)]
@@ -105,6 +106,27 @@ public static class ReadingProbe {
         }
         Shortcut(list, 0x1B, 0, () => !IsWindow(dialog), "dismiss help with Escape");
     }
+    public static void OpenFind(IntPtr window) {
+        Shortcut(window, 0x46, 2, () => IsWindowVisible(GetDlgItem(window, 161)), "open Find");
+    }
+    public static void CloseFind(IntPtr window) {
+        var edit = GetDlgItem(window, 161);
+        Shortcut(edit, 0x1B, 0, () => !IsWindowVisible(edit), "close Find with Escape");
+    }
+    public static void SetFindQuery(IntPtr window, string text) {
+        UIntPtr result;
+        if (FindListEntry(GetDlgItem(window, 161), 0x000C, UIntPtr.Zero, text, 2, 2000, out result) == IntPtr.Zero
+            || result == UIntPtr.Zero) throw new InvalidOperationException("Could not set the search text.");
+    }
+    public static void AppendFindQuestionMark(IntPtr window) {
+        var edit = GetDlgItem(window, 161);
+        int len = Query(edit, 0x000E); // WM_GETTEXTLENGTH
+        UIntPtr ignored;
+        SendMessageTimeoutW(edit, 0x00B1, new UIntPtr((uint)len), new IntPtr(len), 2, 2000, out ignored); // EM_SETSEL
+        short key = VkKeyScanExW('?', GetKeyboardLayout(GetWindowThreadProcessId(edit, IntPtr.Zero)));
+        if (key == -1) throw new InvalidOperationException("No question mark key on this test layout.");
+        Shortcut(edit, key & 255, key >> 8, () => Query(edit, 0x000E) == len + 1, "type ? in Find");
+    }
     public static void ClickClose(IntPtr window, string name) {
         var close = FindWindowExW(GetDlgItem(window, 133), IntPtr.Zero, "Button", "Close " + name);
         Rect bounds;
@@ -127,6 +149,12 @@ public static class ReadingProbe {
     [DllImport("oleacc.dll")]
     static extern int AccessibleObjectFromWindow(IntPtr window, uint id, ref Guid iid,
         [MarshalAs(UnmanagedType.Interface)] out AccessibleTabs accessible);
+    public static string ControlName(IntPtr window, int id) {
+        var iid = typeof(AccessibleTabs).GUID;
+        AccessibleTabs accessible;
+        Marshal.ThrowExceptionForHR(AccessibleObjectFromWindow(GetDlgItem(window, id), 0xFFFFFFFC, ref iid, out accessible));
+        return accessible[0]; // CHILDID_SELF
+    }
     public static void ClickTab(IntPtr window, string name) {
         var tabs = GetDlgItem(window, 133);
         var iid = typeof(AccessibleTabs).GUID;
@@ -203,7 +231,7 @@ public static class ReadingProbe {
             return "";
         } finally { if (src != IntPtr.Zero) ReleaseDC(window, src); }
     }
-    public static string Viewport(IntPtr parent) {
+    static T ReadCanvas<T>(IntPtr parent, Func<IntPtr, int, int, string, T> observe) {
         var canvas = GetDlgItem(parent, 110);
         var previous = SetThreadDpiAwarenessContext(new IntPtr(-4));
         try {
@@ -213,10 +241,40 @@ public static class ReadingProbe {
             var dc = CreateCompatibleDC(screen);
             var bitmap = CreateCompatibleBitmap(screen, size[0], size[1]);
             var old = SelectObject(dc, bitmap);
-            try { return Capture(canvas, dc, size[0], size[1]); }
+            try {
+                string stripe = Capture(canvas, dc, size[0], size[1]);
+                return observe(dc, size[0], size[1], stripe);
+            }
             finally {
                 SelectObject(dc, old); DeleteObject(bitmap); DeleteDC(dc); ReleaseDC(canvas, screen);
             }
         } finally { if (previous != IntPtr.Zero) SetThreadDpiAwarenessContext(previous); }
+    }
+    public static string Viewport(IntPtr parent) {
+        return ReadCanvas(parent, (dc, w, h, stripe) => stripe);
+    }
+    public static int SearchHighlightPixels(IntPtr parent) {
+        return ReadCanvas(parent, (dc, w, h, stripe) => {
+            // Both matches are on blue pages. Recover the painted page bounds from
+            // its untouched centerline and sample the area around the fixture's text.
+            var blue = System.Text.RegularExpressions.Regex.Match(stripe, "B{12,}");
+            if (!blue.Success) return -1;
+            int top = blue.Index * 4, row = top + blue.Length * 2;
+            int left = 0, right = w - 1;
+            while (left < right && PageColor(GetPixel(dc, left, row)) != 'B') left++;
+            while (right > left && PageColor(GetPixel(dc, right, row)) != 'B') right--;
+            if (left == right) return -1;
+            double scale = (right - left + 1) / 612.0;
+            // Text starts at x=122 pt, baseline 347 pt from the top, size 24 pt.
+            int x1 = left + (int)(110 * scale), x2 = left + (int)(299 * scale);
+            int y1 = top + (int)(308 * scale), y2 = Math.Min(h - 1, top + (int)(365 * scale));
+            int count = 0;
+            for (int y = y1; y <= y2; y += 3) for (int x = x1; x <= x2; x += 3) {
+                uint p = GetPixel(dc, x, y);
+                int r = (int)(p & 255), g = (int)((p >> 8) & 255), b = (int)((p >> 16) & 255);
+                if (r > 185 && r - g > 32 && g - b > 32) count++;
+            }
+            return count;
+        });
     }
 }

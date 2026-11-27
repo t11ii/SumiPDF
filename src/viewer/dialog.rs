@@ -11,6 +11,7 @@ use windows_sys::Win32::{Foundation::HWND, UI::Controls::Dialogs::*};
 pub enum Purpose<'a> {
     Open,
     Watermark,
+    AcrobatWatermark,
     Pfx,
     SignedCopy(&'a Path),
     HighlightedCopy(&'a Path),
@@ -37,6 +38,7 @@ fn choose_paths(hwnd: HWND, purpose: Purpose<'_>) -> Result<Vec<PathBuf>, String
         Purpose::Pfx => "Open a PFX file for signing",
         Purpose::Open => "Open PDF",
         Purpose::Watermark => "Choose a PNG for the signature background",
+        Purpose::AcrobatWatermark => "Choose a single-page Acrobat watermark PDF",
     });
     let (filter, ext) = if matches!(purpose, Purpose::Pfx) {
         (wide("PKCS#12 (*.pfx, *.p12)\0*.pfx;*.p12\0"), wide("pfx"))
@@ -46,6 +48,12 @@ fn choose_paths(hwnd: HWND, purpose: Purpose<'_>) -> Result<Vec<PathBuf>, String
         (wide("PDF files (*.pdf)\0*.pdf\0"), wide("pdf"))
     };
     let mut directory = Vec::new();
+    if matches!(purpose, Purpose::AcrobatWatermark)
+        && let Some(folder) =
+            crate::preferences::acrobat_security_folder().filter(|folder| folder.is_dir())
+    {
+        directory.extend(folder.as_os_str().encode_wide().chain([0]));
+    }
     if let Purpose::SignedCopy(path) | Purpose::HighlightedCopy(path) = purpose {
         let mut name = path
             .file_stem()

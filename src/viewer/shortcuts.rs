@@ -14,6 +14,9 @@ const BINDINGS: &[&str] = &[
     "Right / Page Down\tNext page",
     "Home / End\tFirst / last page",
     "Ctrl+G, number, Enter\tGo to a page",
+    "Ctrl+F\tFind text in the current PDF",
+    "Enter / F3\tNext match",
+    "Shift+Enter / Shift+F3\tPrevious match",
     "Ctrl+Plus / Ctrl+Minus\tZoom in / out",
     "Ctrl+0\tFit page",
     "Ctrl+wheel\tZoom in / out",
@@ -33,6 +36,12 @@ pub(super) fn add_to_window_menu(hwnd: HWND) {
         let menu = GetSystemMenu(hwnd, 0);
         if !menu.is_null() {
             AppendMenuW(menu, MF_SEPARATOR, 0, null());
+            AppendMenuW(
+                menu,
+                MF_STRING,
+                FORGET_CERTIFICATE,
+                wide("Forget saved signing certificate").as_ptr(),
+            );
             AppendMenuW(
                 menu,
                 MF_STRING,

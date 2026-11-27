@@ -19,7 +19,7 @@ impl Position {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Placement {
     pub page: u32,
     pub x: i32,
@@ -119,6 +119,16 @@ impl Layout {
         self.position.ratio = self.ratios.get(&self.position.page).copied();
         self.forget_distant_sizes();
         self.clamp();
+    }
+
+    pub fn reveal_offset(&mut self, page: u32, dx: f64, dy: f64) -> bool {
+        // A narrow page may display only part of the pan used on a wider
+        // neighbor. Apply the requested offset from its actual screen position.
+        if dx != 0.0 {
+            let overflow = f64::from(((self.size(page).0 - self.area.0 + 1) / 2).max(0));
+            self.position.horizontal = self.position.horizontal.clamp(-overflow, overflow);
+        }
+        self.scroll(dx, dy)
     }
 
     pub fn scroll(&mut self, dx: f64, dy: f64) -> bool {
@@ -237,6 +247,27 @@ mod tests {
         let mut l = Layout::new(count, Position::at(0));
         l.configure((600, 800), 18, 14, 1.0);
         l
+    }
+
+    #[test]
+    fn revealing_a_hit_on_a_narrower_zoomed_page_uses_its_visible_pan() {
+        let mut pages = layout(3);
+        pages.configure((600, 800), 18, 14, 4.0);
+        pages.measured(0, 1.0);
+        pages.measured(1, 0.25);
+        pages.scroll(900.0, 0.0);
+        pages.jump(1);
+        let narrow_x = |layout: &Layout| {
+            layout
+                .visible()
+                .into_iter()
+                .find(|p| p.page == 1)
+                .unwrap()
+                .x
+        };
+        let before = narrow_x(&pages);
+        assert!(pages.reveal_offset(1, -70.0, 0.0));
+        assert_eq!(narrow_x(&pages), before - 70);
     }
 
     #[test]

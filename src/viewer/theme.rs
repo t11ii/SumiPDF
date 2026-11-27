@@ -342,7 +342,10 @@ fn paint_control(hwnd: HWND, dc: HDC, hot: bool) {
 }
 
 pub(super) fn style_control(hwnd: HWND) -> Result<(), String> {
-    let procedure: SUBCLASSPROC = if unsafe { GetDlgCtrlID(hwnd) } == PAGE_INPUT as i32 {
+    let procedure: SUBCLASSPROC = if matches!(
+        unsafe { GetDlgCtrlID(hwnd) } as usize,
+        PAGE_INPUT | find::EDIT
+    ) {
         Some(edit_proc)
     } else {
         Some(control_proc)

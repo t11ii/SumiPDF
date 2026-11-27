@@ -7,7 +7,17 @@ fn sample(rotate: i64) -> Vec<u8> {
     let latin =
         d.add_object(dictionary! { "Type"=>"Font", "Subtype"=>"Type1", "BaseFont"=>"Helvetica" });
     let cid=d.add_object(dictionary! { "Type"=>"Font", "Subtype"=>"CIDFontType2", "DW"=>1000, "W"=>vec![1.into(), Object::Array(vec![800.into(),900.into()])] });
-    let japanese=d.add_object(dictionary! { "Type"=>"Font","Subtype"=>"Type0","Encoding"=>"Identity-H","DescendantFonts"=>vec![Object::Reference(cid)] });
+    let to_unicode = d.add_object(Stream::new(
+        dictionary! {},
+        b"/CIDInit /ProcSet findresource begin
+12 dict begin begincmap /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def
+/CMapName /Adobe-Identity-UCS def /CMapType 2 def
+1 begincodespacerange <0000> <ffff> endcodespacerange
+1 beginbfrange <0001> <0002> [<6771> <4eac>] endbfrange
+endcmap CMapName currentdict /CMap defineresource pop end end"
+            .to_vec(),
+    ));
+    let japanese=d.add_object(dictionary! { "Type"=>"Font","Subtype"=>"Type0","Encoding"=>"Identity-H","DescendantFonts"=>vec![Object::Reference(cid)],"ToUnicode"=>to_unicode });
     let nested = d.add_object(Stream::new(
         dictionary! {
             "Subtype"=>"Form", "BBox"=>vec![0.into(),0.into(),70.into(),70.into()],
@@ -116,5 +126,104 @@ fn unsupported_page_content_falls_back_but_a_bad_page_number_is_reported() {
     d.save_to(&mut source).unwrap();
     let doc = TextDocument::load(&source).unwrap();
     assert!(doc.page(0).unwrap().is_empty());
+    assert!(doc.search_page(0, "A").is_err());
     assert!(doc.page(1).is_err());
+}
+
+#[test]
+fn search_maps_split_text_and_japanese_to_rotated_cropped_page_rectangles() {
+    for angle in [0, 90, 180, 270] {
+        let doc = TextDocument::load_for_search(&sample(angle)).unwrap();
+        assert_eq!(doc.page_count(), 1);
+        let layout = doc.page(0).unwrap();
+        let rects = doc.search_page(0, "aB   cd").unwrap();
+        assert_eq!(
+            rects,
+            [vec![
+                union(layout.glyphs[0], layout.glyphs[1]),
+                union(layout.glyphs[2], layout.glyphs[3])
+            ]]
+        );
+        assert_eq!(
+            doc.search_page(0, "東京").unwrap(),
+            [vec![union(layout.glyphs[4], layout.glyphs[5])]]
+        );
+        assert!(doc.search_page(0, "absent").unwrap().is_empty());
+        assert!(doc.search_page(0, "　 ").unwrap().is_empty());
+        assert!(doc.search_page(1, "ab").is_err());
+    }
+}
+
+#[test]
+fn search_finds_repeated_words_joined_by_glyph_positioning_in_signed_pdfs() {
+    let mut doc = Document::load_mem(&sample(0)).unwrap();
+    let page = doc.page_iter().next().unwrap();
+    doc.change_page_content(
+        page,
+        b"BT /F 10 Tf 26 90 Td 12 TL [(Sea) 15 (RCH) -340 (one)] TJ (search one) ' ET".to_vec(),
+    )
+    .unwrap();
+    let mut original = Vec::new();
+    doc.save_to(&mut original).unwrap();
+    let signed = crate::pdfseal::sign_pdf(original, |_, _| Ok(vec![1; 64])).unwrap();
+    assert!(TextDocument::load(&signed).is_err());
+    let doc = TextDocument::load_for_search(&signed).unwrap();
+    let found = doc.search_page(0, "search one").unwrap();
+    assert_eq!(found.len(), 2);
+    assert_eq!(found[0].len(), 1);
+    assert_eq!(found[1].len(), 1);
+    assert!(found[0][0].bottom < found[1][0].top);
+}
+
+#[test]
+fn simple_font_tounicode_takes_precedence_and_preserves_ligatures_surrogate_pairs_and_wrap() {
+    let mut doc = Document::load_mem(&sample(0)).unwrap();
+    let cmap = doc.add_object(Stream::new(
+        dictionary! {},
+        b"begincmap
+2 beginbfrange <40> <41> <0041> <42> <43> [<00660069> <d840dc00>] endbfrange
+2 beginbfchar <44> <6771> <45> <4eac> endbfchar endcmap"
+            .to_vec(),
+    ));
+    let font = doc
+        .objects
+        .values_mut()
+        .filter_map(|o| o.as_dict_mut().ok())
+        .find(|d| d.get(b"BaseFont").and_then(Object::as_name).ok() == Some(b"Helvetica"))
+        .unwrap();
+    font.set("ToUnicode", cmap);
+    font.set("Encoding", "WinAnsiEncoding");
+    let page = doc.page_iter().next().unwrap();
+    doc.change_page_content(
+        page,
+        b"BT /F 10 Tf 36 90 Td 12 TL (@A) Tj (BCD) Tj (E) ' ET".to_vec(),
+    )
+    .unwrap();
+    let doc = TextDocument::from_document(doc);
+    assert_eq!(doc.search_page(0, "ABfi𠀀東京").unwrap()[0].len(), 2);
+    assert_eq!(
+        doc.search_page(0, "FI").unwrap(),
+        [vec![doc.page(0).unwrap().glyphs[2]]]
+    );
+    assert!(doc.search_page(0, "@A").unwrap().is_empty());
+}
+
+#[test]
+fn winansi_text_and_following_glyphs_remain_searchable() {
+    let mut doc = Document::load_mem(&sample(0)).unwrap();
+    let font = doc
+        .objects
+        .values_mut()
+        .filter_map(|o| o.as_dict_mut().ok())
+        .find(|d| d.get(b"BaseFont").and_then(Object::as_name).ok() == Some(b"Helvetica"))
+        .unwrap();
+    font.set("Encoding", "WinAnsiEncoding");
+    let page = doc.page_iter().next().unwrap();
+    doc.change_page_content(
+        page,
+        b"BT /F 10 Tf 36 90 Td <436166E92053747261DF65> Tj ET".to_vec(),
+    )
+    .unwrap();
+    let doc = TextDocument::from_document(doc);
+    assert_eq!(doc.search_page(0, "CAFÉ STRASSE").unwrap().len(), 1);
 }

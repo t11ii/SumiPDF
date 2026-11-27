@@ -2,9 +2,15 @@ use super::{App, Controls, Event, VIEW, canvas, dialog, notice, save, wide, work
 use crate::{
     highlight::UnitRect,
     pdfseal,
+    preferences::{self, Identity, PfxIdentity},
     wincrypto::{CertificateSelection, SigningCertificate},
 };
-use std::{os::windows::ffi::OsStrExt, path::Path, ptr::null, sync::Arc};
+use std::{
+    os::windows::ffi::OsStrExt,
+    path::{Path, PathBuf},
+    ptr::null,
+    sync::Arc,
+};
 use windows_sys::Win32::{
     Foundation::{HWND, RECT},
     UI::{Input::KeyboardAndMouse::SetFocus, Shell::ShellExecuteW, WindowsAndMessaging::*},
@@ -101,8 +107,8 @@ impl Choices {
 }
 
 struct Watermark {
-    name: String,
-    bytes: Arc<[u8]>,
+    path: PathBuf,
+    bytes: Option<Arc<[u8]>>,
 }
 
 #[derive(Default)]
@@ -111,10 +117,75 @@ pub(super) struct Session {
     selected: Option<usize>,
     pub drawn: Option<(u32, UnitRect)>,
     watermark: Option<Watermark>,
-    pub(super) certificate: Option<CertificateSelection>,
+    certificate: Option<CertificateSelection>,
+    remembered_pfx: Option<PfxIdentity>,
 }
 
 impl Session {
+    fn restore(hwnd: HWND) -> Self {
+        let mut session = Self::default();
+        match preferences::load_watermark() {
+            Ok(path) => session.watermark = path.map(|path| Watermark { path, bytes: None }),
+            Err(e) => notice(hwnd, &e, true),
+        }
+        match preferences::load_identity() {
+            Ok(Some(Identity::Store { name, thumbprint })) => {
+                session.certificate = Some(CertificateSelection::personal(name, thumbprint));
+            }
+            Ok(Some(Identity::Pfx(record))) => session.remembered_pfx = Some(record),
+            Ok(None) => {}
+            Err(e) => notice(hwnd, &e, true),
+        }
+        session
+    }
+
+    pub(super) fn clear_certificate(&mut self) {
+        self.certificate = None;
+        self.remembered_pfx = None;
+    }
+
+    pub(super) fn resolve_certificate(
+        &mut self,
+        hwnd: HWND,
+    ) -> Result<Option<SigningCertificate>, String> {
+        if self.certificate.is_none() {
+            if let Some(mut saved) = self.remembered_pfx.clone() {
+                let latest = preferences::load_identity()?;
+                let current = matches!(&latest, Some(Identity::Pfx(other)) if other.path == saved.path && other.file_hash == saved.file_hash && other.thumbprint == saved.thumbprint);
+                saved.protected_password = match latest {
+                    Some(Identity::Pfx(other)) if current => other.protected_password,
+                    _ => None,
+                };
+                let Some((choice, record)) =
+                    SigningCertificate::pick_pfx_for_gui(hwnd, &saved.path, Some(&saved))?
+                else {
+                    return Ok(None);
+                };
+                if current && record.protected_password != saved.protected_password {
+                    remember_choice(hwnd, &Identity::Pfx(record.clone()));
+                }
+                self.remembered_pfx = Some(record);
+                self.certificate = Some(choice);
+            } else if let Some(choice) = SigningCertificate::pick(hwnd)? {
+                self.use_store(hwnd, choice)?;
+            }
+        }
+        match &self.certificate {
+            Some(choice) => choice.resolve(hwnd),
+            None => Ok(None),
+        }
+    }
+
+    fn use_store(&mut self, hwnd: HWND, choice: CertificateSelection) -> Result<(), String> {
+        let identity = Identity::Store {
+            name: choice.name.clone(),
+            thumbprint: choice.thumbprint()?,
+        };
+        self.certificate = Some(choice);
+        self.remembered_pfx = None;
+        remember_choice(hwnd, &identity);
+        Ok(())
+    }
     pub(super) fn loaded(&self) -> bool {
         self.choices.is_some()
     }
@@ -161,7 +232,14 @@ impl Session {
         };
         Ok(Some(save::Appearance {
             target,
-            watermark: self.watermark.as_ref().map(|w| w.bytes.clone()),
+            watermark: self
+                .watermark
+                .as_ref()
+                .map(|w| match &w.bytes {
+                    Some(bytes) => Ok(bytes.clone()),
+                    None => watermark_bytes(&w.path),
+                })
+                .transpose()?,
         }))
     }
 
@@ -173,8 +251,13 @@ impl Session {
             return "This PDF has no empty field available for another signature.".into();
         }
         let position = self.position_instructions(current_page);
-        match &self.certificate {
-            Some(cert) => format!("Signer: {}  ·  {position}", cert.name),
+        match self
+            .certificate
+            .as_ref()
+            .map(|c| &c.name)
+            .or_else(|| self.remembered_pfx.as_ref().map(|p| &p.name))
+        {
+            Some(name) => format!("Signer: {name}  ·  {position}"),
             None => {
                 format!("{position}  ·  Choose a certificate from the Windows store or a PFX file.")
             }
@@ -266,9 +349,11 @@ impl App {
         }
         self.tool = None;
         self.request_text()?;
-        self.signing = Some(Session::default());
+        let session = Session::restore(self.hwnd);
+        let custom = session.watermark.is_some();
+        self.signing = Some(session);
         self.ui.show_signing(true);
-        self.ui.toolbar.watermark(self.ui.watermark, false)?;
+        self.ui.toolbar.watermark(self.ui.watermark, custom)?;
         Controls::layout(self.hwnd);
         self.controls();
         self.status();
@@ -335,18 +420,33 @@ impl App {
         let Some(session) = self.signing.as_mut().filter(|s| s.has_positions()) else {
             return Ok(());
         };
-        let choice = if from_pfx {
+        if from_pfx {
             let Some(path) = dialog::choose(self.hwnd, dialog::Purpose::Pfx)? else {
                 return Ok(());
             };
-            SigningCertificate::pick_pfx(self.hwnd, &path)?
-        } else {
-            SigningCertificate::pick(self.hwnd)?
-        };
-        if let Some(choice) = choice {
-            session.certificate = Some(choice);
-            self.status();
+            if let Some((choice, record)) =
+                SigningCertificate::pick_pfx_for_gui(self.hwnd, &path, None)?
+            {
+                remember_choice(self.hwnd, &Identity::Pfx(record.clone()));
+                session.remembered_pfx = Some(record);
+                session.certificate = Some(choice);
+            }
+        } else if let Some(choice) = SigningCertificate::pick(self.hwnd)? {
+            session.use_store(self.hwnd, choice)?;
         }
+        self.status();
+        Ok(())
+    }
+
+    pub(super) fn forget_certificate(&mut self) -> Result<(), String> {
+        preferences::save_identity(None)?;
+        if let Some(session) = &mut self.signing {
+            session.clear_certificate();
+        }
+        for tab in &mut self.tabs {
+            tab.clear_certificate();
+        }
+        self.status();
         Ok(())
     }
 
@@ -357,17 +457,30 @@ impl App {
         if !session.can_pick_watermark() {
             return Ok(());
         }
-        let name = session.watermark.as_ref().map(|w| w.name.as_str());
-        match watermark_menu(self.hwnd, self.ui.watermark, name)? {
+        let path = session.watermark.as_ref().map(|w| w.path.as_path());
+        match watermark_menu(self.hwnd, self.ui.watermark, path)? {
             1 => session.watermark = None,
-            2 => {
-                let Some(path) = dialog::choose(self.hwnd, dialog::Purpose::Watermark)? else {
+            choice @ (2 | 4) => {
+                let purpose = if choice == 4 {
+                    dialog::Purpose::AcrobatWatermark
+                } else {
+                    dialog::Purpose::Watermark
+                };
+                let Some(path) = dialog::choose(self.hwnd, purpose)? else {
                     return Ok(());
                 };
-                session.watermark = Some(load_watermark(&path)?);
+                session.watermark = Some(Watermark {
+                    bytes: Some(watermark_bytes(&path)?),
+                    path,
+                });
             }
             3 => return open_designer(self.hwnd),
             _ => return Ok(()),
+        }
+        if let Err(e) =
+            preferences::save_watermark(session.watermark.as_ref().map(|w| w.path.as_path()))
+        {
+            notice(self.hwnd, &e, true);
         }
         self.ui
             .toolbar
@@ -376,41 +489,73 @@ impl App {
     }
 }
 
-fn load_watermark(path: &Path) -> Result<Watermark, String> {
-    let bytes = crate::read_watermark(path)?;
-    Ok(Watermark {
-        name: path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into(),
-        bytes: bytes.into(),
-    })
+fn remember_choice(hwnd: HWND, identity: &Identity) {
+    if let Err(e) = preferences::save_identity(Some(identity)) {
+        notice(hwnd, &e, true);
+    }
 }
 
-fn watermark_menu(owner: HWND, button: HWND, name: Option<&str>) -> Result<i32, String> {
+fn pdf_path(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
+}
+
+fn watermark_bytes(path: &Path) -> Result<Arc<[u8]>, String> {
+    let result = if pdf_path(path) {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    if path.metadata().map_err(|e| e.to_string())?.len() > 32 * 1024 * 1024 {
+                        return Err("Choose a watermark PDF no larger than 32 MiB.".into());
+                    }
+                    let _apartment = crate::winpdf::initialize()?;
+                    let pdf = crate::winpdf::Document::open_file(path)?;
+                    if pdf.page_count() != 1 {
+                        return Err("Choose a single-page watermark PDF.".into());
+                    }
+                    let bitmap = pdf.render_fit(0, (1024, 1024), 1.0)?;
+                    crate::cli::page_png(bitmap.width, bitmap.height, &bitmap.pixels, None)
+                })
+                .join()
+        })
+        .map_err(|_| "Could not render the watermark PDF.".to_owned())?
+    } else {
+        crate::read_watermark(path)
+    };
+    result.map(Into::into).map_err(|e| format!("Could not load the watermark from {}. Choose another watermark in the signature toolbar.\n{e}", path.display()))
+}
+
+fn watermark_menu(owner: HWND, button: HWND, path: Option<&Path>) -> Result<i32, String> {
     let menu = unsafe { CreatePopupMenu() };
     if menu.is_null() {
         return Err(std::io::Error::last_os_error().to_string());
     }
-    let custom = match name {
-        Some(filename) => format!("Change PNG… ({})", filename.replace('&', "&&")),
-        None => "Choose PNG…".into(),
+    let label = |base: &str, selected: Option<&Path>| match selected.and_then(Path::file_name) {
+        Some(filename) => format!("{base} ({})", filename.to_string_lossy().replace('&', "&&")),
+        None => base.to_owned(),
     };
+    let png = path.filter(|p| !pdf_path(p));
+    let pdf = path.filter(|p| pdf_path(p));
     let check = |value: bool| if value { MF_CHECKED } else { MF_UNCHECKED };
     let mut bounds = RECT::default();
     let result = unsafe {
         AppendMenuW(
             menu,
-            MF_STRING | check(name.is_none()),
+            MF_STRING | check(path.is_none()),
             1,
             wide("Default watermark (paper pattern)").as_ptr(),
         );
         AppendMenuW(
             menu,
-            MF_STRING | check(name.is_some()),
+            MF_STRING | check(png.is_some()),
             2,
-            wide(&custom).as_ptr(),
+            wide(&label("Choose PNG…", png)).as_ptr(),
+        );
+        AppendMenuW(
+            menu,
+            MF_STRING | check(pdf.is_some()),
+            4,
+            wide(&label("Choose Acrobat watermark PDF…", pdf)).as_ptr(),
         );
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
         AppendMenuW(menu, MF_STRING, 3, wide("Create watermark…").as_ptr());

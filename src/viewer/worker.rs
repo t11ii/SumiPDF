@@ -32,6 +32,7 @@ pub struct OpenedDocument {
 }
 
 pub enum Event {
+    Find(u64, Result<super::find::Page, String>),
     Opened(u64, Result<OpenedDocument, String>),
     Painted(u64, bool, Result<Frame, String>),
     SignatureFields {

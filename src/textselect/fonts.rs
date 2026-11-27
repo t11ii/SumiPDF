@@ -1,6 +1,5 @@
-//! Character advances are sufficient for highlighting: PDF glyph codes need not
-//! be translated to Unicode. Composite Identity-H fonts use a two-byte CID.
-use super::{number, standard};
+//! Glyph metrics for selection, with optional Unicode decoding for Find.
+use super::{number, search::Decoder, standard};
 use lopdf::{Dictionary, Document, Object};
 
 struct WidthRun {
@@ -23,15 +22,21 @@ enum Widths {
     },
 }
 
-pub(super) struct Font {
+pub(super) struct Font<'a> {
     pub two_byte: bool,
     pub ascent: f32,
     pub descent: f32,
     widths: Widths,
+    pub decoder: Option<Decoder<'a>>,
 }
 
-impl Font {
-    pub fn from_dict(doc: &Document, font: &Dictionary) -> Option<Self> {
+impl<'a> Font<'a> {
+    pub fn from_dict(
+        doc: &'a Document,
+        font: &'a Dictionary,
+        searchable: bool,
+        budget: &mut usize,
+    ) -> Option<Self> {
         let subtype = font.get(b"Subtype").ok()?.as_name().ok()?;
         let two_byte = subtype == b"Type0";
         let metrics = if two_byte {
@@ -116,12 +121,22 @@ impl Font {
             ascent: ascent / 1000.0,
             descent: descent / 1000.0,
             widths,
+            decoder: if searchable {
+                Decoder::for_font(doc, font, two_byte, budget)
+            } else {
+                None
+            },
         })
     }
 
     pub fn advance(&self, code: u16) -> Option<f32> {
         let width = match &self.widths {
-            Widths::Standard(table) => f32::from(*table.get(usize::from(code).checked_sub(32)?)?),
+            Widths::Standard(table) => {
+                let index = usize::from(code).checked_sub(32)?;
+                // Core fonts may omit /Widths. For a non-ASCII glyph use a
+                // representative advance when its width is unavailable.
+                f32::from(*table.get(index).unwrap_or(&table[usize::from(b'n' - 32)]))
+            }
             Widths::Fixed(w) => *w,
             Widths::Simple {
                 first,

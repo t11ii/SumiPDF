@@ -309,7 +309,12 @@ fn preview(
     )
 }
 
-fn page_png(w: u32, h: u32, bgra: &[u8], rect: Option<[f32; 4]>) -> Result<Vec<u8>, String> {
+pub(crate) fn page_png(
+    w: u32,
+    h: u32,
+    bgra: &[u8],
+    rect: Option<[f32; 4]>,
+) -> Result<Vec<u8>, String> {
     let mut rgb = Vec::with_capacity(bgra.len() / 4 * 3);
     let bounds = rect.map(|[l, t, r, b]| {
         [

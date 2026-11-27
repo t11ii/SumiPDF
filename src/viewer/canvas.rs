@@ -83,6 +83,8 @@ impl PageArea {
 
 #[derive(Default)]
 pub struct Canvas {
+    pub(super) matches: super::find::Matches,
+    pub(super) find_reveal: Option<(u32, UnitRect)>,
     pub bitmap: Option<Bitmap>,
     reading: Option<Reading>,
     resume: Option<Position>,
@@ -121,6 +123,56 @@ pub fn area(hwnd: HWND) -> (i32, i32) {
     let r = rect(hwnd);
     let margin = dips(hwnd, 18) * 2;
     ((r.right - margin).max(1), (r.bottom - margin).max(1))
+}
+
+/// Reuse pixels already painted at their previous positions. A horizontal pan
+/// can move different-width pages by different amounts, so repaint it normally.
+pub fn scroll_reading(hwnd: HWND, dx: f64, dy: f64) -> bool {
+    let Some((shift, update_layout)) = VIEW.with_borrow_mut(|v| {
+        let r = v.reading.as_mut()?;
+        let old = r.layout.visible();
+        if !r.layout.scroll(dx, dy) {
+            return None;
+        }
+        let new = r.layout.visible();
+        let shift = if dx == 0.0 {
+            old.first()
+                .and_then(|p| new.iter().find(|q| q.page == p.page).map(|q| q.y - p.y))
+                .or_else(|| {
+                    new.first()
+                        .and_then(|q| old.iter().find(|p| p.page == q.page).map(|p| q.y - p.y))
+                })
+        } else {
+            None
+        };
+        let range = new.first().zip(new.last()).map(|(a, b)| (a.page, b.page));
+        Some((
+            shift,
+            range != v.visible_range || r.layout.position.page != v.page,
+        ))
+    }) else {
+        return false;
+    };
+    match shift {
+        Some(0) => {}
+        Some(pixels) if pixels.unsigned_abs() < rect(hwnd).bottom as u32 => unsafe {
+            if ScrollWindowEx(
+                hwnd,
+                0,
+                pixels,
+                null(),
+                null(),
+                null_mut(),
+                null_mut(),
+                SW_INVALIDATE,
+            ) == 0
+            {
+                redraw(hwnd);
+            }
+        },
+        _ => redraw(hwnd),
+    }
+    update_layout
 }
 
 impl Canvas {
@@ -221,10 +273,59 @@ impl Canvas {
         }
     }
 
-    pub fn scroll(&mut self, dx: f64, dy: f64) -> bool {
-        self.reading
-            .as_mut()
-            .is_some_and(|r| r.layout.scroll(dx, dy))
+    pub(super) fn reveal_find(&mut self, hwnd: HWND) -> bool {
+        let Some((index, hit)) = self.find_reveal else {
+            return false;
+        };
+        let placement = if let Some(reading) = &self.reading {
+            // Wait for the measured dimensions before revealing a match on a
+            // landscape or unusually tall page. Estimates can put it offscreen.
+            if !reading.frames.get(&index).is_some_and(|p| p.image.is_ok()) {
+                return false;
+            }
+            let Some(p) = reading
+                .layout
+                .visible()
+                .into_iter()
+                .find(|p| p.page == index)
+            else {
+                return false;
+            };
+            PageArea {
+                x: p.x,
+                y: p.y,
+                w: p.w,
+                h: p.h,
+            }
+        } else {
+            if self.page != index || self.bitmap.is_none() {
+                return false;
+            }
+            self.layout(hwnd)
+        };
+        self.find_reveal = None;
+        let target = placement.pixels(&hit);
+        let viewport = rect(hwnd);
+        let margin = dips(hwnd, 12);
+        let offset = |start: i32, end: i32, extent: i32| {
+            if start >= margin && end <= extent - margin {
+                0
+            } else if end - start > extent - 2 * margin {
+                margin - start
+            } else {
+                (extent - (end - start)) / 2 - start
+            }
+        };
+        let dx = offset(target.left, target.right, viewport.right);
+        let dy = offset(target.top, target.bottom, viewport.bottom);
+        if let Some(reading) = &mut self.reading {
+            reading.layout.reveal_offset(index, dx.into(), (-dy).into())
+        } else {
+            self.offset.0 += dx;
+            self.offset.1 += dy;
+            self.layout(hwnd);
+            dx != 0 || dy != 0
+        }
     }
 
     pub fn next_render(&mut self, page: u32, area: (i32, i32)) -> Option<(u32, Option<u64>)> {
@@ -313,14 +414,15 @@ impl Canvas {
         quality: Quality,
         reading: bool,
         result: Result<Frame, String>,
-    ) {
+    ) -> bool {
         if reading != self.reading.is_some() {
-            return;
+            return false;
         }
         if let Some(r) = &mut self.reading {
             if !r.layout.wanted().contains(&page) {
-                return;
+                return false;
             }
+            let before = r.layout.visible();
             if let Ok(frame) = &result {
                 r.layout.measured(page, frame.ratio);
             }
@@ -334,6 +436,7 @@ impl Canvas {
                     image,
                 },
             );
+            return before.iter().any(|p| p.page == page) || before != r.layout.visible();
         } else if self.page == page {
             self.single_quality = Some(quality);
             match result {
@@ -346,7 +449,9 @@ impl Canvas {
                     self.text = e;
                 }
             }
+            return true;
         }
+        false
     }
 
     pub fn set_tool(&mut self, tool: Option<MarkStyle>) {
@@ -559,6 +664,7 @@ fn line(dc: HDC, font: HFONT, color: u32, bounds: RECT, label: &str) {
 }
 
 fn paint_highlights(dc: HDC, clip: RECT, page: PageArea, index: u32, state: &Canvas) {
+    paint_find(dc, clip, page, index, &state.matches);
     let committed = state
         .marks
         .iter()
@@ -623,6 +729,50 @@ fn paint_highlights(dc: HDC, clip: RECT, page: PageArea, index: u32, state: &Can
             DeleteObject(bitmap);
         }
         DeleteDC(tile);
+    }
+}
+
+fn paint_find(dc: HDC, clip: RECT, page: PageArea, index: u32, matches: &super::find::Matches) {
+    let start = matches.hits.partition_point(|hit| hit.page < index);
+    let hits = &matches.hits[start..];
+    if hits.first().is_none_or(|hit| hit.page != index) {
+        return;
+    }
+    unsafe {
+        let saved = SaveDC(dc);
+        let brush = GetStockObject(DC_BRUSH) as HBRUSH;
+        SelectObject(dc, brush);
+        for (i, hit) in hits.iter().take_while(|hit| hit.page == index).enumerate() {
+            let active = start + i == matches.active;
+            for bounds in &hit.boxes {
+                let r = page.pixels(bounds);
+                if r.right <= clip.left
+                    || r.left >= clip.right
+                    || r.bottom <= clip.top
+                    || r.top >= clip.bottom
+                {
+                    continue;
+                }
+                // Multiply the page pixels by a pale tint, preserving black lettering.
+                SetDCBrushColor(dc, if active { 0x0052a9ff } else { 0x0098f1ff });
+                BitBlt(
+                    dc,
+                    r.left,
+                    r.top,
+                    r.right - r.left,
+                    r.bottom - r.top,
+                    dc,
+                    r.left,
+                    r.top,
+                    MERGECOPY,
+                );
+                if active {
+                    SetDCBrushColor(dc, 0x002562a9);
+                    FrameRect(dc, &r, brush);
+                }
+            }
+        }
+        RestoreDC(dc, saved);
     }
 }
 
@@ -833,8 +983,7 @@ pub unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, w: WPARAM, l: LPAR
             if let Some((x, y)) = previous {
                 let (dx, dy) = (point.0 - x, point.1 - y);
                 if VIEW.with_borrow(|v| v.reading.is_some()) {
-                    if VIEW.with_borrow_mut(|v| v.scroll(f64::from(dx), -f64::from(dy))) {
-                        redraw(hwnd);
+                    if scroll_reading(hwnd, f64::from(dx), -f64::from(dy)) {
                         super::action(unsafe { GetParent(hwnd) }, super::SCROLLED);
                     }
                 } else {
@@ -1079,10 +1228,42 @@ mod tests {
             let outside = GetPixel(dc, 7, 0);
             let underline = GetPixel(dc, 3, 5);
             let red_marker = GetPixel(dc, 0, 3);
+            fill(dc, &bounds, 0xffffff);
+            SetPixelV(dc, 1, 1, 0);
+            let hit = |left, right| super::super::find::Hit {
+                page: 2,
+                boxes: vec![UnitRect {
+                    left,
+                    right,
+                    top: 0.0,
+                    bottom: 1.0,
+                }],
+            };
+            let matches = super::super::find::Matches {
+                hits: vec![hit(0.0, 0.5), hit(0.5, 1.0)],
+                active: 1,
+            };
+            let page = PageArea {
+                x: 0,
+                y: 0,
+                w: 8,
+                h: 8,
+            };
+            paint_find(dc, bounds, page, 1, &matches);
+            let other_page = GetPixel(dc, 2, 3);
+            paint_find(dc, bounds, page, 2, &matches);
+            let search_colors = [
+                GetPixel(dc, 1, 1),
+                GetPixel(dc, 2, 3),
+                GetPixel(dc, 6, 3),
+                GetPixel(dc, 7, 3),
+            ];
             SelectObject(dc, original);
             DeleteObject(bitmap);
             DeleteDC(dc);
             assert_eq!(outside, 0x00ffffff);
+            assert_eq!(other_page, 0xffffff);
+            assert_eq!(search_colors, [0, 0x98f1ff, 0x52a9ff, 0x2562a9]);
             assert_eq!(ink, 0);
             assert_eq!(underline, 0x00ff0000);
             assert_eq!(red_marker & 0xff, 0xff);

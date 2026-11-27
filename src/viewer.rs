@@ -1,5 +1,6 @@
 mod canvas;
 mod dialog;
+mod find;
 mod save;
 mod shortcuts;
 mod signing;
@@ -8,10 +9,7 @@ mod theme;
 mod toolbar;
 mod worker;
 
-use crate::{
-    highlight::{Mark, MarkColor, MarkKind, MarkStyle},
-    wincrypto::SigningCertificate,
-};
+use crate::highlight::{Mark, MarkColor, MarkKind, MarkStyle};
 use canvas::VIEW;
 use std::{
     ffi::OsString,
@@ -69,7 +67,9 @@ const CLOSE_TAB: usize = 136;
 const SELECT_TAB: usize = 137;
 const SCROLLED: usize = 138;
 const SHOW_SHORTCUTS: usize = 144;
+const FORGET_CERTIFICATE: usize = 0x1fe0;
 const RENDER_TIMER: usize = 1;
+const SCROLL_TIMER: usize = 2;
 const ACTION: u32 = WM_APP + 1;
 const READY: u32 = WM_APP + 2;
 const DROPPED: u32 = WM_APP + 3;
@@ -130,6 +130,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             action(hwnd, SHOW_SHORTCUTS);
             0
         }
+        WM_SYSCOMMAND if w & 0xfff0 == FORGET_CERTIFICATE => {
+            action(hwnd, FORGET_CERTIFICATE);
+            0
+        }
         WM_MEASUREITEM if w == COLOR && l != 0 => {
             let item = unsafe { &mut *(l as *mut MEASUREITEMSTRUCT) };
             item.itemHeight = dips(hwnd, theme::COLOR_ROW_HEIGHT) as u32;
@@ -151,7 +155,11 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
         }
         WM_COMMAND => {
             let id = w & 0xffff;
-            if id == PAGE_INPUT {
+            if id == find::EDIT {
+                if w >> 16 == EN_CHANGE as usize {
+                    action(hwnd, id);
+                }
+            } else if id == PAGE_INPUT {
                 if w >> 16 == EN_KILLFOCUS as usize {
                     action(hwnd, END_JUMP);
                 }
@@ -289,6 +297,7 @@ fn child(parent: HWND, class: &str, caption: &str, id: usize, style: u32) -> Res
 }
 
 struct Controls {
+    find: find::Bar,
     tab_bar: HWND,
     canvas: HWND,
     open: HWND,
@@ -362,6 +371,7 @@ impl Controls {
         }
         let mut toolbar = toolbar::Toolbar::new(hwnd)?;
         let mut ui = Self {
+            find: find::Bar::new(hwnd, &mut toolbar)?,
             tab_bar: tabs::create(hwnd)?,
             open: toolbar.button(OPEN, toolbar::OPEN_FILE)?,
             prev: toolbar.button(PREV, toolbar::PREVIOUS)?,
@@ -457,6 +467,7 @@ impl Controls {
         self.headline = make("Yu Gothic UI", 22, 600);
         self.icon_font = make("Segoe MDL2 Assets", 16, 400);
         self.toolbar.set_font(self.icon_font);
+        self.find.font(self.font);
         VIEW.with_borrow_mut(|v| {
             v.font = self.font;
             v.headline = self.headline;
@@ -489,7 +500,7 @@ impl Controls {
         let bounds = rect(hwnd);
         let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96) as i32;
         let s = |n: i32| (n * dpi + 48) / 96;
-        let compact = bounds.right < s(650);
+        let compact = bounds.right < s(690);
         let has_tabs = unsafe { GetWindowLongW(control(TABS), GWL_STYLE) } as u32 & WS_VISIBLE != 0;
         let tab_height = if has_tabs { 33 } else { 0 };
         let toolbar = tab_height + if compact { 80 } else { 44 };
@@ -515,6 +526,7 @@ impl Controls {
             (SMALLER, 221, button),
             (LARGER, 260, button),
             (FIT, 299, button),
+            (find::OPEN_FIND, 338, button),
         ] {
             place(control(id), s(x), s(tab_height + 6), s(width), s(32));
         }
@@ -562,6 +574,7 @@ impl Controls {
             }
             top += 37;
         }
+        top += find::Bar::layout(hwnd, top, &mut place);
         place(
             control(CANVAS_ID),
             0,
@@ -616,7 +629,32 @@ impl Drop for Controls {
     }
 }
 
+struct WheelMotion {
+    start: std::time::Instant,
+    distance: f64,
+    delivered: f64,
+}
+
+impl WheelMotion {
+    fn advance(&mut self) -> (f64, bool) {
+        let t = (self.start.elapsed().as_secs_f64() / 0.105).min(1.0);
+        let position = self.distance * (1.0 - (1.0 - t).powi(3));
+        let dy = position - self.delivered;
+        self.delivered = position;
+        (dy, t >= 1.0)
+    }
+}
+
+fn client_animations() -> bool {
+    let mut enabled = 0i32;
+    unsafe {
+        SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, (&raw mut enabled).cast(), 0) != 0
+            && enabled != 0
+    }
+}
+
 struct App {
+    find: find::State,
     tabs: Vec<tabs::Tab>,
     active_tab: Option<usize>,
     resume_source: Option<crate::winpdf::SigningSource>,
@@ -633,6 +671,7 @@ struct App {
     zoom: f64,
     writing: bool,
     wheel_delta: i32,
+    wheel_motion: Option<WheelMotion>,
     requested: Option<(u64, u32, (i32, i32), u64)>,
     marks: Vec<Mark>,
     saved_marks: Vec<Mark>,
@@ -653,6 +692,7 @@ impl App {
         ui.fonts(hwnd);
         Controls::layout(hwnd);
         let app = Self {
+            find: find::State::default(),
             tabs: Vec::new(),
             active_tab: None,
             resume_source: None,
@@ -669,6 +709,7 @@ impl App {
             zoom: 1.0,
             writing: false,
             wheel_delta: 0,
+            wheel_motion: None,
             requested: None,
             marks: Vec::new(),
             saved_marks: Vec::new(),
@@ -706,6 +747,7 @@ impl App {
                 self.page_count() > 0 && self.zoom < MAX_ZOOM,
             ),
             (self.ui.sign, self.page_count() > 0 && editing),
+            (self.ui.find.button, self.page_count() > 0),
             (
                 self.ui.position,
                 self.signing.as_ref().is_some_and(|s| s.has_positions()) && !self.writing,
@@ -1013,6 +1055,7 @@ impl App {
         });
     }
     fn page_to(&mut self, page: u32) {
+        self.stop_motion();
         if page >= self.page_count() {
             return;
         }
@@ -1042,6 +1085,7 @@ impl App {
         self.render();
     }
     fn scale(&mut self, zoom: f64) {
+        self.stop_motion();
         if self.page_count() == 0 {
             return;
         }
@@ -1078,13 +1122,10 @@ impl App {
         let (cert, purpose, appearance) = if signed {
             let session = self
                 .signing
-                .as_ref()
+                .as_mut()
                 .ok_or("Choose a signature position.")?;
             let appearance = session.appearance()?;
-            let certificate = match &session.certificate {
-                Some(choice) => choice.resolve(self.hwnd)?,
-                None => SigningCertificate::choose(self.hwnd)?,
-            };
+            let certificate = session.resolve_certificate(self.hwnd)?;
             let Some(cert) = certificate else {
                 return Ok(());
             };
@@ -1129,6 +1170,7 @@ impl App {
     }
     fn event(&mut self, event: Event) {
         match event {
+            Event::Find(epoch, result) => self.find_page(epoch, result),
             Event::Opened(id, result) if id == self.revision => match result {
                 Ok(document) => {
                     self.resume_source = document.source.as_ref().ok().cloned();
@@ -1164,8 +1206,13 @@ impl App {
                 if let Some((revision, page, area, zoom)) = self.requested.take()
                     && revision == self.revision
                 {
-                    VIEW.with_borrow_mut(|v| v.finish_render(page, (area, zoom), reading, result));
-                    canvas::redraw(self.ui.canvas);
+                    let repaint = VIEW.with_borrow_mut(|v| {
+                        let repaint = v.finish_render(page, (area, zoom), reading, result);
+                        v.reveal_find(self.ui.canvas) || repaint
+                    });
+                    if repaint {
+                        canvas::redraw(self.ui.canvas);
+                    }
                     self.render();
                     let visible = VIEW.with_borrow(|v| {
                         v.visible_range
@@ -1239,8 +1286,19 @@ impl App {
         }
     }
     fn command(&mut self, id: usize, tab_button: HWND) -> Result<(), String> {
+        if !matches!(id, LAYOUT | SCROLLED) {
+            self.stop_motion();
+        }
         match id {
+            find::OPEN_FIND => self.open_find(),
+            find::EDIT => self.update_find(),
+            find::PREVIOUS | find::NEXT => self.step_find(id == find::PREVIOUS),
+            find::CLOSE => {
+                self.close_find();
+                self.render();
+            }
             SHOW_SHORTCUTS => shortcuts::show(self.hwnd)?,
+            FORGET_CERTIFICATE if !self.writing => self.forget_certificate()?,
             OPEN if !self.writing => {
                 self.open_tabs(dialog::open_pdfs(self.hwnd)?)?;
             }
@@ -1340,6 +1398,31 @@ impl App {
         }
         Ok(())
     }
+    fn stop_motion(&mut self) {
+        if self.wheel_motion.take().is_some() {
+            unsafe {
+                KillTimer(self.hwnd, SCROLL_TIMER);
+            }
+        }
+    }
+
+    fn motion_tick(&mut self) {
+        let Some(motion) = self.wheel_motion.as_mut() else {
+            return;
+        };
+        if unsafe { GetCapture() } == self.ui.canvas {
+            self.stop_motion();
+            return;
+        }
+        let (dy, done) = motion.advance();
+        if done {
+            self.stop_motion();
+        }
+        if canvas::scroll_reading(self.ui.canvas, 0.0, dy) {
+            self.render();
+        }
+    }
+
     fn wheel(&mut self, w: WPARAM, horizontal: bool) {
         if self.page_count() == 0 {
             return;
@@ -1363,9 +1446,39 @@ impl App {
             } else {
                 (0.0, -distance)
             };
-            if VIEW.with_borrow_mut(|v| v.scroll(dx, dy)) {
-                canvas::redraw(self.ui.canvas);
-                self.render();
+            let carry = self
+                .wheel_motion
+                .as_ref()
+                .map_or(0.0, |m| m.distance - m.delivered);
+            let carry = if dy != 0.0 && carry.signum() == dy.signum() {
+                carry
+            } else {
+                0.0
+            };
+            if dy != 0.0 && delta % 120 == 0 && client_animations() {
+                let distance = dy + carry;
+                let immediate = distance * 0.20;
+                self.wheel_motion = Some(WheelMotion {
+                    start: std::time::Instant::now(),
+                    distance: distance - immediate,
+                    delivered: 0.0,
+                });
+                let timed = unsafe { SetTimer(self.hwnd, SCROLL_TIMER, 15, None) } != 0;
+                if !timed {
+                    self.stop_motion();
+                }
+                if canvas::scroll_reading(
+                    self.ui.canvas,
+                    0.0,
+                    if timed { immediate } else { distance },
+                ) {
+                    self.render();
+                }
+            } else {
+                self.stop_motion();
+                if canvas::scroll_reading(self.ui.canvas, dx, dy + carry) {
+                    self.render();
+                }
             }
             return;
         }
@@ -1399,6 +1512,13 @@ impl App {
             return None;
         }
         match (ctrl, key as u16) {
+            (true, 0x46) => Some(find::OPEN_FIND),
+            (false, VK_F3) => Some(if unsafe { GetKeyState(VK_SHIFT as i32) } < 0 {
+                find::PREVIOUS
+            } else {
+                find::NEXT
+            }),
+            (false, VK_ESCAPE) if self.find.open => Some(find::CLOSE),
             (true, VK_TAB) if unsafe { GetKeyState(VK_SHIFT as i32) } < 0 => Some(PREVIOUS_TAB),
             (true, VK_TAB) => Some(NEXT_TAB),
             (true, 0x57) => Some(CLOSE_TAB),
@@ -1453,6 +1573,10 @@ impl App {
                 break;
             }
             if msg.message == WM_KEYDOWN {
+                if msg.hwnd == self.ui.find.edit && msg.wParam == VK_RETURN as usize {
+                    self.step_find(unsafe { GetKeyState(VK_SHIFT as i32) } < 0);
+                    continue;
+                }
                 // Hand navigation and dismissal to the native color list.
                 let picker_key = (msg.hwnd == self.ui.color || msg.hwnd == self.ui.position)
                     && (unsafe { SendMessageW(msg.hwnd, CB_GETDROPPEDSTATE, 0, 0) != 0 }
@@ -1478,8 +1602,23 @@ impl App {
                 if !picker_key
                     && !tab_arrow
                     && let Some(id) = self.shortcut(msg.wParam)
+                    && (msg.hwnd != self.ui.find.edit
+                        || matches!(
+                            id,
+                            find::OPEN_FIND
+                                | find::NEXT
+                                | find::PREVIOUS
+                                | find::CLOSE
+                                | CLOSE_TAB
+                                | NEXT_TAB
+                                | PREVIOUS_TAB
+                                | OPEN
+                        ))
                     && (msg.hwnd != self.ui.page_input
-                        || matches!(id, CLOSE_TAB | NEXT_TAB | PREVIOUS_TAB | OPEN))
+                        || matches!(
+                            id,
+                            find::OPEN_FIND | CLOSE_TAB | NEXT_TAB | PREVIOUS_TAB | OPEN
+                        ))
                 {
                     if id == CLOSE_TAB {
                         tabs::post_selected(self.ui.tab_bar, id);
@@ -1496,7 +1635,7 @@ impl App {
             }
             match msg.message {
                 // TranslateMessage uses the active keyboard layout to produce '?'.
-                WM_CHAR if msg.wParam == usize::from(b'?') => {
+                WM_CHAR if msg.wParam == usize::from(b'?') && msg.hwnd != self.ui.find.edit => {
                     if msg.lParam & (1 << 30) == 0 {
                         action(self.hwnd, SHOW_SHORTCUTS);
                     }
@@ -1509,6 +1648,9 @@ impl App {
                 READY if msg.hwnd == self.hwnd => {}
                 WHEEL if msg.hwnd == self.hwnd => {
                     self.wheel(msg.wParam, msg.lParam == WM_MOUSEHWHEEL as isize)
+                }
+                WM_TIMER if msg.hwnd == self.hwnd && msg.wParam == SCROLL_TIMER => {
+                    self.motion_tick()
                 }
                 DROPPED if msg.hwnd == self.hwnd => {
                     let drop = msg.wParam as HDROP;
@@ -1534,6 +1676,11 @@ impl App {
                         KillTimer(self.hwnd, RENDER_TIMER);
                     }
                     self.render();
+                }
+                WM_TIMER if msg.hwnd == self.hwnd && msg.wParam == find::TIMER => {
+                    if let Err(error) = self.start_find() {
+                        self.find_failed(&error);
+                    }
                 }
                 _ => unsafe {
                     TranslateMessage(&msg);

@@ -1,3 +1,5 @@
+. (Join-Path $PSScriptRoot 'scrollMotion.ps1')
+
 function Write-ReadingPdf([string]$Path, [int]$Count) {
     $objects = [Collections.Generic.List[string]]::new()
     $kids = (0..($Count - 1) | ForEach-Object { "$(4 + 2 * $_) 0 R" }) -join ' '
@@ -11,6 +13,10 @@ function Write-ReadingPdf([string]$Path, [int]$Count) {
         $color = if ($page -eq $Count) { '0.92 0.745 0.835' } else { $palette[($page - 1) % $palette.Length] }
         $drawing = "$color rg 0 0 612 792 re f`n0.12 0.16 0.2 rg BT /F1 24 Tf 48 696 Td (Reading notes) Tj " +
             "/F1 11 Tf 0 -26 Td (Page $page of $Count) Tj ET`n"
+        if ($page -in @(1, 2, 37)) {
+            $punctuation = if ($page -eq 2) { '!' } else { '?' }
+            $drawing += "BT /F1 24 Tf 122 445 Td (Which section$punctuation) Tj ET`n"
+        }
         $objects.Add("<< /Length $($drawing.Length) >>`nstream`n${drawing}endstream")
     }
     Write-PdfObjects $Path $objects.ToArray()
@@ -65,6 +71,7 @@ function Test-ReadingTabs([Diagnostics.Process]$Viewer, [IntPtr]$Window, [string
     $timer = [Diagnostics.Stopwatch]::StartNew()
     [ReadingProbe]::TabShortcut($Window, 9, $false, 0, 3) # Ctrl+Tab, wrapping from last to first
     [void](Wait-Page $Viewer $name '1 / 240' $timer)
+    Test-Find $Viewer $Window
     $Viewer.Refresh()
     $baseline = $Viewer.WorkingSet64
     [SumiSmoke]::Click($Window, 105)
@@ -83,9 +90,9 @@ function Test-ReadingTabs([Diagnostics.Process]$Viewer, [IntPtr]$Window, [string
     }
     [void](Wait-Page $Viewer $name '1 / 240' ([Diagnostics.Stopwatch]::StartNew()) 'Pages 1–2')
     # Leave enough of the second page exposed for a visible, reproducible boundary.
-    [ReadingProbe]::Wheel($Window, -120)
+    foreach ($step in 1..4) { [ReadingProbe]::Wheel($Window, -30) }
     if ($capture) {
-        $before = Wait-Viewport $Window 'B{4,}\.+O{4,}' 2500
+        $before = Wait-StableBoundary $Window
         [ReadingProbe]::Wheel($Window, -30)
         $edge = $before.LastIndexOf('B')
         $moved = [Diagnostics.Stopwatch]::StartNew()
@@ -98,6 +105,7 @@ function Test-ReadingTabs([Diagnostics.Process]$Viewer, [IntPtr]$Window, [string
         if ($movement -le 0 -or $movement -ge $savedStripe.Length / 5) {
             throw "A quarter-detent wheel did not smoothly shift the page boundary: $movement samples."
         }
+        $savedStripe = Test-ScrollMotion $Window $savedStripe
     }
     if ($ScreenshotPath) {
         try { Save-ReadingScreenshot $Window $ScreenshotPath }

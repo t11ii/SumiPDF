@@ -24,6 +24,12 @@ struct DocumentState {
 }
 
 impl Tab {
+    pub(super) fn clear_certificate(&mut self) {
+        if let Some(session) = self.state.as_mut().and_then(|s| s.signing.as_mut()) {
+            session.clear_certificate();
+        }
+    }
+
     pub(super) fn dirty(&self) -> bool {
         self.state
             .as_ref()
@@ -492,6 +498,8 @@ impl App {
     }
 
     fn activate_tab(&mut self, index: Option<usize>) -> Result<(), String> {
+        self.close_find();
+        self.stop_motion();
         self.jump_input(false);
         self.release_text();
         self.revision += 1;

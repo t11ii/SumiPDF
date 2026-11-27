@@ -71,6 +71,13 @@ impl CertificateSelection {
         }
     }
 
+    pub(crate) fn thumbprint(&self) -> Result<[u8; 20], String> {
+        match &self.source {
+            CertificateSource::Personal(hash) => Ok(*hash),
+            CertificateSource::Pfx(cert) => cert.thumbprint(),
+        }
+    }
+
     pub(crate) fn resolve(&self, owner: HWND) -> Result<Option<SigningCertificate>, String> {
         match &self.source {
             CertificateSource::Personal(hash) => SigningCertificate::by_thumbprint(*hash, owner),
@@ -544,7 +551,7 @@ pub(crate) mod tests {
     use super::*;
     use std::process::Command;
 
-    pub(crate) fn with_test_certificate(test: impl FnOnce(SigningCertificate)) {
+    pub(super) fn test_pfx_bytes() -> zeroize::Zeroizing<Vec<u8>> {
         // Generate a disposable RSA identity in memory. No personal store or file is touched.
         let script = r#"
 $ErrorActionPreference = 'Stop'
@@ -568,7 +575,11 @@ try {
             "{}",
             String::from_utf8_lossy(&generated.stderr)
         );
-        let mut bytes = generated.stdout;
+        zeroize::Zeroizing::new(generated.stdout)
+    }
+
+    pub(crate) fn with_test_certificate(test: impl FnOnce(SigningCertificate)) {
+        let mut bytes = test_pfx_bytes();
         let password: Vec<u16> = "unit-test".encode_utf16().collect();
         assert!(pfx::import(&mut bytes, &[120]).is_err());
         let mut candidates = pfx::import(&mut bytes, &password).unwrap();

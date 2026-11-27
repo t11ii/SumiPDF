@@ -1,11 +1,13 @@
 //! On-demand positions of painted PDF glyphs in display coordinates.
 mod fonts;
+mod search;
 mod standard;
 pub(crate) const HELVETICA_WIDTHS: &[u16; 95] = &standard::HELVETICA;
 
 use crate::highlight::{Direction, PageGeometry, TextRun, UnitRect, inherited};
 use fonts::Font;
 use lopdf::{Dictionary, Document, Object, ObjectId, content::Content};
+use search::SearchText;
 use std::collections::HashMap;
 
 const MAX_CONTENT: usize = 16 * 1024 * 1024;
@@ -21,11 +23,38 @@ pub struct TextDocument {
 impl TextDocument {
     pub fn load(bytes: &[u8]) -> Result<Self, String> {
         let doc = crate::pdfseal::editable_document(bytes)?;
+        Ok(Self::from_document(doc))
+    }
+
+    /// Find only reads page content, including in signed and recovered PDFs.
+    pub fn load_for_search(bytes: &[u8]) -> Result<Self, String> {
+        let doc = Document::load_mem(bytes).map_err(crate::pdfseal::pdf_error)?;
+        Ok(Self::from_document(doc))
+    }
+
+    fn from_document(doc: Document) -> Self {
         let pages = doc.page_iter().collect();
-        Ok(Self { doc, pages })
+        Self { doc, pages }
     }
 
     pub fn page(&self, index: u32) -> Result<TextLayout, String> {
+        self.scan_page(index, None).map(|(layout, _)| layout)
+    }
+
+    pub fn page_count(&self) -> usize {
+        self.pages.len()
+    }
+
+    pub fn search_page(&self, index: u32, query: &str) -> Result<Vec<Vec<UnitRect>>, String> {
+        let (layout, text) = self.scan_page(index, Some(SearchText::default()))?;
+        Ok(text.map_or_else(Vec::new, |text| text.matches(&layout, query)))
+    }
+
+    fn scan_page(
+        &self,
+        index: u32,
+        text: Option<SearchText>,
+    ) -> Result<(TextLayout, Option<SearchText>), String> {
         let id = *self
             .pages
             .get(index as usize)
@@ -33,13 +62,16 @@ impl TextDocument {
         let geom = PageGeometry::from_page(&self.doc, id)?;
         // PDF annotation coordinates remain usable even when text extraction
         // encounters unsupported operations or a page exceeds its work budget.
-        let Ok(bytes) = self.doc.get_page_content_with_limit(id, MAX_CONTENT) else {
-            return Ok(TextLayout::default());
+        let bytes = match self.doc.get_page_content_with_limit(id, MAX_CONTENT) {
+            Ok(bytes) => bytes,
+            Err(e) if text.is_some() => return Err(e.to_string()),
+            Err(_) => return Ok((TextLayout::default(), None)),
         };
         let mut parser = Parser {
             doc: &self.doc,
             geom,
             layout: TextLayout::default(),
+            text,
             fonts: Vec::new(),
             font_ids: HashMap::new(),
             budget: MAX_CONTENT,
@@ -47,8 +79,9 @@ impl TextDocument {
         };
         let resources = inherited(&self.doc, id, b"Resources")?.and_then(|o| o.as_dict().ok());
         match parser.content(&bytes, resources, State::default(), 0) {
-            Ok(()) => Ok(parser.layout),
-            Err(_) => Ok(TextLayout::default()),
+            Ok(()) => Ok((parser.layout, parser.text)),
+            Err(e) if parser.text.is_some() => Err(e),
+            Err(_) => Ok((TextLayout::default(), None)),
         }
     }
 }
@@ -166,6 +199,10 @@ impl TextLayout {
             return Vec::new();
         };
         let (first, last) = (anchor.min(endpoint), anchor.max(endpoint));
+        self.runs(first, last)
+    }
+
+    fn runs(&self, first: usize, last: usize) -> Vec<TextRun> {
         let mut result = Vec::new();
         let start_line = self.lines.partition_point(|l| l.start <= first) - 1;
         for i in start_line..self.lines.len() {
@@ -302,7 +339,8 @@ struct Parser<'a> {
     doc: &'a Document,
     geom: PageGeometry,
     layout: TextLayout,
-    fonts: Vec<Font>,
+    text: Option<SearchText>,
+    fonts: Vec<Font<'a>>,
     font_ids: HashMap<usize, Option<usize>>,
     budget: usize,
     ops: usize,
@@ -312,7 +350,7 @@ impl<'a> Parser<'a> {
         // Dictionaries belong to the immutable document throughout this page walk.
         let key = std::ptr::from_ref(dict) as usize;
         *self.font_ids.entry(key).or_insert_with(|| {
-            let f = Font::from_dict(self.doc, dict)?;
+            let f = Font::from_dict(self.doc, dict, self.text.is_some(), &mut self.budget)?;
             let n = self.fonts.len();
             self.fonts.push(f);
             Some(n)
@@ -439,6 +477,9 @@ impl<'a> Parser<'a> {
             return Ok(());
         };
         let Some(font) = s.font.map(|i| &self.fonts[i]) else {
+            if let Some(text) = &mut self.text {
+                text.interrupt();
+            }
             pos.valid = false;
             return Ok(());
         };
@@ -447,6 +488,9 @@ impl<'a> Parser<'a> {
         }
         let unit = if font.two_byte { 2 } else { 1 };
         if data.len() % unit != 0 {
+            if let Some(text) = &mut self.text {
+                text.interrupt();
+            }
             pos.valid = false;
             return Ok(());
         }
@@ -457,6 +501,9 @@ impl<'a> Parser<'a> {
                 u16::from(chunk[0])
             };
             let Some(advance) = font.advance(code) else {
+                if let Some(text) = &mut self.text {
+                    text.interrupt();
+                }
                 pos.valid = false;
                 break;
             };
@@ -494,6 +541,11 @@ impl<'a> Parser<'a> {
                     Direction::Up
                 };
                 self.layout.push(r, direction);
+                if let Some(text) = &mut self.text {
+                    text.append(&self.layout, font, code, chunk)?;
+                }
+            } else if let Some(text) = &mut self.text {
+                text.interrupt();
             }
             let word = if !font.two_byte && code == 32 {
                 s.word

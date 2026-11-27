@@ -58,6 +58,11 @@ public static class SumiSmoke {
     static extern IntPtr FindWindowExW(IntPtr parent, IntPtr previous, string kind, string title);
     [DllImport("user32.dll")]
     static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    delegate bool EnumChildCallback(IntPtr h, IntPtr unused);
+    [DllImport("user32.dll")]
+    static extern bool EnumChildWindows(IntPtr parent, EnumChildCallback visit, IntPtr unused);
+    [DllImport("user32.dll")]
+    static extern int GetDlgCtrlID(IntPtr h);
 
     public static IntPtr Dialog(int processId, string title) {
         var h = IntPtr.Zero;
@@ -71,6 +76,60 @@ public static class SumiSmoke {
     [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", ExactSpelling=true, CharSet=CharSet.Unicode)]
     static extern IntPtr SendString(IntPtr h, uint message, UIntPtr wparam, string text,
         uint flags, uint timeout, out UIntPtr result);
+    public static void SetFileName(IntPtr dialog, string path) {
+        // cmb13 can be a ComboBoxEx with a nested ComboBox and Edit.
+        var edit = IntPtr.Zero;
+        EnumChildWindows(dialog, (control, unused) => {
+            if (GetDlgCtrlID(control) == 0x047c) {
+                EnumChildWindows(control, (child, ignored) => {
+                    if (ClassName(child) != "Edit") return true;
+                    edit = child;
+                    return false;
+                }, IntPtr.Zero);
+            }
+            return edit == IntPtr.Zero;
+        }, IntPtr.Zero);
+        if (edit == IntPtr.Zero) edit = GetDlgItem(dialog, 0x0480); // edt1
+        UIntPtr result;
+        if (edit == IntPtr.Zero || SendString(edit, 0x000c, UIntPtr.Zero, path, 2, 2000, out result) == IntPtr.Zero
+            || result == UIntPtr.Zero)
+            throw new InvalidOperationException("Could not set the file dialog's filename.");
+        Post(dialog, 0x0111, 1, GetDlgItem(dialog, 1)); // WM_COMMAND / IDOK
+    }
+    public static void PasswordPreference(IntPtr dialog, bool remember) {
+        var check = GetDlgItem(dialog, 1003);
+        var edit = GetDlgItem(dialog, 1001);
+        UIntPtr result;
+        if (edit == IntPtr.Zero || SendMessageTimeoutW(edit, 0x00D2, UIntPtr.Zero, null, 2, 2000, out result) == IntPtr.Zero
+            || result == UIntPtr.Zero)
+            throw new InvalidOperationException("The PFX password edit is not masked.");
+        if (!IsWindowVisible(check) || !IsWindowEnabled(check) ||
+            SendMessageTimeoutW(check, 0x00F0, UIntPtr.Zero, null, 2, 2000, out result) == IntPtr.Zero || result != UIntPtr.Zero)
+            throw new InvalidOperationException("The password checkbox must be visible and initially unchecked.");
+        if (remember && SendMessageTimeoutW(check, 0x00F1, new UIntPtr(1u), null, 2, 2000, out result) == IntPtr.Zero)
+            throw new InvalidOperationException("Could not check the password preference.");
+    }
+    public static void PickWatermark(IntPtr window, int index) {
+        uint pid;
+        GetWindowThreadProcessId(window, out pid);
+        Click(window, 128);
+        var timer = System.Diagnostics.Stopwatch.StartNew();
+        while (timer.ElapsedMilliseconds < 5000) {
+            var menu = IntPtr.Zero;
+            while ((menu = FindWindowExW(IntPtr.Zero, menu, "#32768", null)) != IntPtr.Zero) {
+                uint menuPid;
+                GetWindowThreadProcessId(menu, out menuPid);
+                if (menuPid != pid || !IsWindowVisible(menu)) continue;
+                // TrackPopupMenu handles keyboard messages in the owner's UI thread.
+                Post(window, 0x0100, 0x24, new IntPtr(1)); // Home: built-in
+                for (int i = 0; i < index; i++) Post(window, 0x0100, 0x28, new IntPtr(1)); // Down
+                Post(window, 0x0100, 0x0D, new IntPtr(1)); // Return
+                return;
+            }
+            System.Threading.Thread.Sleep(25);
+        }
+        throw new InvalidOperationException("The watermark menu did not open.");
+    }
     public static void EnterTestPassword(IntPtr dialog, string password) {
         UIntPtr result;
         if (SendString(GetDlgItem(dialog, 1001), 0x000c, UIntPtr.Zero,
@@ -171,6 +230,8 @@ public static class SumiSmoke {
 '@
 Add-Type -Path (Join-Path $PSScriptRoot 'ReadingProbe.cs')
 . (Join-Path $PSScriptRoot 'reading.ps1')
+. (Join-Path $PSScriptRoot 'find.ps1')
+. (Join-Path $PSScriptRoot 'signingPreferences.ps1')
 
 function Write-TestPdf([string]$Path) {
     $objects = @(
@@ -281,11 +342,10 @@ function Test-ToolbarResize([IntPtr]$Window, [bool]$Signing) {
     }
 }
 
-function Test-PfxSigning([string]$ExecutablePath, [string]$InputPdf, [string]$Folder) {
+function New-TestPfx([string]$Folder) {
     $name = "SumiPDF PFX " + [guid]::NewGuid()
     $password = "試験 " + [guid]::NewGuid()
     $pfx = Join-Path $Folder '署名用 ID.pfx'
-    $out = Join-Path $Folder 'PFX signed.pdf'
     $rsa = [Security.Cryptography.RSA]::Create(2048)
     try {
         $request = [Security.Cryptography.X509Certificates.CertificateRequest]::new(
@@ -296,12 +356,20 @@ function Test-PfxSigning([string]$ExecutablePath, [string]$InputPdf, [string]$Fo
             [IO.File]::WriteAllBytes($pfx, $cert.Export([Security.Cryptography.X509Certificates.X509ContentType]::Pfx, $password))
         } finally { $cert.Dispose() }
     } finally { $rsa.Dispose() }
+    [pscustomobject]@{ Path = $pfx; Name = $name; Password = $password; Thumbprint = $thumbprint }
+}
+
+function Test-PfxSigning([string]$ExecutablePath, [string]$InputPdf, [string]$Folder, $Identity) {
+    $out = Join-Path $Folder 'PFX signed.pdf'
     $start = [Diagnostics.ProcessStartInfo]::new($ExecutablePath)
     $start.UseShellExecute = $false
+    $cliProfile = Join-Path $Folder 'CLI profile'
+    [void][IO.Directory]::CreateDirectory($cliProfile)
+    $start.Environment['LOCALAPPDATA'] = $cliProfile
     $start.RedirectStandardOutput = $true
     $start.RedirectStandardError = $true
     $start.StandardOutputEncoding = $start.StandardErrorEncoding = [Text.Encoding]::UTF8
-    foreach ($arg in @('--sign', $InputPdf, '--out', $out, '--page', '1', '--rect', '0.1,0.4,0.7,0.6', '--pfx', $pfx)) {
+    foreach ($arg in @('--sign', $InputPdf, '--out', $out, '--page', '1', '--rect', '0.1,0.4,0.7,0.6', '--pfx', $Identity.Path)) {
         $start.ArgumentList.Add($arg)
     }
     foreach ($attempt in @('cancel', 'wrong', 'correct')) {
@@ -310,26 +378,27 @@ function Test-PfxSigning([string]$ExecutablePath, [string]$InputPdf, [string]$Fo
             $stdout = $proc.StandardOutput.ReadToEndAsync()
             $stderr = $proc.StandardError.ReadToEndAsync()
             $dialog = Wait-Dialog $proc.Id 'PFX password'
+            if ([SumiSmoke]::IsWindowVisible([SumiSmoke]::GetDlgItem($dialog, 1003))) {
+                throw 'The CLI password dialog offered to persist its password.'
+            }
             switch ($attempt) {
                 'cancel' { [SumiSmoke]::CloseDialog($dialog) }
                 'wrong' { [SumiSmoke]::EnterTestPassword($dialog, 'wrong') }
-                'correct' { [SumiSmoke]::EnterTestPassword($dialog, $password) }
+                'correct' { [SumiSmoke]::EnterTestPassword($dialog, $Identity.Password) }
             }
             if (!$proc.WaitForExit(30000)) { throw 'PFX signing timed out.' }
             if ($attempt -eq 'correct') {
                 if ($proc.ExitCode -ne 0) { throw "PFX signing failed: $($stderr.Result)" }
                 $result = $stdout.Result | ConvertFrom-Json
-                if ($result.signer -ne $name -or $result.sha256 -ne (Get-FileHash $out).Hash) { throw 'Wrong PFX signer or digest.' }
+                if ($result.signer -ne $Identity.Name -or $result.sha256 -ne (Get-FileHash $out).Hash) { throw 'Wrong PFX signer or digest.' }
             } elseif ($proc.ExitCode -eq 0 -or (Test-Path $out)) { throw "Unexpected output after $attempt." }
         } finally {
             if (!$proc.HasExited) { $proc.Kill(); $proc.WaitForExit() }
             $proc.Dispose()
         }
     }
-    if ((Test-Path "Cert:\CurrentUser\My\$thumbprint") -or (Test-Path "Cert:\LocalMachine\My\$thumbprint")) {
-        throw 'The PFX test certificate was installed in a personal store.'
-    }
-    Write-Host 'Verified PFX co-signing with a Unicode password, cancellation, wrong-password handling and no personal-store registration.'
+    if ([IO.Directory]::Exists((Join-Path $cliProfile 'SumiPDF'))) { throw 'The PFX CLI wrote GUI preferences.' }
+    Write-Host 'Verified PFX co-signing with a Unicode password, cancellation and wrong-password handling.'
 }
 
 $exe = (Resolve-Path -LiteralPath $Executable).Path
@@ -344,14 +413,17 @@ try {
     Write-TestPdf $fixture
     Write-ReadingPdf $readingFixture 240
     & (Join-Path $PSScriptRoot 'signingCli.ps1') -Executable $exe -Pdf $fixture -SignedGuiFixture $signedFixture
-    Test-PfxSigning $exe $signedFixture $dir
+    $identity = New-TestPfx $dir
+    Test-PfxSigning $exe $signedFixture $dir $identity
+    Test-SigningPreferences $exe $fixture $dir $identity
+    if ((Test-Path "Cert:\CurrentUser\My\$($identity.Thumbprint)") -or (Test-Path "Cert:\LocalMachine\My\$($identity.Thumbprint)")) {
+        throw 'The PFX test certificate was installed in a personal store.'
+    }
     Write-Host "Release EXE size $((Get-Item -LiteralPath $exe).Length) bytes."
     # The first observation includes process launch. Both include polling latency.
     $timer = [Diagnostics.Stopwatch]::StartNew()
-    $launch = [Diagnostics.ProcessStartInfo]::new($exe)
-    $launch.UseShellExecute = $false
-    foreach ($path in @($readingFixture, $signedFixture, $fixture)) { $launch.ArgumentList.Add($path) }
-    $viewer = [Diagnostics.Process]::Start($launch)
+    $profileDir = Join-Path $dir 'viewer profile'
+    $viewer = Start-SmokeViewer $exe $profileDir @($readingFixture, $signedFixture, $fixture)
     $window = Wait-Page $viewer 'two pages.pdf' '1 / 2' $timer
     [ReadingProbe]::CheckShortcutHelp($window)
     Test-ToolbarResize $window $false
@@ -466,10 +538,11 @@ try {
 
     # A PDF with an ordinary approval signature can use the remaining field or a new position.
     $timer.Restart()
-    $viewer = Start-Process -FilePath $exe -ArgumentList ('"{0}"' -f $signedFixture) -PassThru
+    $viewer = Start-SmokeViewer $exe $profileDir @($signedFixture)
     $window = Wait-Page $viewer 'signed once.pdf' '1 / 2' $timer
     [SumiSmoke]::Click($window, 107)
     Wait-SignatureState $window 'The blue box shows the selected signature field' $true $true
+    Wait-SignatureState $window "Signer: $pickerName" $true $true
     if ([SumiSmoke]::ReadText([SumiSmoke]::GetDlgItem($window, 111)) -ne '2 / 2') {
         throw 'Co-signing did not navigate to the remaining Approval field.'
     }

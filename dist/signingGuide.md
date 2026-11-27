@@ -39,3 +39,9 @@ $rect = '0.5,0.75,0.9,0.85'
 - `--expect-sha256` は、確認したファイルと署名時のファイルの一致を検査します。対象が変わっていたら、新しい PDF で署名欄を再確認します。
 - 出力先には新しいパスを指定します。成功時は標準出力に JSON が返ります。失敗時は標準エラーに JSON が返り、終了コードは 1 です。GUI 形式の EXE のため、PowerShell の例ではパイプで出力を受けています。エージェントから子プロセスとして呼ぶときは標準出力・標準エラーを取得し、終了を待ちます。
 - 電子署名の検証には Acrobat Reader などの署名パネルを使えます。署名の外観には証明書の氏名と UTC 日時が入り、秘密鍵の処理は Windows の鍵プロバイダーが担当します。
+
+## 画面で署名するときの初期設定
+
+署名ツールで最後に選んだ透かしのパスと証明書を、Windows ユーザーごとに記憶します。PFX のパスワードも省略する場合は、入力時に **Remember password on this PC** を選びます。Windows の DPAPI で暗号化したデータをローカルに保存します。**Alt + Space → Forget saved signing certificate** で、証明書の選択と記憶したパスワードを消去できます。
+
+Acrobat DC 用のカスタム透かし `%APPDATA%\Adobe\Acrobat\DC\Security\SignatureLogo.pdf` を設定済みなら、初回から背景に使います。別の場所にある1ページの PDF は **Choose Acrobat watermark PDF…** で選択できます。コマンドラインで署名する場合は、上記の `--certificate`、`--pfx`、`--watermark` で署名ごとに指定します。

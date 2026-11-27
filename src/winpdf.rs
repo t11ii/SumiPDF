@@ -78,14 +78,27 @@ pub struct SigningSource(AgileReference<IRandomAccessStream>);
 impl SigningSource {
     pub fn read_bytes(&self) -> Result<Vec<u8>, String> {
         let _apartment = initialize()?;
-        self.read_stream()
+        self.read_stream(None)
             .map_err(|e| format!("編集中の PDF を読み込めません。\n{e}"))
     }
 
-    fn read_stream(&self) -> WinResult<Vec<u8>> {
+    pub fn read_for_search(&self) -> Result<Vec<u8>, String> {
+        let _apartment = initialize()?;
+        self.read_stream(Some(256 * 1024 * 1024))
+            .map_err(|e| e.message().to_string())
+    }
+
+    fn read_stream(&self, search_limit: Option<u64>) -> WinResult<Vec<u8>> {
         let stream = self.0.resolve()?.CloneStream()?;
         stream.Seek(0)?;
-        let length = u32::try_from(stream.Size()?)
+        let size = stream.Size()?;
+        if search_limit.is_some_and(|limit| size > limit) {
+            return Err(Error::new(
+                E_INVALIDARG,
+                "Find supports PDFs up to 256 MiB.",
+            ));
+        }
+        let length = u32::try_from(size)
             .map_err(|_| Error::new(E_INVALIDARG, "4 GiB 以上の PDF は編集できません。"))?
             as usize;
         let reader: IStream = unsafe { CreateStreamOverRandomAccessStream(&stream)? };

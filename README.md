@@ -10,6 +10,10 @@ Windows x64 用の小さな PDF ビューアーです。複数の PDF をタブ�
 
 ウィンドウは濃いグレー、PDF のページは原本の色で表示します。メニューやツールチップは英語で表示します。`?`（Shift + /）を押すとショートカット一覧が開き、Esc で閉じられます。ウィンドウのシステムメニュー（Alt + Space）の **Keyboard shortcuts…** からも開けます。左右の矢印の間にあるページ番号をクリックすると、指定したページに移動します。注釈や署名を付けるときは対象ページを単独で表示し、ツールを閉じると連続表示に戻ります。
 
+### 文書内を検索する
+
+**Ctrl + F** で検索欄を開き、語句を入力します。一致箇所がページ上で色付きになり、**Enter** または **F3** で次へ、**Shift + Enter** または **Shift + F3** で前へ移動できます。**Esc** で検索欄と色付けが消えます。検索は署名済みの PDF でも使えます。スキャン画像だけのページを検索するには OCR 済みの PDF が必要です。縦書きや文字情報を復元できないフォントは検索対象外です。検索は 256 MiB までの PDF に対応し、一度に最大 5,000 件を表示します。
+
 ### 蛍光ペンと下線を使う
 
 1. **Highlight**（蛍光ペン）または **Underline**（下線）を押し、隣のドロップダウンで黄・赤・緑・青の色見本から選びます。最初の色は黄色です。選んだ色は、これから付ける注釈に適用されます。
@@ -21,13 +25,17 @@ Windows x64 用の小さな PDF ビューアーです。複数の PDF をタブ�
 ### 電子署名する
 
 1. **Sign PDF…** を押し、署名位置の一覧で記入先を選びます。PDF に空の署名フィールドがあれば、ページ番号と名前が表示されます。印刷された署名欄やスキャンには **Draw signature box** を選び、欄を囲みます。青枠が署名の表示位置です。従来の不可視署名も選べます。
-2. **Choose watermark** で標準模様または自分の PNG を選びます。**Create watermark…** で同梱のデザイナーが開きます。文字・書体・外枠・色・手描きを組み合わせ、**Save PNG** したら、署名画面の **Choose PNG…** で読み込みます。編集用の SVG も書き出せます。[透かしデザイナー](dist/watermarkDesigner.html)
+2. **Choose watermark** で標準模様、自分の PNG、または **Choose Acrobat watermark PDF…** から1ページの透かし PDF を選びます。次に署名するときも、選んだファイルを使います。**Create watermark…** で同梱のデザイナーが開きます。文字・書体・外枠・色・手描きを組み合わせ、**Save PNG** したら、署名画面の **Choose PNG…** で読み込みます。編集用の SVG も書き出せます。[透かしデザイナー](dist/watermarkDesigner.html)
 3. 鍵アイコンの **Choose from the Windows certificate store** を押します。「現在のユーザー」と「ローカル コンピューター」の両方の「個人」ストアから、秘密鍵付きで有効な署名用証明書を探します。同じ氏名の候補があるときは、**View details** で発行者や有効期限を確認できます。自分の証明書を選ぶと画面下部に署名者名が表示されます。
 
-   **PFX ファイルをお持ちの場合**は、鍵アイコンの右隣にある **Load certificate from PFX** を押します。`.pfx` または `.p12` を開き、パスワードを入力してください。ファイルに署名用証明書が複数あれば、使用する証明書を選べます。秘密鍵は今回の署名用にメモリー内で開きます。
+   **PFX ファイルをお持ちの場合**は、鍵アイコンの右隣にある **Load certificate from PFX** を押します。`.pfx` または `.p12` を開き、パスワードを入力してください。ファイルに署名用証明書が複数あれば、使用する証明書を選べます。証明書のファイルと署名者を記憶するので、次回は **Sign and save…** に進めます。パスワードの入力も省略するには、最初の入力時に **Remember password on this PC** にチェックを入れます。パスワードは Windows の DPAPI で現在のユーザー向けに暗号化します。ファイルを交換した場合は再度選択してください。
 
 4. **Sign and save…** を押して新しいファイルに保存します。証明書をここで初めて選ぶこともできます。証明書の氏名を左に、署名者情報と UTC 日時を右に配置し、透かしを背景に重ねます。画面で付けた注釈と署名の外観を含む PDF 全体が署名対象です。[参考にした Acrobat の署名表示](https://www.adobe.com/devnet-docs/acrobatetk/tools/DigSigDC/appearances.html)
 5. 証明書や署名後の変更は、Acrobat Reader などの署名パネルで確認できます。信頼判定は受け手の証明書と検証環境によって決まります。
+
+Windows ストアで選んだ証明書も、次回の署名時に呼び出せます。記憶した証明書と PFX の保存パスワードは、ウィンドウ左上のシステムメニュー（Alt + Space）の **Forget saved signing certificate** で消去できます。
+
+初めて署名するときは、Acrobat DC 用に自分で設定した `%APPDATA%\Adobe\Acrobat\DC\Security\SignatureLogo.pdf` があれば、署名背景に使います。そのファイルがなければ SumiPDF の紙模様が初期値です。Acrobat 内蔵の Adobe PDF ロゴは Adobe の許諾を要するため、公開版には含めていません。[Acrobat の透かし設定](https://www.adobe.com/devnet-docs/acrobatetk/tools/DigSigDC/appearances.html) · [Adobe のロゴ利用条件](https://www.adobe.com/legal/permissions/trademarks.html)
 
 ### 別の人が署名した PDF に自分の署名を追加する
 
