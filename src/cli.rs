@@ -2,7 +2,7 @@
 use crate::pdfseal::Target;
 use std::{collections::BTreeMap, ffi::OsString, path::PathBuf};
 
-const HELP: &str = r#"SumiPDF.exe FILE.pdf
+const HELP: &str = r#"SumiPDF.exe FILE.pdf [OTHER.pdf ...]
 SumiPDF.exe --inspect FILE.pdf
 SumiPDF.exe --preview FILE.pdf --out PAGE.png (--page N [--rect L,T,R,B] | --field ID)
 SumiPDF.exe --certificates

@@ -1,5 +1,5 @@
 //! Native button captions use Segoe MDL2 Assets. Give each glyph a Japanese
-//! accessible name and a native tooltip while leaving painting and input to Windows.
+//! accessible name and a native tooltip while preserving native input and state.
 use super::*;
 use windows::{
     Win32::{
@@ -47,6 +47,7 @@ pub(super) struct Toolbar {
     tips: HWND,
     names: IAccPropServices,
     buttons: Vec<HWND>,
+    tab_close: Option<HWND>,
 }
 
 impl Toolbar {
@@ -84,6 +85,7 @@ impl Toolbar {
             tips,
             names,
             buttons: Vec::new(),
+            tab_close: None,
         })
     }
 
@@ -111,6 +113,12 @@ impl Toolbar {
         self.tooltip(button, w!("ページを指定 (Ctrl+G)"), TTM_ADDTOOLW)
     }
 
+    pub fn tab_close_tip(&mut self, button: HWND) -> Result<(), String> {
+        self.describe(button, w!("現在のタブを閉じる (Ctrl+W)"), TTM_ADDTOOLW)?;
+        self.tab_close = Some(button);
+        Ok(())
+    }
+
     fn describe(&self, button: HWND, label: PCWSTR, message: u32) -> Result<(), String> {
         self.tooltip(button, label, message)?;
         unsafe {
@@ -134,6 +142,7 @@ impl Toolbar {
             0
         };
         let hwnd = child(self.parent, "BUTTON", icon.glyph, id, WS_TABSTOP | style)?;
+        theme::style_control(hwnd)?;
         self.describe(hwnd, icon.label, TTM_ADDTOOLW)?;
         self.buttons.push(hwnd);
         Ok(hwnd)
@@ -160,7 +169,7 @@ impl Toolbar {
 
     // MSAA annotations must be removed while their HWNDs still exist.
     pub fn clear_names(&mut self) {
-        for button in self.buttons.drain(..) {
+        for button in self.buttons.drain(..).chain(self.tab_close.take()) {
             unsafe {
                 let _ = self.names.ClearHwndProps(
                     WinHwnd(button),
@@ -221,7 +230,7 @@ mod tests {
         }
     }
 
-    fn glyph_pixels(button: HWND, dc: HDC) -> Vec<bool> {
+    fn snapshot<T>(button: HWND, dc: HDC, inspect: impl FnOnce(HDC, RECT) -> T) -> T {
         let bounds = rect(button);
         unsafe {
             let memory = CreateCompatibleDC(dc);
@@ -230,22 +239,32 @@ mod tests {
             let old = SelectObject(memory, image);
             FillRect(memory, &bounds, GetSysColorBrush(COLOR_BTNFACE));
             SendMessageW(button, WM_PRINTCLIENT, memory as usize, PRF_CLIENT as isize);
-            let mut ink = Vec::new();
-            for y in bounds.bottom / 4..bounds.bottom * 3 / 4 {
-                for x in bounds.right / 4..bounds.right * 3 / 4 {
-                    let color = GetPixel(memory, x, y);
-                    ink.push((color & 0xff) < 128);
-                }
-            }
+            let result = inspect(memory, bounds);
             SelectObject(memory, old);
             DeleteObject(image);
             DeleteDC(memory);
+            result
+        }
+    }
+
+    fn glyph_pixels(button: HWND, dc: HDC) -> Vec<bool> {
+        snapshot(button, dc, |image, bounds| {
+            let mut ink = Vec::new();
+            let background = unsafe { GetPixel(image, bounds.right / 6, bounds.bottom / 2) };
+            for y in bounds.bottom / 4..bounds.bottom * 3 / 4 {
+                for x in bounds.right / 4..bounds.right * 3 / 4 {
+                    let pixel = unsafe { GetPixel(image, x, y) };
+                    ink.push([0, 8, 16].into_iter().any(|shift| {
+                        ((pixel >> shift) & 0xffu32).abs_diff((background >> shift) & 0xff) > 48
+                    }));
+                }
+            }
             assert!(
                 ink.contains(&true) && ink.contains(&false),
                 "button did not paint a glyph"
             );
             ink
-        }
+        })
     }
 
     #[test]
@@ -308,6 +327,10 @@ mod tests {
                 "Windows 証明書ストアから選ぶ"
             );
             assert_eq!(labels(&ui.toolbar, ui.sign).1, "電子署名… (Ctrl+S)");
+            assert_eq!(
+                labels(&ui.toolbar, ui.tab_close).1,
+                "現在のタブを閉じる (Ctrl+W)"
+            );
             ui.toolbar.watermark(ui.watermark, true).unwrap();
             let (tip, name) = labels(&ui.toolbar, ui.watermark);
             assert!(tip.contains("指定画像") && tip == name);
@@ -316,6 +339,48 @@ mod tests {
             ui.show_signing(true);
             Controls::layout(parent);
             let dc = GetDC(parent);
+            let p = theme::palette();
+            if !p.high_contrast {
+                let surface = |button| snapshot(button, dc, |image, _| GetPixel(image, 3, 3));
+                for toggle in [ui.highlighter, ui.underline] {
+                    assert_eq!(surface(toggle), p.chrome);
+                    SendMessageW(toggle, BM_SETCHECK, 1, 0);
+                    assert_eq!(SendMessageW(toggle, BM_GETCHECK, 0, 0), 1);
+                    assert_eq!(surface(toggle), p.selected);
+                    SendMessageW(toggle, BM_SETCHECK, 0, 0);
+                    assert_eq!(surface(toggle), p.chrome);
+                }
+                assert_eq!(surface(ui.color), p.field);
+                assert_eq!(surface(ui.position), p.field);
+                assert_eq!(surface(ui.page), p.field);
+                let mut prior_ink = 0;
+                for label in [w!("I"), w!("MMMM")] {
+                    let index = SendMessageW(ui.position, CB_ADDSTRING, 0, label.0 as isize);
+                    assert!(index >= 0);
+                    SendMessageW(ui.position, CB_SETCURSEL, index as usize, 0);
+                    let ink = snapshot(ui.position, dc, |image, bounds| {
+                        let mut count = 0;
+                        for y in 3..bounds.bottom - 3 {
+                            for x in 3..bounds.right - dips(ui.position, 18) {
+                                count += usize::from(GetPixel(image, x, y) != p.field);
+                            }
+                        }
+                        count
+                    });
+                    assert!(ink > prior_ink, "closed combo did not paint its selection");
+                    prior_ink = ink;
+                }
+                let old_focus = GetFocus();
+                ShowWindow(parent, SW_SHOWNOACTIVATE);
+                SetFocus(ui.page);
+                assert_eq!(GetFocus(), ui.page);
+                assert_eq!(
+                    snapshot(ui.page, dc, |image, _| GetPixel(image, 0, 0)),
+                    p.accent
+                );
+                SetFocus(old_focus);
+                ShowWindow(parent, SW_HIDE);
+            }
             let icons = [ui.fit, ui.sign, ui.pfx];
             let reference = icons.map(|button| glyph_pixels(button, dc));
             for width in [440, 649, 650, 900] {

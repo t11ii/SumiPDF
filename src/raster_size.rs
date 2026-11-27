@@ -1,12 +1,23 @@
 const MAX_EDGE: u32 = 8192;
-const MAX_PIXELS: u64 = 8 * 1024 * 1024;
+pub const MAX_PIXELS: u64 = 8 * 1024 * 1024;
 
+#[cfg(test)]
 pub fn bitmap_size(page_width: f64, page_height: f64, requested_width: u32) -> (u32, u32) {
-    let width = f64::from(requested_width.clamp(1, MAX_EDGE));
+    bounded_bitmap_size(page_width, page_height, requested_width, MAX_PIXELS)
+}
+
+pub fn bounded_bitmap_size(
+    page_width: f64,
+    page_height: f64,
+    requested_width: u32,
+    pixels: u64,
+) -> (u32, u32) {
+    let edge = u64::from(MAX_EDGE).min(pixels.max(1)) as u32;
+    let width = f64::from(requested_width.clamp(1, edge));
     let height = width * page_height / page_width;
     let scale = 1.0_f64
-        .min(f64::from(MAX_EDGE) / height)
-        .min((MAX_PIXELS as f64 / (width * height)).sqrt());
+        .min(f64::from(edge) / height)
+        .min((pixels as f64 / (width * height)).sqrt());
     // Round down to stay within both caps. Even a very slender page gets one pixel.
     (
         (width * scale).floor().max(1.0) as u32,
@@ -14,12 +25,21 @@ pub fn bitmap_size(page_width: f64, page_height: f64, requested_width: u32) -> (
     )
 }
 
+#[cfg(test)]
 pub fn decoded_size(requested: (u32, u32), actual: (u32, u32)) -> Option<(u32, u32)> {
+    bounded_decoded_size(requested, actual, MAX_PIXELS)
+}
+
+pub fn bounded_decoded_size(
+    requested: (u32, u32),
+    actual: (u32, u32),
+    pixels: u64,
+) -> Option<(u32, u32)> {
     let (w, h) = actual;
     if w == 0 || h == 0 {
         return None;
     }
-    if w.max(h) <= MAX_EDGE && u64::from(w) * u64::from(h) <= MAX_PIXELS {
+    if w.max(h) <= MAX_EDGE && u64::from(w) * u64::from(h) <= pixels {
         return Some(actual);
     }
     // The requested box was bounded before rendering. Fit the actual frame

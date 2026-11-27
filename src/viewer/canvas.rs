@@ -1,12 +1,13 @@
-//! The UI thread owns the current page surface. Panning and painting use the
-//! last bitmap immediately, including while a higher-resolution render runs.
+//! The UI thread owns surfaces intersecting the viewport and its immediate
+//! neighbors. Reading and editing share the same Win32 painting path.
 use super::{dips, rect, wide};
+use crate::continuous::{Layout, Position};
 use crate::highlight::{HIGHLIGHT_OPACITY, Mark, MarkKind, MarkStyle, TextRun, UnitRect};
 use crate::textselect::TextLayout;
-use crate::winpdf::Bitmap;
+use crate::winpdf::{Bitmap, Frame};
 use std::{
     cell::RefCell,
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     mem::size_of,
     ptr::{null, null_mut},
 };
@@ -39,6 +40,25 @@ struct PageArea {
     h: i32,
 }
 
+type Quality = ((i32, i32), u64);
+
+struct CachedPage {
+    quality: Quality,
+    limited_to: Option<u64>,
+    image: Result<Bitmap, String>,
+}
+
+struct Reading {
+    layout: Layout,
+    frames: BTreeMap<u32, CachedPage>,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct ViewPosition {
+    anchor: Option<Position>,
+    pan: (i32, i32),
+}
+
 impl PageArea {
     fn contains(self, (x, y): (i32, i32)) -> bool {
         (self.x..self.x + self.w).contains(&x) && (self.y..self.y + self.h).contains(&y)
@@ -64,6 +84,11 @@ impl PageArea {
 #[derive(Default)]
 pub struct Canvas {
     pub bitmap: Option<Bitmap>,
+    reading: Option<Reading>,
+    resume: Option<Position>,
+    single_quality: Option<Quality>,
+    single_ratio: Option<f64>,
+    pub visible_range: Option<(u32, u32)>,
     pub text: String,
     pub empty: bool,
     pub zoom: f64,
@@ -101,6 +126,11 @@ pub fn area(hwnd: HWND) -> (i32, i32) {
 impl Canvas {
     pub fn reset(&mut self, empty: bool, text: &str) {
         self.bitmap = None;
+        self.reading = None;
+        self.single_quality = None;
+        self.single_ratio = None;
+        self.resume = None;
+        self.visible_range = None;
         self.offset = (0, 0);
         self.cancel_drag();
         self.marks.clear();
@@ -111,6 +141,212 @@ impl Canvas {
 
     pub fn center(&mut self) {
         self.offset = (0, 0);
+    }
+
+    pub fn position(&self) -> ViewPosition {
+        ViewPosition {
+            anchor: self
+                .reading
+                .as_ref()
+                .map(|r| r.layout.position)
+                .or(self.resume),
+            pan: self.offset,
+        }
+    }
+
+    pub fn restore_position(&mut self, position: ViewPosition) {
+        self.resume = position.anchor;
+        self.offset = position.pan;
+    }
+
+    pub fn prepare(&mut self, hwnd: HWND, page: u32, count: u32, reading: bool) -> u32 {
+        if reading && self.reading.is_none() {
+            let anchor = self
+                .resume
+                .take()
+                .filter(|pos| pos.page == page)
+                .unwrap_or_else(|| Position::at(page));
+            let mut layout = Layout::new(count, anchor);
+            layout.configure(area(hwnd), dips(hwnd, 18), dips(hwnd, 18), self.zoom);
+            let mut frames = BTreeMap::new();
+            if let (Some(image), Some(quality)) = (self.bitmap.take(), self.single_quality.take()) {
+                if let Some(ratio) = self.single_ratio.take() {
+                    layout.measured(page, ratio);
+                }
+                frames.insert(
+                    page,
+                    CachedPage {
+                        quality,
+                        limited_to: None,
+                        image: Ok(image),
+                    },
+                );
+            }
+            self.reading = Some(Reading { layout, frames });
+            self.center();
+            self.cancel_drag();
+            redraw(hwnd);
+        } else if !reading && let Some(mut old) = self.reading.take() {
+            self.resume = Some(old.layout.position);
+            self.text = "ページを表示中…".into();
+            if let Some(cached) = old.frames.remove(&page)
+                && let Ok(image) = cached.image
+            {
+                self.single_ratio = Some(f64::from(image.width) / f64::from(image.height));
+                self.bitmap = Some(image);
+                self.single_quality = cached.limited_to.is_none().then_some(cached.quality);
+            }
+            self.cancel_drag();
+            redraw(hwnd);
+        }
+        let Some(r) = &mut self.reading else {
+            self.visible_range = None;
+            self.page = page;
+            return page;
+        };
+        r.layout
+            .configure(area(hwnd), dips(hwnd, 18), dips(hwnd, 18), self.zoom);
+        let visible = r.layout.visible();
+        self.visible_range = visible
+            .first()
+            .zip(visible.last())
+            .map(|(first, last)| (first.page, last.page));
+        self.page = r.layout.position.page;
+        self.page
+    }
+
+    pub fn jump(&mut self, page: u32) {
+        if let Some(r) = &mut self.reading {
+            r.layout.jump(page);
+        }
+    }
+
+    pub fn scroll(&mut self, dx: f64, dy: f64) -> bool {
+        self.reading
+            .as_mut()
+            .is_some_and(|r| r.layout.scroll(dx, dy))
+    }
+
+    pub fn next_render(&mut self, page: u32, area: (i32, i32)) -> Option<(u32, Option<u64>)> {
+        let quality = (area, self.zoom.to_bits());
+        let Some(r) = &mut self.reading else {
+            return (self.single_quality != Some(quality)).then_some((page, None));
+        };
+        let wanted = r.layout.wanted();
+        r.frames.retain(|index, _| wanted.contains(index));
+        const CACHE_PIXELS: u64 = 12 * 1024 * 1024;
+        const PREVIEW_PIXELS: u64 = 1024 * 1024;
+        let visible = r.layout.visible();
+        let on_screen = |index| visible.iter().any(|p| p.page == index);
+        let bytes = |f: &CachedPage| f.image.as_ref().map_or(0, |img| img.pixels.len() as u64);
+        let used: u64 = r.frames.values().map(|f| bytes(f) / 4).sum();
+        // Account for replacement before dispatch. The worker also enforces
+        // the budget if the native decoder produces an unexpectedly large BMP.
+        for &next in &wanted {
+            let old = r.frames.get(&next);
+            let room = CACHE_PIXELS
+                .saturating_sub(used - old.map_or(0, |f| bytes(f) / 4) + wanted.len() as u64);
+            let limit = if on_screen(next) {
+                crate::raster_size::MAX_PIXELS
+            } else {
+                PREVIEW_PIXELS
+            };
+            if old.is_some_and(|f| {
+                f.quality == quality && f.limited_to.is_none_or(|cap| cap >= limit)
+            }) {
+                continue;
+            }
+            let mut budget = room.min(limit);
+            // Prioritize the page at the reading position when an old,
+            // full-resolution offscreen neighbor is occupying its allowance.
+            if next == page && budget < limit {
+                let mut recovered = 0;
+                r.frames.retain(|index, f| {
+                    if !on_screen(*index) && bytes(f) / 4 > PREVIEW_PIXELS {
+                        recovered += bytes(f) / 4;
+                        false
+                    } else {
+                        true
+                    }
+                });
+                budget = (room + recovered).min(limit);
+            }
+            if budget > 0
+                && !r.frames.get(&next).is_some_and(|f| {
+                    f.quality == quality && f.limited_to.is_none_or(|cap| budget <= cap + cap / 4)
+                })
+            {
+                return Some((next, Some(budget)));
+            }
+        }
+        None
+    }
+
+    pub fn surface_message(&self, reading: bool) -> Option<String> {
+        let pending = || "ページを表示中…".to_owned();
+        if reading {
+            let Some(r) = &self.reading else {
+                return Some(pending());
+            };
+            for page in r.layout.visible() {
+                match r.frames.get(&page.page).map(|f| &f.image) {
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => return Some(error.clone()),
+                    None => return Some(pending()),
+                }
+            }
+            None
+        } else {
+            self.bitmap.is_none().then(|| {
+                if self.single_quality.is_some() {
+                    self.text.clone()
+                } else {
+                    pending()
+                }
+            })
+        }
+    }
+
+    pub fn finish_render(
+        &mut self,
+        page: u32,
+        quality: Quality,
+        reading: bool,
+        result: Result<Frame, String>,
+    ) {
+        if reading != self.reading.is_some() {
+            return;
+        }
+        if let Some(r) = &mut self.reading {
+            if !r.layout.wanted().contains(&page) {
+                return;
+            }
+            if let Ok(frame) = &result {
+                r.layout.measured(page, frame.ratio);
+            }
+            let limited_to = result.as_ref().ok().and_then(|f| f.limited_to);
+            let image = result.map(|frame| frame.bitmap);
+            r.frames.insert(
+                page,
+                CachedPage {
+                    quality,
+                    limited_to,
+                    image,
+                },
+            );
+        } else if self.page == page {
+            self.single_quality = Some(quality);
+            match result {
+                Ok(frame) => {
+                    self.single_ratio = Some(frame.ratio);
+                    self.bitmap = Some(frame.bitmap);
+                }
+                Err(e) => {
+                    self.bitmap = None;
+                    self.text = e;
+                }
+            }
+        }
     }
 
     pub fn set_tool(&mut self, tool: Option<MarkStyle>) {
@@ -135,8 +371,7 @@ impl Canvas {
     pub fn set_marks(&mut self, marks: &[Mark], page: u32) {
         self.page = page;
         self.marks.clear();
-        self.marks
-            .extend(marks.iter().filter(|mark| mark.page == page).cloned());
+        self.marks.extend_from_slice(marks);
     }
 
     pub fn set_text_layout(&mut self, layout: Option<TextLayout>) {
@@ -188,7 +423,9 @@ impl Canvas {
 
     fn start_drag(&mut self, hwnd: HWND, point: (i32, i32)) -> bool {
         let page = self.layout(hwnd);
-        self.drag = if self.draw_signature && page.contains(point) {
+        self.drag = if self.reading.is_some() {
+            Some(Drag::Pan(point))
+        } else if self.draw_signature && page.contains(point) {
             Some(Drag::Signature(page.normalized(point)))
         } else if self.tool.is_some() && page.contains(point) {
             let origin = page.normalized(point);
@@ -321,9 +558,16 @@ fn line(dc: HDC, font: HFONT, color: u32, bounds: RECT, label: &str) {
     }
 }
 
-fn paint_highlights(dc: HDC, clip: RECT, page: PageArea, state: &Canvas) {
-    let committed = state.marks.iter().map(|m| (m.style, m.runs.as_slice()));
-    let preview = state.tool.map(|s| (s, state.preview.as_slice()));
+fn paint_highlights(dc: HDC, clip: RECT, page: PageArea, index: u32, state: &Canvas) {
+    let committed = state
+        .marks
+        .iter()
+        .filter(|m| m.page == index)
+        .map(|m| (m.style, m.runs.as_slice()));
+    let preview = state
+        .tool
+        .filter(|_| state.reading.is_none())
+        .map(|s| (s, state.preview.as_slice()));
     let mut visible = committed
         .chain(preview)
         .flat_map(|(style, runs)| runs.iter().map(move |run| (style, run)))
@@ -382,19 +626,102 @@ fn paint_highlights(dc: HDC, clip: RECT, page: PageArea, state: &Canvas) {
     }
 }
 
-fn paint(hwnd: HWND, state: &mut Canvas) {
-    let mut ps = PAINTSTRUCT::default();
+fn draw_bitmap(dc: HDC, page: PageArea, img: &Bitmap) {
+    let PageArea { x, y, w, h } = page;
     unsafe {
-        let dc = BeginPaint(hwnd, &mut ps);
-        let bounds = rect(hwnd);
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: img.width as i32,
+                biHeight: -(img.height as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        if (w, h) != (img.width as i32, img.height as i32) {
+            // Preserve fine lines while showing the last frame at a new size.
+            SetStretchBltMode(dc, HALFTONE);
+            SetBrushOrgEx(dc, x, y, null_mut());
+        }
+        StretchDIBits(
+            dc,
+            x,
+            y,
+            w,
+            h,
+            0,
+            0,
+            img.width as i32,
+            img.height as i32,
+            img.pixels.as_ptr().cast(),
+            &info,
+            DIB_RGB_COLORS,
+            SRCCOPY,
+        );
+    }
+}
+
+fn draw_reading(dc: HDC, bounds: RECT, clip: RECT, state: &Canvas, reading: &Reading) {
+    let palette = super::theme::palette();
+    let pages = reading.layout.visible();
+    unsafe {
+        let saved = SaveDC(dc);
+        for p in &pages {
+            ExcludeClipRect(dc, p.x, p.y, p.x + p.w, p.y + p.h);
+        }
+        fill(dc, &bounds, palette.canvas);
+        RestoreDC(dc, saved);
+        let brush = GetStockObject(DC_BRUSH) as HBRUSH;
+        for p in pages {
+            if p.y + p.h < clip.top || p.y > clip.bottom {
+                continue;
+            }
+            let page = PageArea {
+                x: p.x,
+                y: p.y,
+                w: p.w,
+                h: p.h,
+            };
+            let mut paper = RECT {
+                left: p.x,
+                top: p.y,
+                right: p.x + p.w,
+                bottom: p.y + p.h,
+            };
+            let cached = reading.frames.get(&p.page).map(|f| &f.image);
+            if let Some(Ok(image)) = cached {
+                draw_bitmap(dc, page, image);
+                paint_highlights(dc, clip, page, p.page, state);
+            } else {
+                fill(dc, &paper, 0x00ffffff);
+                if let Some(Err(message)) = cached {
+                    line(dc, state.font, 0x00505050, paper, message);
+                }
+            }
+            InflateRect(&mut paper, 1, 1);
+            SetDCBrushColor(dc, palette.edge);
+            FrameRect(dc, &paper, brush);
+        }
+    }
+}
+
+fn draw(hwnd: HWND, dc: HDC, clip: RECT, state: &mut Canvas) {
+    let bounds = rect(hwnd);
+    let palette = super::theme::palette();
+    if let Some(reading) = &state.reading {
+        draw_reading(dc, bounds, clip, state, reading);
+        return;
+    }
+    unsafe {
         let page = state.layout(hwnd);
         let PageArea { x, y, w, h } = page;
         if let Some(img) = &state.bitmap {
-            // Paint only the margins. Skipping a full-window erase prevents
-            // a background flash and avoids a screen-sized backbuffer.
             let saved = SaveDC(dc);
             ExcludeClipRect(dc, x, y, x + w, y + h);
-            fill(dc, &bounds, 0x00e9e9e6);
+            fill(dc, &bounds, palette.canvas);
             fill(
                 dc,
                 &RECT {
@@ -403,42 +730,11 @@ fn paint(hwnd: HWND, state: &mut Canvas) {
                     right: x + w + 1,
                     bottom: y + h + 1,
                 },
-                0x00c8c6c1,
+                palette.edge,
             );
             RestoreDC(dc, saved);
-            let info = BITMAPINFO {
-                bmiHeader: BITMAPINFOHEADER {
-                    biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: img.width as i32,
-                    biHeight: -(img.height as i32),
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    biCompression: BI_RGB,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-            if (w, h) != (img.width as i32, img.height as i32) {
-                // Preserve fine lines while showing the last frame at a new size.
-                SetStretchBltMode(dc, HALFTONE);
-                SetBrushOrgEx(dc, x, y, null_mut());
-            }
-            StretchDIBits(
-                dc,
-                x,
-                y,
-                w,
-                h,
-                0,
-                0,
-                img.width as i32,
-                img.height as i32,
-                img.pixels.as_ptr().cast(),
-                &info,
-                DIB_RGB_COLORS,
-                SRCCOPY,
-            );
-            paint_highlights(dc, ps.rcPaint, page, state);
+            draw_bitmap(dc, page, img);
+            paint_highlights(dc, clip, page, state.page, state);
             if let Some(area) = state.signature_preview.or(state.signature) {
                 let mut bounds = page.pixels(&area);
                 let brush = GetStockObject(DC_BRUSH) as HBRUSH;
@@ -457,14 +753,14 @@ fn paint(hwnd: HWND, state: &mut Canvas) {
                 }
             }
         } else {
-            fill(dc, &bounds, 0x00f7f7f4);
+            fill(dc, &bounds, palette.canvas);
             let cy = bounds.bottom / 2;
             let step = dips(hwnd, 37);
             if state.empty {
                 line(
                     dc,
                     state.headline,
-                    0x00342c23,
+                    palette.text,
                     RECT {
                         top: cy - step,
                         bottom: cy + 2,
@@ -475,7 +771,7 @@ fn paint(hwnd: HWND, state: &mut Canvas) {
                 line(
                     dc,
                     state.font,
-                    0x006a625a,
+                    palette.muted,
                     RECT {
                         top: cy + 2,
                         bottom: cy + step,
@@ -484,10 +780,9 @@ fn paint(hwnd: HWND, state: &mut Canvas) {
                     "ここにファイルをドロップ  /  Ctrl + O",
                 );
             } else {
-                line(dc, state.font, 0x006a625a, bounds, &state.text);
+                line(dc, state.font, palette.muted, bounds, &state.text);
             }
         }
-        EndPaint(hwnd, &ps);
     }
 }
 
@@ -495,7 +790,14 @@ pub unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, w: WPARAM, l: LPAR
     let point = ((l as u16 as i16) as i32, ((l >> 16) as i16) as i32);
     match msg {
         WM_PAINT => {
-            VIEW.with_borrow_mut(|v| paint(hwnd, v));
+            let mut ps = PAINTSTRUCT::default();
+            let dc = unsafe { BeginPaint(hwnd, &mut ps) };
+            VIEW.with_borrow_mut(|v| draw(hwnd, dc, ps.rcPaint, v));
+            unsafe { EndPaint(hwnd, &ps) };
+            0
+        }
+        WM_PRINTCLIENT if w != 0 => {
+            VIEW.with_borrow_mut(|v| draw(hwnd, w as HDC, rect(hwnd), v));
             0
         }
         WM_ERASEBKGND => 1,
@@ -529,7 +831,15 @@ pub unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, w: WPARAM, l: LPAR
                 None => None,
             });
             if let Some((x, y)) = previous {
-                pan(hwnd, point.0 - x, point.1 - y);
+                let (dx, dy) = (point.0 - x, point.1 - y);
+                if VIEW.with_borrow(|v| v.reading.is_some()) {
+                    if VIEW.with_borrow_mut(|v| v.scroll(f64::from(dx), -f64::from(dy))) {
+                        redraw(hwnd);
+                        super::action(unsafe { GetParent(hwnd) }, super::SCROLLED);
+                    }
+                } else {
+                    pan(hwnd, dx, dy);
+                }
             }
             0
         }
@@ -597,6 +907,67 @@ pub unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, w: WPARAM, l: LPAR
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn continuous_paint_shows_both_page_surfaces_and_their_gutter() {
+        let mut layout = Layout::new(2, Position::at(0));
+        layout.configure((64, 80), 8, 8, 1.0);
+        layout.measured(0, 0.8);
+        layout.measured(1, 0.8);
+        layout.scroll(0.0, 40.0);
+        let surface = |bgra: [u8; 4]| CachedPage {
+            quality: ((64, 80), 1.0f64.to_bits()),
+            limited_to: None,
+            image: Ok(Bitmap {
+                width: 1,
+                height: 1,
+                pixels: windows::core::Array::from_slice(&bgra),
+            }),
+        };
+        let reading = Reading {
+            layout,
+            frames: BTreeMap::from([
+                (0, surface([0, 0, 255, 255])),
+                (1, surface([255, 0, 0, 255])),
+            ]),
+        };
+        let state = Canvas::default();
+        let bounds = RECT {
+            left: 0,
+            top: 0,
+            right: 80,
+            bottom: 96,
+        };
+        unsafe {
+            let dc = CreateCompatibleDC(null_mut());
+            assert!(!dc.is_null());
+            let info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: bounds.right,
+                    biHeight: -bounds.bottom,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut data = null_mut();
+            let dib = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut data, null_mut(), 0);
+            assert!(!dib.is_null());
+            let original = SelectObject(dc, dib);
+            draw_reading(dc, bounds, bounds, &state, &reading);
+            let samples = [20, 52, 72].map(|y| GetPixel(dc, 40, y));
+            SelectObject(dc, original);
+            DeleteObject(dib);
+            DeleteDC(dc);
+            assert_eq!(
+                samples,
+                [0xff, super::super::theme::palette().canvas, 0xff0000]
+            );
+        }
+    }
 
     #[test]
     fn page_points_remain_normalized_when_panned_and_zoomed() {
@@ -700,6 +1071,7 @@ mod tests {
                     w: 8,
                     h: 8,
                 },
+                0,
                 &state,
             );
             let paper = GetPixel(dc, 2, 2);

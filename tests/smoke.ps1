@@ -1,4 +1,4 @@
-﻿param([string]$Executable = "$PSScriptRoot/../target/release/SumiPDF.exe")
+﻿param([string]$Executable = "$PSScriptRoot/../target/release/SumiPDF.exe", [string]$ScreenshotPath)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
@@ -169,10 +169,10 @@ public static class SumiSmoke {
     }
 }
 '@
+Add-Type -Path (Join-Path $PSScriptRoot 'ReadingProbe.cs')
+. (Join-Path $PSScriptRoot 'reading.ps1')
 
 function Write-TestPdf([string]$Path) {
-    # Every inserted character is ASCII, so StringBuilder lengths are also byte offsets.
-    $pdf = [Text.StringBuilder]::new("%PDF-1.4`n")
     $objects = @(
         '<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [8 0 R] >> >>'
         '<< /Type /Pages /Count 2 /Kids [3 0 R 4 0 R] >>'
@@ -187,6 +187,12 @@ function Write-TestPdf([string]$Path) {
     }
     $objects += '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>'
     $objects += '<< /Type /Annot /Subtype /Widget /FT /Sig /T (Approval) /P 4 0 R /F 4 /Rect [165 150 285 185] >>'
+    Write-PdfObjects $Path $objects
+}
+
+function Write-PdfObjects([string]$Path, [string[]]$Objects) {
+    # Every inserted character is ASCII, so StringBuilder lengths are also byte offsets.
+    $pdf = [Text.StringBuilder]::new("%PDF-1.4`n")
     $size = $objects.Count + 1
     $xref = [Text.StringBuilder]::new("xref`n0 $size`n0000000000 65535 f `n")
     for ($i = 0; $i -lt $objects.Count; $i++) {
@@ -199,7 +205,8 @@ function Write-TestPdf([string]$Path) {
     [IO.File]::WriteAllText($Path, $pdf.ToString(), [Text.Encoding]::ASCII)
 }
 
-function Wait-Page([Diagnostics.Process]$Viewer, [string]$Filename, [string]$Expected, [Diagnostics.Stopwatch]$Elapsed) {
+function Wait-Page([Diagnostics.Process]$Viewer, [string]$Filename, [string]$Expected, [Diagnostics.Stopwatch]$Elapsed,
+    [string]$StatusText = '全体表示の 100%', [switch]$Quiet) {
     $class = $title = $page = $status = '<none>'
     do {
         $Viewer.Refresh()
@@ -211,12 +218,14 @@ function Wait-Page([Diagnostics.Process]$Viewer, [string]$Filename, [string]$Exp
             if ($class -eq 'SumiPDF.Window') {
                 $page = [SumiSmoke]::ReadText([SumiSmoke]::GetDlgItem($window, 111))
                 $status = [SumiSmoke]::ReadText([SumiSmoke]::GetDlgItem($window, 112))
-                if ($title.Contains($Filename) -and $page -eq $Expected -and $status.StartsWith('ページ全体')) {
+                if ($title.Contains($Filename) -and $page -eq $Expected -and $status.Contains($StatusText)) {
                     $Elapsed.Stop()
                     $Viewer.Refresh()
-                    Write-Host ("Page '{0}' ready after {1} ms; working set {2} bytes; peak working set {3} bytes." -f
-                        $page, $Elapsed.ElapsedMilliseconds, $Viewer.WorkingSet64, $Viewer.PeakWorkingSet64)
-                    Write-Host "Title '$title'; status '$status'."
+                    if (!$Quiet) {
+                        Write-Host ("Page '{0}' observed after {1} ms; working set {2} bytes; peak working set {3} bytes." -f
+                            $page, $Elapsed.ElapsedMilliseconds, $Viewer.WorkingSet64, $Viewer.PeakWorkingSet64)
+                        Write-Host "Title '$title'; status '$status'."
+                    }
                     return $window
                 }
             }
@@ -327,19 +336,25 @@ $exe = (Resolve-Path -LiteralPath $Executable).Path
 $dir = Join-Path ([IO.Path]::GetTempPath()) ("SumiPDF-smoke-" + [Guid]::NewGuid().ToString('N'))
 $fixture = Join-Path $dir 'two pages.pdf'
 $signedFixture = Join-Path $dir 'signed once.pdf'
+$readingFixture = Join-Path $dir 'Reading notes.pdf'
 $viewer = $null
 $pickerCert = $null
 try {
     [void][IO.Directory]::CreateDirectory($dir)
     Write-TestPdf $fixture
+    Write-ReadingPdf $readingFixture 240
     & (Join-Path $PSScriptRoot 'signingCli.ps1') -Executable $exe -Pdf $fixture -SignedGuiFixture $signedFixture
     Test-PfxSigning $exe $signedFixture $dir
     Write-Host "Release EXE size $((Get-Item -LiteralPath $exe).Length) bytes."
     # The first observation includes process launch. Both include polling latency.
     $timer = [Diagnostics.Stopwatch]::StartNew()
-    $viewer = Start-Process -FilePath $exe -ArgumentList ('"{0}"' -f $fixture) -PassThru
+    $launch = [Diagnostics.ProcessStartInfo]::new($exe)
+    $launch.UseShellExecute = $false
+    foreach ($path in @($readingFixture, $signedFixture, $fixture)) { $launch.ArgumentList.Add($path) }
+    $viewer = [Diagnostics.Process]::Start($launch)
     $window = Wait-Page $viewer 'two pages.pdf' '1 / 2' $timer
     Test-ToolbarResize $window $false
+    Test-ReadingTabs $viewer $window $ScreenshotPath
     $timer.Restart()
     [SumiSmoke]::NextPage($window)
     [void](Wait-Page $viewer 'two pages.pdf' '2 / 2' $timer)
@@ -359,7 +374,7 @@ try {
     [SumiSmoke]::Click($window, 114)
     Wait-HighlightState $viewer $window '下線（青）' $false
     [SumiSmoke]::Click($window, 115)
-    Wait-HighlightState $viewer $window 'ページ全体' $false
+    Wait-HighlightState $viewer $window '全体表示の 100%' $false
     [SumiSmoke]::Click($window, 102)
     $timer.Restart()
     [void](Wait-Page $viewer 'two pages.pdf' '1 / 2' $timer)
@@ -375,6 +390,10 @@ try {
     Wait-HighlightState $viewer $window '下線（青）' $false
     [SumiSmoke]::DragOnPage($window, 200, 300, 0.56, 0.38, 0.22, 0.38)
     Wait-HighlightState $viewer $window '文字をドラッグ' $true
+    [ReadingProbe]::ClickTab($window, 'Reading notes.pdf')
+    [void](Wait-Page $viewer 'Reading notes.pdf' '240 / 240' ([Diagnostics.Stopwatch]::StartNew()) '125%')
+    [ReadingProbe]::ClickTab($window, 'two pages.pdf')
+    Wait-HighlightState $viewer $window '下線（青）' $true
     # Keep the pending underline while switching to signing. The existing empty field is on page 2.
     [SumiSmoke]::Click($window, 107)
     Wait-SignatureState $window '青枠が選択した署名欄' $true $true
@@ -388,6 +407,12 @@ try {
     [SumiSmoke]::Click($window, 131)
     $popup = Wait-Dialog $viewer.Id 'Windows 証明書ストアから選ぶ'
     [SumiSmoke]::ChooseCertificate($popup, $pickerName)
+    Wait-SignatureState $window "署名者：$pickerName" $true $true
+    [ReadingProbe]::TabShortcut($window, 9, $false, 0, 3)
+    [void](Wait-Page $viewer 'Reading notes.pdf' '240 / 240' ([Diagnostics.Stopwatch]::StartNew()) '125%')
+    [ReadingProbe]::TabShortcut($window, 0x57, $false, 0, 2)
+    [void](Wait-Page $viewer 'signed once.pdf' '1 / 2' ([Diagnostics.Stopwatch]::StartNew()))
+    [ReadingProbe]::TabShortcut($window, 9, $false, 1, 2)
     Wait-SignatureState $window "署名者：$pickerName" $true $true
     [SumiSmoke]::Click($window, 131)
     $popup = Wait-Dialog $viewer.Id 'Windows 証明書ストアから選ぶ'
@@ -405,13 +430,13 @@ try {
     [SumiSmoke]::Pick($window, 127, 2)
     Wait-SignatureState $window 'ページに表示しない電子署名' $true $false
     [SumiSmoke]::Click($window, 130)
-    Wait-HighlightState $viewer $window 'ページ全体' $true
+    Wait-HighlightState $viewer $window '全体表示の 100%' $true
     if ([SumiSmoke]::IsWindowVisible([SumiSmoke]::GetDlgItem($window, 129)) -or
         [SumiSmoke]::IsWindowVisible([SumiSmoke]::GetDlgItem($window, 131))) {
         throw 'The signature toolbar remained visible after cancellation.'
     }
     [SumiSmoke]::Click($window, 114)
-    Wait-HighlightState $viewer $window 'ページ全体' $false
+    Wait-HighlightState $viewer $window '全体表示の 100%' $false
     if (-not $viewer.CloseMainWindow() -or -not $viewer.WaitForExit(5000)) {
         throw 'The viewer did not close normally.'
     }
@@ -433,7 +458,7 @@ try {
     [SumiSmoke]::Pick($window, 127, 2)
     Wait-SignatureState $window 'ページに表示しない電子署名' $true $false
     [SumiSmoke]::Click($window, 130)
-    Wait-HighlightState $viewer $window 'ページ全体' $false
+    Wait-HighlightState $viewer $window '全体表示の 100%' $false
     foreach ($id in @(108, 115)) {
         if ([SumiSmoke]::IsWindowEnabled([SumiSmoke]::GetDlgItem($window, $id))) {
             throw 'Annotation tools were enabled after identifying an existing signature.'

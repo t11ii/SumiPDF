@@ -1,5 +1,5 @@
 use crate::textselect::{TextDocument, TextLayout};
-use crate::winpdf::{self, Bitmap, Document, SigningSource};
+use crate::winpdf::{self, Document, Frame, SigningSource};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
@@ -11,12 +11,18 @@ pub enum Job {
         revision: u64,
         path: PathBuf,
     },
+    Restore {
+        revision: u64,
+        source: SigningSource,
+    },
+    Close,
     Render {
         revision: u64,
         ticket: u64,
         page: u32,
         area: (i32, i32),
         zoom: f64,
+        cache_pixels: Option<u64>,
     },
 }
 
@@ -27,7 +33,7 @@ pub struct OpenedDocument {
 
 pub enum Event {
     Opened(u64, Result<OpenedDocument, String>),
-    Painted(u64, Result<Bitmap, String>),
+    Painted(u64, bool, Result<Frame, String>),
     SignatureFields {
         revision: u64,
         result: Result<super::signing::Choices, String>,
@@ -97,18 +103,29 @@ pub fn run(hwnd: usize, jobs: Receiver<Job>, events: Sender<Event>) {
     let apartment = winpdf::initialize();
     let mut active: Option<(u64, Document)> = None;
     while let Ok(first) = jobs.recv() {
-        // The UI requests renders only after Opened. During fast navigation or
-        // resizing the most recent request supersedes all pending work.
+        // A newer activation supersedes queued tab switches. The UI sends a
+        // render only after the current revision has successfully opened.
         let job = jobs.try_iter().last().unwrap_or(first);
         match job {
-            Job::Open { revision, path } => {
+            Job::Close => active = None,
+            Job::Open { revision, .. } | Job::Restore { revision, .. } => {
                 active = None;
                 let opened = (|| {
                     apartment.as_ref().map_err(Clone::clone)?;
-                    let doc = Document::open_file(&path)?;
+                    let (doc, source) = match job {
+                        Job::Open { path, .. } => {
+                            let doc = Document::open_file(&path)?;
+                            let source = doc.signing_source();
+                            (doc, source)
+                        }
+                        Job::Restore { source, .. } => {
+                            (Document::from_source(&source)?, Ok(source))
+                        }
+                        _ => unreachable!(),
+                    };
                     let opened = OpenedDocument {
                         pages: doc.page_count(),
-                        source: doc.signing_source(),
+                        source,
                     };
                     active = Some((revision, doc));
                     Ok(opened)
@@ -121,6 +138,7 @@ pub fn run(hwnd: usize, jobs: Receiver<Job>, events: Sender<Event>) {
                 page,
                 area,
                 zoom,
+                cache_pixels,
             } => {
                 let Some((current, doc)) = &active else {
                     continue;
@@ -128,8 +146,12 @@ pub fn run(hwnd: usize, jobs: Receiver<Job>, events: Sender<Event>) {
                 if *current != revision {
                     continue;
                 }
-                let result = doc.render_fit(page, area, zoom);
-                report(hwnd, &events, Event::Painted(ticket, result));
+                let result = doc.render_page(page, area, zoom, cache_pixels);
+                report(
+                    hwnd,
+                    &events,
+                    Event::Painted(ticket, cache_pixels.is_some(), result),
+                );
             }
         }
     }

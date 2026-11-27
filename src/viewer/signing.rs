@@ -65,6 +65,27 @@ impl Choices {
         })
     }
 
+    fn populate(&self, control: HWND, selected: Option<usize>) -> Result<(), String> {
+        for position in &self.positions {
+            let label = match position {
+                Position::Draw => "署名位置をドラッグして指定".to_owned(),
+                Position::Field(f) => format!("{} ページの署名欄：{}", f.page + 1, f.name),
+                Position::Invisible => "ページに表示しない署名".to_owned(),
+            };
+            let index =
+                unsafe { SendMessageW(control, CB_ADDSTRING, 0, wide(&label).as_ptr() as isize) };
+            if index < 0 {
+                return Err("署名位置の選択肢を表示できませんでした。".into());
+            }
+        }
+        if let Some(index) = selected {
+            unsafe {
+                SendMessageW(control, CB_SETCURSEL, index, 0);
+            }
+        }
+        Ok(())
+    }
+
     fn preferred(&self, page: u32) -> Option<usize> {
         self.positions
             .iter()
@@ -93,6 +114,10 @@ pub(super) struct Session {
 }
 
 impl Session {
+    pub(super) fn loaded(&self) -> bool {
+        self.choices.is_some()
+    }
+
     pub fn has_positions(&self) -> bool {
         self.choices
             .as_ref()
@@ -198,6 +223,21 @@ impl App {
         }
     }
 
+    pub(super) fn restore_signing_controls(&mut self) -> Result<(), String> {
+        unsafe {
+            SendMessageW(self.ui.position, CB_RESETCONTENT, 0, 0);
+        }
+        if let Some(session) = &self.signing {
+            self.ui
+                .toolbar
+                .watermark(self.ui.watermark, session.watermark.is_some())?;
+            if let Some(choices) = &session.choices {
+                choices.populate(self.ui.position, session.selected)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn begin_signing(&mut self) -> Result<(), String> {
         if self.signing.is_some() || self.writing {
             return Ok(());
@@ -260,30 +300,8 @@ impl App {
             return Err("署名済みの PDF には注釈を追加できません。「元に戻す」で注釈をすべて取り消してから署名してください。".into());
         }
         let preferred = choices.preferred(self.page);
-        for position in &choices.positions {
-            let label = match position {
-                Position::Draw => "署名位置をドラッグして指定".to_owned(),
-                Position::Field(f) => format!("{} ページの署名欄：{}", f.page + 1, f.name),
-                Position::Invisible => "ページに表示しない署名".to_owned(),
-            };
-            let index = unsafe {
-                SendMessageW(
-                    self.ui.position,
-                    CB_ADDSTRING,
-                    0,
-                    wide(&label).as_ptr() as isize,
-                )
-            };
-            if index < 0 {
-                return Err("署名位置の選択肢を表示できませんでした。".into());
-            }
-        }
+        choices.populate(self.ui.position, preferred)?;
         session.choices = Some(choices);
-        if let Some(index) = preferred {
-            unsafe {
-                SendMessageW(self.ui.position, CB_SETCURSEL, index, 0);
-            }
-        }
         self.choose_position();
         unsafe {
             SetFocus(if preferred.is_some() {

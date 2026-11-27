@@ -29,7 +29,7 @@ use windows::{
     core::{AgileReference, Array, Error, HSTRING, Result as WinResult},
 };
 
-use crate::raster_size::{bitmap_size, decoded_size};
+use crate::raster_size::{MAX_PIXELS, bounded_bitmap_size, bounded_decoded_size};
 
 /// WinRT initialization and shutdown must occur on the same thread.
 pub struct Apartment(PhantomData<Rc<()>>);
@@ -51,6 +51,12 @@ pub struct Bitmap {
     pub height: u32,
     /// Tightly packed BGRA, starting at the top left.
     pub pixels: Array<u8>,
+}
+
+pub struct Frame {
+    pub bitmap: Bitmap,
+    pub ratio: f64,
+    pub limited_to: Option<u64>,
 }
 
 // DetachPixelData returns owned CoTaskMem containing just bytes. No COM object or
@@ -136,6 +142,20 @@ impl Document {
             FileOpenDisposition::OpenExisting,
         )?
         .join()?;
+        Self::load_stream(stream)
+    }
+
+    pub fn from_source(source: &SigningSource) -> Result<Self, String> {
+        let stream = source
+            .0
+            .resolve()
+            .and_then(|s| s.CloneStream())
+            .map_err(|e| e.to_string())?;
+        stream.Seek(0).map_err(|e| e.to_string())?;
+        Self::load_stream(stream).map_err(|e| e.to_string())
+    }
+
+    fn load_stream(stream: IRandomAccessStream) -> WinResult<Self> {
         let pdf = PdfDocument::LoadFromStreamAsync(&stream)?.join()?;
         let count = pdf.PageCount()?;
         if count == 0 {
@@ -158,14 +178,35 @@ impl Document {
     }
 
     pub fn render_fit(&self, index: u32, area: (i32, i32), zoom: f64) -> Result<Bitmap, String> {
+        self.render_page(index, area, zoom, None)
+            .map(|frame| frame.bitmap)
+    }
+
+    pub fn render_page(
+        &self,
+        index: u32,
+        area: (i32, i32),
+        zoom: f64,
+        cache_pixels: Option<u64>,
+    ) -> Result<Frame, String> {
         let page = Page(self.pdf.GetPage(index).map_err(|e| e.to_string())?);
         let size = checked_size(&page.0)?;
         let fit = (f64::from(area.0) / f64::from(size.Width))
             .min(f64::from(area.1) / f64::from(size.Height));
         let width = (f64::from(size.Width) * fit * zoom).round().max(1.0) as u32;
-        let (w, h) = bitmap_size(f64::from(size.Width), f64::from(size.Height), width);
-        rasterize(&page.0, w, h)
-            .map_err(|e| format!("{} ページを表示できませんでした。 {e}", index + 1))
+        let budget = cache_pixels.unwrap_or(MAX_PIXELS).clamp(1, MAX_PIXELS);
+        let dimensions =
+            |cap| bounded_bitmap_size(f64::from(size.Width), f64::from(size.Height), width, cap);
+        let (w, h) = dimensions(budget);
+        let limited_to =
+            (budget < MAX_PIXELS && (w, h) != dimensions(MAX_PIXELS)).then_some(budget);
+        let bitmap = rasterize(&page.0, w, h, budget)
+            .map_err(|e| format!("{} ページを表示できませんでした。 {e}", index + 1))?;
+        Ok(Frame {
+            bitmap,
+            ratio: f64::from(size.Width) / f64::from(size.Height),
+            limited_to,
+        })
     }
 }
 
@@ -189,7 +230,7 @@ fn checked_size(page: &PdfPage) -> Result<Size, String> {
     Ok(size)
 }
 
-fn rasterize(page: &PdfPage, width: u32, height: u32) -> WinResult<Bitmap> {
+fn rasterize(page: &PdfPage, width: u32, height: u32, budget: u64) -> WinResult<Bitmap> {
     let stream = InMemoryRandomAccessStream::new()?;
     let options = PdfPageRenderOptions::new()?;
     options.SetDestinationWidth(width)?;
@@ -197,12 +238,13 @@ fn rasterize(page: &PdfPage, width: u32, height: u32) -> WinResult<Bitmap> {
     options.SetBitmapEncoderId(BitmapEncoder::BmpEncoderId()?)?;
     page.RenderWithOptionsToStreamAsync(&stream, &options)?
         .join()?;
-    decode_page_bitmap(&stream, (width, height))
+    decode_page_bitmap(&stream, (width, height), budget)
 }
 
 fn decode_page_bitmap(
     stream: &InMemoryRandomAccessStream,
     requested: (u32, u32),
+    budget: u64,
 ) -> WinResult<Bitmap> {
     stream.Seek(0)?;
     let decoder = BitmapDecoder::CreateAsync(stream)?.join()?;
@@ -213,7 +255,7 @@ fn decode_page_bitmap(
             requested.0, requested.1, actual.0, actual.1
         )
     };
-    let (width, height) = decoded_size(requested, actual).ok_or_else(|| {
+    let (width, height) = bounded_decoded_size(requested, actual, budget).ok_or_else(|| {
         Error::new(
             E_UNEXPECTED,
             format!("ページ画像の寸法がゼロです（{}）。", dimensions()),
@@ -299,7 +341,7 @@ mod tests {
                 .unwrap();
             encoder.FlushAsync().unwrap().join().unwrap();
             drop(encoder);
-            let image = decode_page_bitmap(&stream, requested).unwrap();
+            let image = decode_page_bitmap(&stream, requested, MAX_PIXELS).unwrap();
             assert_eq!((image.width, image.height), expected);
             let stride = image.width as usize * 4;
             assert_eq!(image.pixels.len(), stride * image.height as usize);

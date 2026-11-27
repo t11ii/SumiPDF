@@ -5,6 +5,8 @@ mod appearance;
 #[cfg(any(windows, test))]
 mod cli;
 #[cfg(any(windows, test))]
+mod continuous;
+#[cfg(any(windows, test))]
 mod highlight;
 #[cfg(test)]
 mod highlight_roundtrip;
@@ -31,7 +33,7 @@ fn main() {
             std::process::exit(1);
         }
     } else {
-        viewer::run();
+        viewer::run(args);
     }
 }
 

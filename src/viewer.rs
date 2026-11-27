@@ -2,6 +2,8 @@ mod canvas;
 mod dialog;
 mod save;
 mod signing;
+mod tabs;
+mod theme;
 mod toolbar;
 mod worker;
 
@@ -53,6 +55,12 @@ const SIGN_SAVE: usize = 129;
 const SIGN_CANCEL: usize = 130;
 const SIGN_CERTIFICATE: usize = 131;
 const SIGN_PFX: usize = 132;
+const TABS: usize = 133;
+const PREVIOUS_TAB: usize = 134;
+const NEXT_TAB: usize = 135;
+const CLOSE_TAB: usize = 136;
+const SELECT_TAB: usize = 137;
+const SCROLLED: usize = 138;
 const RENDER_TIMER: usize = 1;
 const ACTION: u32 = WM_APP + 1;
 const READY: u32 = WM_APP + 2;
@@ -110,6 +118,15 @@ fn action(hwnd: HWND, id: usize) {
 // procedure. Changes to the application model run only in the outer loop.
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     match msg {
+        WM_NOTIFY if l != 0 => {
+            let header = unsafe { &*(l as *const windows_sys::Win32::UI::Controls::NMHDR) };
+            if header.idFrom == TABS
+                && header.code == windows_sys::Win32::UI::Controls::TCN_SELCHANGE
+            {
+                action(hwnd, SELECT_TAB);
+            }
+            unsafe { DefWindowProcW(hwnd, msg, w, l) }
+        }
         WM_COMMAND => {
             let id = w & 0xffff;
             if id == PAGE_INPUT {
@@ -160,10 +177,21 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             };
             0
         }
-        WM_CTLCOLORSTATIC => unsafe {
-            SetBkColor(w as HDC, GetSysColor(COLOR_WINDOW));
-            GetSysColorBrush(COLOR_WINDOW) as isize
-        },
+        WM_ERASEBKGND => {
+            theme::paint_chrome(hwnd, w as HDC);
+            1
+        }
+        WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX
+            if !theme::palette().high_contrast =>
+        {
+            let field =
+                msg != WM_CTLCOLORSTATIC || unsafe { GetDlgCtrlID(l as HWND) } == PAGE_INPUT as i32;
+            theme::control_color(w as HDC, field, unsafe { IsWindowEnabled(l as HWND) != 0 })
+        }
+        WM_SETTINGCHANGE | WM_THEMECHANGED | WM_SYSCOLORCHANGE => {
+            theme::refresh(hwnd);
+            unsafe { DefWindowProcW(hwnd, msg, w, l) }
+        }
         WM_DROPFILES => {
             unsafe {
                 PostMessageW(hwnd, DROPPED, w, 0);
@@ -239,6 +267,8 @@ fn child(parent: HWND, class: &str, caption: &str, id: usize, style: u32) -> Res
 }
 
 struct Controls {
+    tab_bar: HWND,
+    tab_close: HWND,
     canvas: HWND,
     open: HWND,
     prev: HWND,
@@ -310,7 +340,9 @@ impl Controls {
             );
         }
         let mut toolbar = toolbar::Toolbar::new(hwnd)?;
-        let ui = Self {
+        let mut ui = Self {
+            tab_bar: tabs::create(hwnd)?,
+            tab_close: child(hwnd, "BUTTON", "×", CLOSE_TAB, WS_TABSTOP)?,
             open: toolbar.button(OPEN, toolbar::OPEN_FILE)?,
             prev: toolbar.button(PREV, toolbar::PREVIOUS)?,
             page: child(hwnd, "BUTTON", "— / —", PAGE, WS_TABSTOP)?,
@@ -352,7 +384,15 @@ impl Controls {
             font_dpi: 0,
         };
         ui.toolbar.page_tip(ui.page)?;
+        for control in [ui.page, ui.page_input, ui.color, ui.position, ui.tab_close] {
+            theme::style_control(control)?;
+        }
+        ui.toolbar.tab_close_tip(ui.tab_close)?;
         ui.show_signing(false);
+        unsafe {
+            ShowWindow(ui.tab_bar, SW_HIDE);
+            ShowWindow(ui.tab_close, SW_HIDE);
+        }
         Ok(ui)
     }
 
@@ -394,8 +434,8 @@ impl Controls {
             )
         };
         let old = (self.font, self.headline, self.icon_font);
-        self.font = make("Yu Gothic UI", 15, 400);
-        self.headline = make("Yu Gothic UI", 25, 600);
+        self.font = make("Yu Gothic UI", 14, 400);
+        self.headline = make("Yu Gothic UI", 22, 600);
         self.icon_font = make("Segoe MDL2 Assets", 16, 400);
         self.toolbar.set_font(self.icon_font);
         VIEW.with_borrow_mut(|v| {
@@ -405,6 +445,8 @@ impl Controls {
         for c in [
             self.page,
             self.page_input,
+            self.tab_close,
+            self.tab_bar,
             self.color,
             self.position,
             self.status,
@@ -413,6 +455,7 @@ impl Controls {
                 SendMessageW(c, WM_SETFONT, self.font as usize, 1);
             }
         }
+        tabs::item_size(self.tab_bar);
         unsafe {
             DeleteObject(old.0 as _);
             DeleteObject(old.1 as _);
@@ -429,9 +472,21 @@ impl Controls {
         let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96) as i32;
         let s = |n: i32| (n * dpi + 48) / 96;
         let compact = bounds.right < s(650);
-        let toolbar = if compact { 91 } else { 50 };
+        let has_tabs = unsafe { GetWindowLongW(control(TABS), GWL_STYLE) } as u32 & WS_VISIBLE != 0;
+        let tab_height = if has_tabs { 33 } else { 0 };
+        let toolbar = tab_height + if compact { 80 } else { 44 };
         let mut positions = Vec::with_capacity(23);
         let mut place = |w, x, y, width, height| positions.push((w, x, y, width, height));
+        if has_tabs {
+            place(
+                control(TABS),
+                s(6),
+                s(1),
+                (bounds.right - s(54)).max(1),
+                s(32),
+            );
+            place(control(CLOSE_TAB), bounds.right - s(43), s(1), s(36), s(32));
+        }
         let button = 36;
         let page_x = 91;
         let page_width = 80;
@@ -444,15 +499,21 @@ impl Controls {
             (LARGER, 260, button),
             (FIT, 299, button),
         ] {
-            place(control(id), s(x), s(9), s(width), s(32));
+            place(control(id), s(x), s(tab_height + 6), s(width), s(32));
         }
-        place(control(PAGE_INPUT), s(page_x), s(12), s(page_width), s(26));
+        place(
+            control(PAGE_INPUT),
+            s(page_x),
+            s(tab_height + 9),
+            s(page_width),
+            s(26),
+        );
         let left = if compact {
             s(10)
         } else {
             bounds.right - s(300)
         };
-        let y = s(if compact { 50 } else { 9 });
+        let y = s(tab_height + if compact { 42 } else { 6 });
         for (id, x) in [
             (HIGHLIGHT, 0),
             (UNDERLINE, 39),
@@ -462,7 +523,13 @@ impl Controls {
             place(control(id), left + s(x), y, s(button), s(32));
         }
         place(control(COLOR), left + s(78), y + s(4), s(82), s(140));
-        place(control(SIGN), bounds.right - s(46), s(9), s(button), s(32));
+        place(
+            control(SIGN),
+            bounds.right - s(46),
+            s(tab_height + 6),
+            s(button),
+            s(32),
+        );
         let mut top = toolbar;
         if unsafe { GetWindowLongW(control(SIGN_POSITION), GWL_STYLE) } as u32 & WS_VISIBLE != 0 {
             let width = (bounds.right - s(227)).min(s(390));
@@ -476,7 +543,7 @@ impl Controls {
             ] {
                 place(control(id), width + s(x), s(toolbar), s(button), s(32));
             }
-            top += 41;
+            top += 37;
         }
         place(
             control(CANVAS_ID),
@@ -533,6 +600,9 @@ impl Drop for Controls {
 }
 
 struct App {
+    tabs: Vec<tabs::Tab>,
+    active_tab: Option<usize>,
+    resume_source: Option<crate::winpdf::SigningSource>,
     hwnd: HWND,
     ui: Controls,
     worker: Option<Sender<Job>>,
@@ -566,6 +636,9 @@ impl App {
         ui.fonts(hwnd);
         Controls::layout(hwnd);
         let app = Self {
+            tabs: Vec::new(),
+            active_tab: None,
+            resume_source: None,
             hwnd,
             ui,
             worker: None,
@@ -602,6 +675,11 @@ impl App {
         let annotate = editing && !self.known_signed;
         for (c, enabled) in [
             (self.ui.open, !self.writing),
+            (self.ui.tab_bar, !self.writing),
+            (
+                self.ui.tab_close,
+                self.active_tab.is_some() && !self.writing,
+            ),
             (self.ui.page, self.page_count() > 0),
             (self.ui.prev, self.page > 0),
             (self.ui.next, self.page + 1 < self.page_count()),
@@ -671,7 +749,26 @@ impl App {
         } else {
             " *"
         };
-        set_text(self.hwnd, &format!("{name}{star}  —  SumiPDF"));
+        if let Some(index) = self.active_tab {
+            tabs::update_label(self.ui.tab_bar, index, &format!("{name}{star}"));
+            set_text(self.hwnd, &format!("{name}{star}  —  SumiPDF"));
+        } else {
+            set_text(self.hwnd, "SumiPDF");
+        }
+    }
+    fn discard_all_ok(&self) -> bool {
+        if !self.tabs.iter().any(tabs::Tab::dirty) {
+            return self.discard_ok();
+        }
+        unsafe {
+            MessageBoxW(
+                self.hwnd,
+                wide("未保存の注釈があるタブがあります。変更を破棄してすべてのタブを閉じますか？")
+                    .as_ptr(),
+                wide("SumiPDF").as_ptr(),
+                MB_YESNO | MB_DEFBUTTON2 | MB_ICONQUESTION,
+            ) == IDYES
+        }
     }
     fn discard_ok(&self) -> bool {
         self.marks == self.saved_marks
@@ -688,7 +785,10 @@ impl App {
         if self.writing {
             return;
         }
-        let text = if let Some(signing) = &self.signing {
+        let reading = self.tool.is_none() && self.signing.is_none();
+        let text = if let Some(message) = VIEW.with_borrow(|v| v.surface_message(reading)) {
+            message
+        } else if let Some(signing) = &self.signing {
             signing.instructions(self.page)
         } else if let Some(kind) = self.tool {
             let name = match kind {
@@ -705,15 +805,19 @@ impl App {
                 "ハイライトする範囲をドラッグ"
             };
             format!("{name}（{}）  ·  {help}  ·  Esc で終了", self.color.label())
-        } else if self.zoom == 1.0 {
-            "ページ全体  ·  ホイールでページ移動".into()
         } else {
-            let help = if self.zoom < 1.0 {
-                "ホイールでページ移動"
+            let range = VIEW
+                .with_borrow(|v| v.visible_range)
+                .unwrap_or((self.page, self.page));
+            let pages = if range.0 == range.1 {
+                (range.0 + 1).to_string()
             } else {
-                "ドラッグで移動"
+                format!("{}–{}", range.0 + 1, range.1 + 1)
             };
-            format!("全体表示の {:.0}%  ·  {help}", self.zoom * 100.0)
+            format!(
+                "表示中 {pages} ページ  ·  全体表示の {:.0}%  ·  ホイールでスクロール",
+                self.zoom * 100.0
+            )
         };
         set_text(self.ui.status, &text);
     }
@@ -784,6 +888,7 @@ impl App {
         });
         self.controls();
         self.status();
+        self.render();
         notice(self.hwnd, error, true);
     }
     fn jump_input(&self, show: bool) {
@@ -843,57 +948,6 @@ impl App {
         });
         canvas::redraw(self.ui.canvas);
     }
-    fn open(&mut self, path: PathBuf) {
-        if self.writing || !self.discard_ok() {
-            return;
-        }
-        self.jump_input(false);
-        let path = match std::path::absolute(path) {
-            Ok(p) => p,
-            Err(e) => {
-                notice(self.hwnd, &e.to_string(), true);
-                return;
-            }
-        };
-        if self.worker.is_none() {
-            let (tx, rx) = mpsc::channel();
-            let events = self.events.clone();
-            let hwnd = self.hwnd as usize;
-            if let Err(e) = std::thread::Builder::new()
-                .name("pdf-render".into())
-                .spawn(move || worker::run(hwnd, rx, events))
-            {
-                notice(self.hwnd, &e.to_string(), true);
-                return;
-            }
-            self.worker = Some(tx);
-        }
-        self.revision += 1;
-        self.known_signed = false;
-        self.ticket += 1;
-        self.document = None;
-        self.end_signing();
-        self.marks.clear();
-        self.saved_marks.clear();
-        self.tool = None;
-        self.text_ready = false;
-        self.has_text = false;
-        self.release_text();
-        VIEW.with_borrow_mut(|v| v.set_tool(None));
-        self.requested = None;
-        self.path = path;
-        self.page = 0;
-        self.zoom = 1.0;
-        self.wheel_delta = 0;
-        self.title();
-        self.reset_canvas("PDF を開いています…");
-        set_text(self.ui.status, "PDF を開いています…");
-        self.controls();
-        self.send(Job::Open {
-            revision: self.revision,
-            path: self.path.clone(),
-        });
-    }
     fn send(&self, job: Job) {
         if let Some(w) = &self.worker
             && w.send(job).is_err()
@@ -906,26 +960,55 @@ impl App {
         }
     }
     fn render(&mut self) {
-        if self.page_count() == 0 {
+        let count = self.page_count();
+        if count == 0 {
             return;
         }
         let area = canvas::area(self.ui.canvas);
-        let key = (self.revision, self.page, area, self.zoom.to_bits());
-        if self.requested == Some(key) {
+        let reading = self.tool.is_none() && self.signing.is_none();
+        let (lead, range_changed) = VIEW.with_borrow_mut(|v| {
+            let before = v.visible_range;
+            let lead = v.prepare(self.ui.canvas, self.page, count, reading);
+            (lead, before != v.visible_range)
+        });
+        if self.page != lead {
+            self.page = lead;
+            self.controls();
+        }
+        if range_changed {
+            self.status();
+        }
+        if self.requested.is_some() {
             return;
         }
-        self.requested = Some(key);
+        let Some((page, cache_pixels)) = VIEW.with_borrow_mut(|v| v.next_render(self.page, area))
+        else {
+            return;
+        };
+        self.requested = Some((self.revision, page, area, self.zoom.to_bits()));
         self.ticket += 1;
         self.send(Job::Render {
             revision: self.revision,
             ticket: self.ticket,
-            page: self.page,
+            page,
             area,
             zoom: self.zoom,
+            cache_pixels,
         });
     }
     fn page_to(&mut self, page: u32) {
-        if self.page_count() == 0 || self.page == page || page >= self.page_count() {
+        if page >= self.page_count() {
+            return;
+        }
+        if self.tool.is_none() && self.signing.is_none() {
+            VIEW.with_borrow_mut(|v| v.jump(page));
+            self.page = page;
+            self.controls();
+            canvas::redraw(self.ui.canvas);
+            self.render();
+            return;
+        }
+        if self.page == page {
             return;
         }
         self.page = page;
@@ -960,6 +1043,7 @@ impl App {
         canvas::redraw(self.ui.canvas);
         self.controls();
         self.render();
+        self.status();
     }
     fn save_copy(&mut self, signed: bool) -> Result<(), String> {
         if self.writing
@@ -1028,7 +1112,26 @@ impl App {
         match event {
             Event::Opened(id, result) if id == self.revision => match result {
                 Ok(document) => {
+                    self.resume_source = document.source.as_ref().ok().cloned();
                     self.document = Some(document);
+                    if self.tool.is_some()
+                        && let Err(error) = self.request_text()
+                    {
+                        self.text_failed(&error);
+                    }
+                    if self
+                        .signing
+                        .as_ref()
+                        .is_some_and(|session| !session.loaded())
+                    {
+                        self.signing = None;
+                        if let Err(error) = self.begin_signing() {
+                            self.end_signing();
+                            self.ui.show_signing(false);
+                            Controls::layout(self.hwnd);
+                            notice(self.hwnd, &error, true);
+                        }
+                    }
                     self.controls();
                     self.render();
                 }
@@ -1038,24 +1141,25 @@ impl App {
                     notice(self.hwnd, &e, true);
                 }
             },
-            Event::Painted(ticket, result) if ticket == self.ticket => match result {
-                Ok(bitmap) => {
-                    VIEW.with_borrow_mut(|v| {
-                        v.bitmap = Some(bitmap);
-                    });
+            Event::Painted(ticket, reading, result) if ticket == self.ticket => {
+                if let Some((revision, page, area, zoom)) = self.requested.take()
+                    && revision == self.revision
+                {
+                    VIEW.with_borrow_mut(|v| v.finish_render(page, (area, zoom), reading, result));
                     canvas::redraw(self.ui.canvas);
-                    self.status();
-                    if self.signing.is_some() {
-                        self.controls();
+                    self.render();
+                    let visible = VIEW.with_borrow(|v| {
+                        v.visible_range
+                            .is_some_and(|(first, last)| (first..=last).contains(&page))
+                    });
+                    if page == self.page || visible {
+                        self.status();
+                        if self.signing.is_some() {
+                            self.controls();
+                        }
                     }
                 }
-                Err(e) => {
-                    VIEW.with_borrow_mut(|v| v.text = "このページを描画できません。".into());
-                    canvas::redraw(self.ui.canvas);
-                    set_text(self.ui.status, &e);
-                    self.requested = None;
-                }
-            },
+            }
             Event::Layout {
                 revision,
                 page,
@@ -1121,10 +1225,17 @@ impl App {
     fn command(&mut self, id: usize) -> Result<(), String> {
         match id {
             OPEN if !self.writing => {
-                if let Some(p) = dialog::choose(self.hwnd, dialog::Purpose::Open)? {
-                    self.open(p);
+                self.open_tabs(dialog::open_pdfs(self.hwnd)?)?;
+            }
+            PREVIOUS_TAB => self.cycle_tab(-1)?,
+            NEXT_TAB => self.cycle_tab(1)?,
+            CLOSE_TAB => self.close_tab()?,
+            SELECT_TAB => {
+                if let Some(index) = tabs::selected(self.ui.tab_bar) {
+                    self.switch_tab(index)?;
                 }
             }
+            SCROLLED => self.render(),
             PREV => self.page_to(self.page.saturating_sub(1)),
             NEXT => self.page_to(self.page + 1),
             FIRST => self.page_to(0),
@@ -1161,6 +1272,7 @@ impl App {
                 }
                 self.controls();
                 canvas::redraw(self.ui.canvas);
+                self.render();
             }
             COLOR if !self.writing && self.signing.is_none() && self.page_count() > 0 => {
                 let index = unsafe { SendMessageW(self.ui.color, CB_GETCURSEL, 0, 0) };
@@ -1192,7 +1304,7 @@ impl App {
             CLOSE if self.writing => {
                 notice(self.hwnd, "保存処理が終わるまでお待ちください。", false)
             }
-            CLOSE if self.discard_ok() => unsafe {
+            CLOSE if self.discard_all_ok() => unsafe {
                 self.ui.toolbar.clear_names();
                 DestroyWindow(self.hwnd);
             },
@@ -1206,7 +1318,30 @@ impl App {
         }
         let delta = ((w >> 16) as i16) as i32;
         let ctrl = w & 8 != 0;
-        if !ctrl && self.zoom > 1.0 {
+        if ctrl {
+            if !horizontal {
+                self.scale(
+                    self.zoom * ZOOM_STEP.powf((f64::from(delta) / 120.0).clamp(-16.0, 16.0)),
+                );
+            }
+            return;
+        }
+        if self.tool.is_none() && self.signing.is_none() {
+            let distance = f64::from(delta) * f64::from(dips(self.ui.canvas, 72)) / 120.0;
+            let (dx, dy) = if horizontal {
+                (-distance, 0.0)
+            } else if w & 4 != 0 {
+                (distance, 0.0)
+            } else {
+                (0.0, -distance)
+            };
+            if VIEW.with_borrow_mut(|v| v.scroll(dx, dy)) {
+                canvas::redraw(self.ui.canvas);
+                self.render();
+            }
+            return;
+        }
+        if self.zoom > 1.0 {
             let distance = delta * dips(self.hwnd, 60) / 120;
             let (dx, dy) = if horizontal {
                 (-distance, 0)
@@ -1223,14 +1358,10 @@ impl App {
             if ticks == 0 {
                 return;
             }
-            if ctrl {
-                self.scale(self.zoom * ZOOM_STEP.powi(ticks.clamp(-16, 16)));
-            } else {
-                self.page_to(
-                    (i64::from(self.page) - i64::from(ticks))
-                        .clamp(0, i64::from(self.page_count() - 1)) as u32,
-                );
-            }
+            self.page_to(
+                (i64::from(self.page) - i64::from(ticks)).clamp(0, i64::from(self.page_count() - 1))
+                    as u32,
+            );
         }
     }
     fn shortcut(&self, key: usize) -> Option<usize> {
@@ -1240,6 +1371,9 @@ impl App {
             return None;
         }
         match (ctrl, key as u16) {
+            (true, VK_TAB) if unsafe { GetKeyState(VK_SHIFT as i32) } < 0 => Some(PREVIOUS_TAB),
+            (true, VK_TAB) => Some(NEXT_TAB),
+            (true, 0x57) => Some(CLOSE_TAB),
             (true, 0x4F) => Some(OPEN),
             (true, 0x47) => Some(PAGE),
             (true, 0x53) if unsafe { GetKeyState(VK_SHIFT as i32) } < 0 => Some(SAVE_MARKS),
@@ -1298,6 +1432,8 @@ impl App {
                             msg.wParam as u16,
                             VK_LEFT | VK_RIGHT | VK_HOME | VK_END | VK_PRIOR | VK_NEXT
                         ));
+                let tab_arrow =
+                    msg.hwnd == self.ui.tab_bar && matches!(msg.wParam as u16, VK_LEFT | VK_RIGHT);
                 if msg.hwnd == self.ui.page_input {
                     if msg.wParam == VK_RETURN as usize {
                         self.jump_to_input();
@@ -1310,7 +1446,13 @@ impl App {
                         }
                         continue;
                     }
-                } else if !picker_key && let Some(id) = self.shortcut(msg.wParam) {
+                }
+                if !picker_key
+                    && !tab_arrow
+                    && let Some(id) = self.shortcut(msg.wParam)
+                    && (msg.hwnd != self.ui.page_input
+                        || matches!(id, CLOSE_TAB | NEXT_TAB | PREVIOUS_TAB | OPEN))
+                {
                     action(self.hwnd, id);
                     continue;
                 }
@@ -1332,14 +1474,21 @@ impl App {
                 }
                 DROPPED if msg.hwnd == self.hwnd => {
                     let drop = msg.wParam as HDROP;
-                    let len = unsafe { DragQueryFileW(drop, 0, null_mut(), 0) };
-                    let mut name = vec![0; len as usize + 1];
-                    let n = unsafe { DragQueryFileW(drop, 0, name.as_mut_ptr(), len + 1) };
+                    let count = unsafe { DragQueryFileW(drop, u32::MAX, null_mut(), 0) };
+                    let mut paths = Vec::new();
+                    for i in 0..count {
+                        let len = unsafe { DragQueryFileW(drop, i, null_mut(), 0) };
+                        let mut name = vec![0; len as usize + 1];
+                        let n = unsafe { DragQueryFileW(drop, i, name.as_mut_ptr(), len + 1) };
+                        if n > 0 {
+                            paths.push(PathBuf::from(OsString::from_wide(&name[..n as usize])));
+                        }
+                    }
                     unsafe {
                         DragFinish(drop);
                     }
-                    if n > 0 {
-                        self.open(PathBuf::from(OsString::from_wide(&name[..n as usize])));
+                    if let Err(e) = self.open_tabs(paths) {
+                        notice(self.hwnd, &e, true);
                     }
                 }
                 WM_TIMER if msg.hwnd == self.hwnd && msg.wParam == RENDER_TIMER => {
@@ -1357,15 +1506,14 @@ impl App {
     }
 }
 
-pub fn run() {
+pub fn run(files: Vec<OsString>) {
     unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
     let com = unsafe { CoInitializeEx(null(), COINIT_APARTMENTTHREADED as u32) };
     let result = (|| {
-        if !register(WINDOW, Some(window_proc), unsafe {
-            GetSysColorBrush(COLOR_WINDOW)
-        }) || !register(CANVAS, Some(canvas::procedure), null_mut())
+        if !register(WINDOW, Some(window_proc), null_mut())
+            || !register(CANVAS, Some(canvas::procedure), null_mut())
         {
             return Err(std::io::Error::last_os_error().to_string());
         }
@@ -1388,14 +1536,15 @@ pub fn run() {
         if hwnd.is_null() {
             return Err(std::io::Error::last_os_error().to_string());
         }
+        theme::refresh(hwnd);
         let mut app = App::new(hwnd)?;
         unsafe {
             DragAcceptFiles(hwnd, 1);
             ShowWindow(hwnd, SW_SHOW);
             UpdateWindow(hwnd);
         }
-        if let Some(path) = std::env::args_os().nth(1) {
-            app.open(path.into());
+        if let Err(e) = app.open_tabs(files.into_iter().map(PathBuf::from)) {
+            notice(hwnd, &e, true);
         }
         app.process();
         Ok(())

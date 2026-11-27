@@ -17,7 +17,16 @@ pub enum Purpose<'a> {
 }
 
 pub fn choose(hwnd: HWND, purpose: Purpose<'_>) -> Result<Option<PathBuf>, String> {
-    let mut buffer = vec![0u16; 32768];
+    Ok(choose_paths(hwnd, purpose)?.pop())
+}
+
+pub fn open_pdfs(hwnd: HWND) -> Result<Vec<PathBuf>, String> {
+    choose_paths(hwnd, Purpose::Open)
+}
+
+fn choose_paths(hwnd: HWND, purpose: Purpose<'_>) -> Result<Vec<PathBuf>, String> {
+    let multiple = matches!(purpose, Purpose::Open);
+    let mut buffer = vec![0u16; if multiple { 65536 } else { 32768 }];
     let save = matches!(
         purpose,
         Purpose::SignedCopy(_) | Purpose::HighlightedCopy(_)
@@ -73,6 +82,7 @@ pub fn choose(hwnd: HWND, purpose: Purpose<'_>) -> Result<Option<PathBuf>, Strin
             | OFN_PATHMUSTEXIST
             | OFN_NOCHANGEDIR
             | OFN_HIDEREADONLY
+            | if multiple { OFN_ALLOWMULTISELECT } else { 0 }
             | if save {
                 OFN_NOTESTFILECREATE
             } else {
@@ -91,7 +101,7 @@ pub fn choose(hwnd: HWND, purpose: Purpose<'_>) -> Result<Option<PathBuf>, Strin
         if ok == 0 {
             let code = unsafe { CommDlgExtendedError() };
             return if code == 0 {
-                Ok(None)
+                Ok(Vec::new())
             } else {
                 Err(format!(
                     "ファイル選択ダイアログを開けません (0x{code:08X})。"
@@ -100,6 +110,13 @@ pub fn choose(hwnd: HWND, purpose: Purpose<'_>) -> Result<Option<PathBuf>, Strin
         }
         let len = buffer.iter().position(|&u| u == 0).unwrap_or(buffer.len());
         let chosen = PathBuf::from(OsString::from_wide(&buffer[..len]));
+        if multiple && buffer.get(len + 1).is_some_and(|&c| c != 0) {
+            return Ok(buffer[len + 1..]
+                .split(|&c| c == 0)
+                .take_while(|s| !s.is_empty())
+                .map(|s| chosen.join(OsString::from_wide(s)))
+                .collect());
+        }
         if save && chosen.exists() {
             super::notice(
                 hwnd,
@@ -108,6 +125,6 @@ pub fn choose(hwnd: HWND, purpose: Purpose<'_>) -> Result<Option<PathBuf>, Strin
             );
             continue;
         }
-        return Ok(Some(chosen));
+        return Ok(vec![chosen]);
     }
 }

@@ -26,7 +26,12 @@ jobs:
         run: ./tests/smoke.ps1 -Executable ./target/x86_64-pc-windows-msvc/release/SumiPDF.exe
       - name: Check the executable distributed in the release ZIP
         shell: pwsh
-        run: ./tests/smoke.ps1 -Executable ./dist/SumiPDF.exe
+        run: ./tests/smoke.ps1 -Executable ./dist/SumiPDF.exe -ScreenshotPath ./SumiPDF-reading.png
+      - uses: actions/upload-artifact@v7
+        with:
+          name: SumiPDF-reading-preview
+          path: SumiPDF-reading.png
+          if-no-files-found: ignore
       - uses: actions/upload-artifact@v7
         with:
           name: SumiPDF-Windows-x64
