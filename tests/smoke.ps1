@@ -181,8 +181,8 @@ public static class SumiSmoke {
                 throw new Win32Exception(Marshal.GetLastWin32Error());
             if (!GetClientRect(window, out client) || client.Right != width)
                 throw new InvalidOperationException("Did not reach the requested client width.");
-            int[] icons = signing ? new[] {101,102,103,104,105,106,107,108,109,114,115,128,129,130,131,132}
-                                  : new[] {101,102,103,104,105,106,107,108,109,114,115};
+            int[] icons = signing ? new[] {101,102,103,104,105,106,107,108,109,114,115,128,129,130,131,132,160}
+                                  : new[] {101,102,103,104,105,106,107,108,109,114,115,160};
             var occupied = new System.Collections.Generic.List<Rect>();
             // Include the page number, color combo and signature-position combo in overlap checks.
             foreach (int id in signing ? new[] {111,116,127} : new[] {111,116}) {
@@ -337,7 +337,7 @@ function Wait-SignatureState([IntPtr]$Window, [string]$StatusText, [bool]$CanSav
 }
 
 function Test-ToolbarResize([IntPtr]$Window, [bool]$Signing) {
-    foreach ($width in @(900,650,649,440,700,480,900)) {
+    foreach ($width in @(900,690,689,440,700,480,900)) {
         [SumiSmoke]::CheckResize($Window, $width, $Signing)
     }
 }

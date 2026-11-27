@@ -413,9 +413,14 @@ mod tests {
                     ),
                     u32::MAX
                 );
-                assert!(index != 0xffff && indices.insert(index), "{name}: {index}");
+                assert_ne!(index, 0xffff, "{name}");
+                if !indices.insert(index) {
+                    // Both dismiss actions deliberately use the same close glyph.
+                    assert_eq!(caption[0], 0xe711, "{name}: {index}");
+                }
             }
-            assert_eq!(indices.len(), 16);
+            assert_eq!(indices.len(), 19);
+            assert_eq!(ui.toolbar.buttons.len(), 20);
             let (tip, name) = labels(&ui.toolbar, ui.color);
             assert_eq!(tip, "Markup color");
             assert_eq!(name, tip);
@@ -476,7 +481,7 @@ mod tests {
             }
             let icons = [ui.fit, ui.sign, ui.pfx];
             let reference = icons.map(|button| glyph_pixels(button, dc));
-            for width in [440, 649, 650, 900] {
+            for width in [440, 689, 690, 900] {
                 SetWindowPos(
                     parent,
                     null_mut(),
