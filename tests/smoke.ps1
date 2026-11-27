@@ -143,10 +143,8 @@ public static class SumiSmoke {
                 uint menuPid;
                 GetWindowThreadProcessId(menu, out menuPid);
                 if (menuPid != pid || !IsWindowVisible(menu)) continue;
-                // TrackPopupMenu handles keyboard messages in the owner's UI thread.
-                Post(window, 0x0100, 0x24, new IntPtr(1)); // Home: built-in
-                for (int i = 0; i < index; i++) Post(window, 0x0100, 0x28, new IntPtr(1)); // Down
-                Post(window, 0x0100, 0x0D, new IntPtr(1)); // Return
+                // Enter the item's unique mnemonic in the native popup's menu loop.
+                Post(menu, 0x0102, "dpa"[index], new IntPtr(1)); // WM_CHAR
                 return;
             }
             System.Threading.Thread.Sleep(25);

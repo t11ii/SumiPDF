@@ -543,19 +543,19 @@ fn watermark_menu(owner: HWND, button: HWND, path: Option<&Path>) -> Result<i32,
             menu,
             MF_STRING | check(path.is_none()),
             1,
-            wide("Default watermark (paper pattern)").as_ptr(),
+            wide("&Default watermark (paper pattern)").as_ptr(),
         );
         AppendMenuW(
             menu,
             MF_STRING | check(png.is_some()),
             2,
-            wide(&label("Choose PNG…", png)).as_ptr(),
+            wide(&label("Choose &PNG…", png)).as_ptr(),
         );
         AppendMenuW(
             menu,
             MF_STRING | check(pdf.is_some()),
             4,
-            wide(&label("Choose Acrobat watermark PDF…", pdf)).as_ptr(),
+            wide(&label("Choose &Acrobat watermark PDF…", pdf)).as_ptr(),
         );
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
         AppendMenuW(menu, MF_STRING, 3, wide("Create watermark…").as_ptr());
