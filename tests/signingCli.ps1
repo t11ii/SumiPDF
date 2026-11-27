@@ -27,13 +27,17 @@ function Invoke-SignCli([string[]]$Arguments, [switch]$ExpectError) {
     } finally { $proc.Dispose() }
 }
 
-function New-TestSigner([string]$Subject) {
-    New-SelfSignedCertificate -Type Custom -Subject "CN=$Subject" -KeyAlgorithm RSA -KeyLength 2048 -KeyUsage DigitalSignature -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.36') -CertStoreLocation Cert:\CurrentUser\My
+function New-TestSigner([string]$Subject, [string]$Store = 'CurrentUser\My') {
+    New-SelfSignedCertificate -Type Custom -Subject "CN=$Subject" -KeyAlgorithm RSA -KeyLength 2048 -KeyUsage DigitalSignature -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.36') -CertStoreLocation "Cert:\$Store"
 }
 
 $cert = $null
 $reviewer = $null
+$principal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
+$elevated = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+$reviewStore = if ($elevated) { 'LocalMachine\My' } else { 'CurrentUser\My' }
 try {
+    if ($env:GITHUB_ACTIONS -eq 'true' -and !$elevated) { throw 'Windows CI requires a machine-store signer.' }
     $info = Invoke-SignCli @('--inspect', $inputPdf)
     $field = @($info.fields | Where-Object name -eq 'Approval')
     if ($info.pages -ne 2 -or $field.Count -ne 1 -or $field[0].page -ne 2 -or $info.sha256 -ne (Get-FileHash $inputPdf).Hash) {
@@ -45,9 +49,14 @@ try {
     $subject = "SumiPDF CLI 試験 " + [guid]::NewGuid()
     $cert = New-TestSigner $subject
     $reviewerName = "SumiPDF 承認 " + [guid]::NewGuid()
-    $reviewer = New-TestSigner $reviewerName
+    $reviewer = New-TestSigner $reviewerName $reviewStore
     $list = Invoke-SignCli @('--certificates')
-    if (@($list.certificates | Where-Object thumbprint -eq $cert.Thumbprint).Count -ne 1) { throw 'Certificate missing from list' }
+    $firstIdentity = @($list.certificates | Where-Object thumbprint -eq $cert.Thumbprint)
+    $secondIdentity = @($list.certificates | Where-Object thumbprint -eq $reviewer.Thumbprint)
+    if ($firstIdentity.Count -ne 1 -or $firstIdentity[0].store -ne 'CurrentUser\My' -or
+        $secondIdentity.Count -ne 1 -or $secondIdentity[0].store -ne $reviewStore) {
+        throw "Expected distinct identities in CurrentUser\My and $reviewStore."
+    }
 
     $logo = Join-Path $folder '透かし.png'
     Add-Type -AssemblyName System.Drawing
@@ -85,9 +94,10 @@ try {
         throw 'An existing PDF was overwritten'
     }
     if ($SignedGuiFixture) { [IO.File]::Copy($area, $SignedGuiFixture) }
+    Write-Host "Signed first from CurrentUser\My and then from $reviewStore."
     Write-Host 'CLI verified two different Windows signers, both placements, field discovery, preview, exact revision preservation, source digest, custom PNG and no overwrite.'
 } finally {
-    if ($null -ne $reviewer) { Remove-Item -LiteralPath ("Cert:\CurrentUser\My\" + $reviewer.Thumbprint) -DeleteKey -Force }
+    if ($null -ne $reviewer) { Remove-Item -LiteralPath ("Cert:\$reviewStore\" + $reviewer.Thumbprint) -DeleteKey -Force }
     if ($null -ne $cert) { Remove-Item -LiteralPath ("Cert:\CurrentUser\My\" + $cert.Thumbprint) -DeleteKey -Force }
     [IO.Directory]::Delete($folder, $true)
 }

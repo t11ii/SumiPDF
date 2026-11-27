@@ -1,12 +1,14 @@
 //! Detached CMS signatures with a key held by a Windows CSP or KSP.
 
+use std::collections::HashSet;
 use std::ffi::CStr;
 use std::io;
 use std::mem::size_of;
 use std::ptr::{null, null_mut};
 use windows_sys::Win32::Foundation::{
-    CRYPT_E_NOT_FOUND, ERROR_CANCELLED, ERROR_NO_MORE_FILES, FILETIME, GetLastError, HWND,
-    NTE_USER_CANCELLED, SCARD_W_CANCELLED_BY_USER,
+    CRYPT_E_NOT_FOUND, ERROR_ACCESS_DENIED, ERROR_CANCELLED, ERROR_NO_MORE_FILES, FILETIME,
+    GetLastError, HWND, NTE_BAD_KEYSET, NTE_NOT_FOUND, NTE_PERM, NTE_USER_CANCELLED,
+    SCARD_W_CANCELLED_BY_USER,
 };
 use windows_sys::Win32::Security::Cryptography::UI::CryptUIDlgSelectCertificateFromStore;
 use windows_sys::Win32::Security::Cryptography::*;
@@ -42,25 +44,89 @@ impl Drop for SigningCertificate {
     }
 }
 
+struct Candidate {
+    certificate: SigningCertificate,
+    hash: [u8; 20],
+    store: &'static str,
+}
+
+pub(crate) struct CertificateSelection {
+    pub name: String,
+    pub hash: [u8; 20],
+}
+
 impl SigningCertificate {
-    /// Build the list without prompting for the keys of unselected identities.
-    fn eligible_store() -> Result<Store, String> {
-        let personal = Store(unsafe {
-            CertOpenStore(
-                CERT_STORE_PROV_SYSTEM_W,
-                0,
-                0,
-                CERT_SYSTEM_STORE_CURRENT_USER
-                    | CERT_STORE_READONLY_FLAG
-                    | CERT_STORE_OPEN_EXISTING_FLAG
-                    | CERT_STORE_DEFER_CLOSE_UNTIL_LAST_FREE_FLAG,
-                w!("MY").cast(),
-            )
-        });
-        if personal.0.is_null() {
-            return Err(last_error("Windows の個人証明書ストアを開けません。"));
+    // Enumerate only personal stores and leave all private keys with their providers.
+    fn candidates() -> Result<Vec<Candidate>, String> {
+        let mut found = Vec::new();
+        let mut opened = false;
+        let mut errors = Vec::new();
+        for (scope, store) in [
+            (CERT_SYSTEM_STORE_CURRENT_USER, r"CurrentUser\My"),
+            (CERT_SYSTEM_STORE_LOCAL_MACHINE, r"LocalMachine\My"),
+        ] {
+            let personal = Store(unsafe {
+                CertOpenStore(
+                    CERT_STORE_PROV_SYSTEM_W,
+                    0,
+                    0,
+                    scope
+                        | CERT_STORE_READONLY_FLAG
+                        | CERT_STORE_OPEN_EXISTING_FLAG
+                        | CERT_STORE_DEFER_CLOSE_UNTIL_LAST_FREE_FLAG,
+                    w!("MY").cast(),
+                )
+            });
+            if personal.0.is_null() {
+                errors.push(format!("{store}: {}", io::Error::last_os_error()));
+                continue;
+            }
+            opened = true;
+            let mut current = null_mut();
+            loop {
+                current = unsafe { CertEnumCertificatesInStore(personal.0, current) };
+                if current.is_null() {
+                    let code = unsafe { GetLastError() };
+                    if code != CRYPT_E_NOT_FOUND as u32 && code != ERROR_NO_MORE_FILES {
+                        return Err(last_error("証明書を一覧表示できません。"));
+                    }
+                    break;
+                }
+                if permits_signing(current) {
+                    // Enumeration consumes the original reference on the next call.
+                    let certificate = Self(unsafe { CertDuplicateCertificateContext(current) });
+                    let hash = match certificate.thumbprint() {
+                        Ok(hash) => hash,
+                        Err(e) => {
+                            unsafe {
+                                CertFreeCertificateContext(current);
+                            }
+                            return Err(e);
+                        }
+                    };
+                    found.push(Candidate {
+                        certificate,
+                        hash,
+                        store,
+                    });
+                }
+            }
         }
-        let candidates = Store(unsafe {
+        if !opened {
+            return Err(format!(
+                "Windows の個人証明書ストアを開けません。\n{}",
+                errors.join("\n")
+            ));
+        }
+        Ok(found)
+    }
+
+    pub(crate) fn pick(owner: HWND) -> Result<Option<CertificateSelection>, String> {
+        let candidates = Self::candidates()?;
+        if candidates.is_empty() {
+            return Err("Windows の「現在のユーザー」と「ローカル コンピューター」の読み取り可能な個人ストアに、有効な秘密鍵付きの文書署名用証明書がありません。IC カードを使う場合はカードを挿入してから再検索してください。".into());
+        }
+        let picker = Store(unsafe {
             CertOpenStore(
                 CERT_STORE_PROV_MEMORY,
                 0,
@@ -69,52 +135,34 @@ impl SigningCertificate {
                 null(),
             )
         });
-        if candidates.0.is_null() {
+        if picker.0.is_null() {
             return Err(last_error("証明書を選択できません。"));
         }
-
-        let mut current = null_mut();
-        loop {
-            // Each enumeration call releases the previous context, including at EOF.
-            current = unsafe { CertEnumCertificatesInStore(personal.0, current) };
-            if current.is_null() {
-                let error = unsafe { GetLastError() };
-                if error != CRYPT_E_NOT_FOUND as u32 && error != ERROR_NO_MORE_FILES {
-                    return Err(last_error("証明書を一覧表示できません。"));
-                }
-                break;
+        let mut linked = HashSet::new();
+        for candidate in &candidates {
+            if !linked.insert(candidate.hash) {
+                continue;
             }
-            if permits_signing(current)
-                && unsafe {
-                    CertAddCertificateLinkToStore(
-                        candidates.0,
-                        current,
-                        CERT_STORE_ADD_ALWAYS,
-                        null_mut(),
-                    )
-                } == 0
+            if unsafe {
+                CertAddCertificateLinkToStore(
+                    picker.0,
+                    candidate.certificate.0,
+                    CERT_STORE_ADD_ALWAYS,
+                    null_mut(),
+                )
+            } == 0
             {
-                let error = last_error("署名用証明書を一覧に追加できません。");
-                unsafe { CertFreeCertificateContext(current) };
-                return Err(error);
+                return Err(last_error("署名用証明書を一覧に追加できません。"));
             }
         }
-        Ok(candidates)
-    }
-
-    pub(crate) fn choose(owner: HWND) -> Result<Option<Self>, String> {
-        let candidates = Self::eligible_store()?;
-        let first = unsafe { CertEnumCertificatesInStore(candidates.0, null()) };
-        if first.is_null() {
-            return Err("利用できる文書署名用の証明書がありません。秘密鍵付きの署名用証明書を Windows の「現在のユーザー」→「個人」に登録してください。IC カードを使う場合はカードを挿入してください。".into());
-        }
-        unsafe { CertFreeCertificateContext(first) };
         let selected = unsafe {
             CryptUIDlgSelectCertificateFromStore(
-                candidates.0,
+                picker.0,
                 owner,
-                w!("PDF に電子署名"),
-                w!("この PDF への署名に使う証明書を選択してください。"),
+                w!("Windows 証明書ストアから選ぶ"),
+                w!(
+                    "現在のユーザーとローカル コンピューターの個人ストアから、この PDF の署名者を選択してください。"
+                ),
                 0,
                 0,
                 null(),
@@ -123,7 +171,18 @@ impl SigningCertificate {
         if selected.is_null() {
             return Ok(None);
         }
-        Self(selected).acquire(owner)
+        let cert = Self(selected);
+        Ok(Some(CertificateSelection {
+            name: cert.display_name()?,
+            hash: cert.thumbprint()?,
+        }))
+    }
+
+    pub(crate) fn choose(owner: HWND) -> Result<Option<Self>, String> {
+        match Self::pick(owner)? {
+            Some(choice) => Self::by_thumbprint(choice.hash, owner),
+            None => Ok(None),
+        }
     }
 
     pub(crate) fn display_name(&self) -> Result<String, String> {
@@ -141,7 +200,7 @@ impl SigningCertificate {
         String::from_utf16(&name[..size as usize - 1]).map_err(|e| e.to_string())
     }
 
-    fn thumbprint(&self) -> Result<String, String> {
+    fn thumbprint(&self) -> Result<[u8; 20], String> {
         let mut hash = [0u8; 20];
         let mut size = hash.len() as u32;
         if unsafe {
@@ -156,54 +215,54 @@ impl SigningCertificate {
         {
             return Err(last_error("証明書の拇印を読み込めません。"));
         }
-        Ok(hash.iter().map(|b| format!("{b:02X}")).collect())
+        Ok(hash)
     }
 
     pub(crate) fn list() -> Result<Vec<serde_json::Value>, String> {
-        let store = Self::eligible_store()?;
-        let mut current = null_mut();
-        let mut certificates = Vec::new();
-        loop {
-            current = unsafe { CertEnumCertificatesInStore(store.0, current) };
-            if current.is_null() {
-                let error = unsafe { GetLastError() };
-                if error == CRYPT_E_NOT_FOUND as u32 || error == ERROR_NO_MORE_FILES {
-                    return Ok(certificates);
-                }
-                return Err(last_error("証明書を一覧表示できません。"));
+        let mut seen = HashSet::new();
+        let mut result = Vec::new();
+        for candidate in Self::candidates()? {
+            if seen.insert(candidate.hash) {
+                let fingerprint: String =
+                    candidate.hash.iter().map(|b| format!("{b:02X}")).collect();
+                result.push(
+                    serde_json::json!({"name":candidate.certificate.display_name()?,
+                            "thumbprint":fingerprint, "store":candidate.store}),
+                );
             }
-            let cert = Self(current);
-            certificates.push(
-                serde_json::json!({"name":cert.display_name()?,"thumbprint":cert.thumbprint()?}),
-            );
-            // Transfer ownership back to CertEnumCertificatesInStore for the next call.
-            std::mem::forget(cert);
         }
+        Ok(result)
     }
 
-    pub(crate) fn by_thumbprint(hash: &mut [u8; 20]) -> Result<Option<Self>, String> {
-        let candidates = Self::eligible_store()?;
-        let blob = CRYPT_INTEGER_BLOB {
-            cbData: hash.len() as u32,
-            pbData: hash.as_mut_ptr(),
-        };
-        let found = unsafe {
-            CertFindCertificateInStore(
-                candidates.0,
-                ENCODING,
-                0,
-                CERT_FIND_SHA1_HASH,
-                (&raw const blob).cast(),
-                null(),
-            )
-        };
-        if found.is_null() {
-            return Err("指定した拇印の有効な署名用証明書が見つかりません。".into());
+    pub(crate) fn by_thumbprint(hash: [u8; 20], owner: HWND) -> Result<Option<Self>, String> {
+        let mut matches = Self::candidates()?
+            .into_iter()
+            .filter(|c| c.hash == hash)
+            .peekable();
+        while let Some(candidate) = matches.next() {
+            match candidate.certificate.acquire(owner) {
+                Ok(selected) => return Ok(selected),
+                Err(e) => {
+                    // The same identity may have an inaccessible key in one store.
+                    // Never retry a cancellation or PIN failure against a second provider.
+                    if matches.peek().is_some()
+                        && matches!(e.raw_os_error(),
+                        Some(code) if [ERROR_ACCESS_DENIED, NTE_BAD_KEYSET as u32,
+                                      NTE_NOT_FOUND as u32, NTE_PERM as u32].contains(&(code as u32)))
+                    {
+                        continue;
+                    }
+                    return Err(format!(
+                        "{} の秘密鍵を使用できません。IC カードの接続や鍵へのアクセスを確認してください。\n{e}",
+                        candidate.store
+                    ));
+                }
+            }
         }
-        Self(found).acquire(null_mut())
+        Err("選択した署名用証明書が Windows の個人ストアに見つかりません。証明書を選び直してください。".into())
     }
 
-    fn acquire(self, owner: HWND) -> Result<Option<Self>, String> {
+    fn acquire(self, owner: HWND) -> Result<Option<Self>, io::Error> {
         // Acquire/cache only the selected key. CACHE_FLAG makes the cert own the resulting
         // handle. The parent HWND lets the provider display its PIN prompt over the viewer.
         let mut key = 0;
@@ -241,9 +300,7 @@ impl SigningCertificate {
             {
                 return Ok(None);
             }
-            return Err(last_error(
-                "秘密鍵を使用できません。IC カードの接続や鍵へのアクセスを確認してください。",
-            ));
+            return Err(io::Error::from_raw_os_error(code as i32));
         }
         Ok(Some(self))
     }

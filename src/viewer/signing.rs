@@ -1,5 +1,9 @@
 use super::{App, Controls, Event, VIEW, canvas, dialog, notice, save, wide, worker};
-use crate::{highlight::UnitRect, pdfseal};
+use crate::{
+    highlight::UnitRect,
+    pdfseal,
+    wincrypto::{CertificateSelection, SigningCertificate},
+};
 use std::{os::windows::ffi::OsStrExt, path::Path, ptr::null, sync::Arc};
 use windows_sys::Win32::{
     Foundation::{HWND, RECT},
@@ -85,6 +89,7 @@ pub(super) struct Session {
     selected: Option<usize>,
     pub drawn: Option<(u32, UnitRect)>,
     watermark: Option<Watermark>,
+    pub(super) certificate: Option<CertificateSelection>,
 }
 
 impl Session {
@@ -141,19 +146,29 @@ impl Session {
         if !self.has_positions() {
             return "この PDF には追加署名に使える空の署名欄がありません。".into();
         }
+        let position = self.position_instructions(current_page);
+        match &self.certificate {
+            Some(cert) => format!("署名者：{}　·　{position}", cert.name),
+            None => format!("{position}　·　鍵のボタンで証明書を選べます。"),
+        }
+    }
+
+    fn position_instructions(&self, current_page: u32) -> String {
         if self.position().is_none() {
             return "署名位置を選び直してください。".into();
         }
         if matches!(self.position(), Some(Position::Invisible)) {
-            return "ページに表示しない電子署名を作成します。「署名して保存」で証明書を選択します。".into();
+            return "ページに表示しない電子署名を作成します。".into();
         }
         match self.placement() {
             Some((page, _)) if page != current_page => format!(
-                "署名の位置は {} ページです。そのページを開いて確認するか、署名位置を選び直してください。", page + 1
+                "署名の位置は {} ページです。そのページを開いて確認するか、署名位置を選び直してください。",
+                page + 1
             ),
-            Some(_) if self.drawing() =>
-                "青枠の位置に署名します。ドラッグで描き直すか、「署名して保存」で証明書を選択してください。".into(),
-            Some(_) => "青枠が選択した署名欄です。「署名して保存」で証明書を選択してください。".into(),
+            Some(_) if self.drawing() => {
+                "青枠の位置に署名します。ドラッグで描き直すこともできます。".into()
+            }
+            Some(_) => "青枠が選択した署名欄です。".into(),
             None => "署名を表示するページで、枠の角から反対側の角までドラッグしてください。".into(),
         }
     }
@@ -295,6 +310,17 @@ impl App {
         self.status();
     }
 
+    pub(super) fn choose_certificate(&mut self) -> Result<(), String> {
+        if let Some(session) = &mut self.signing
+            && session.has_positions()
+            && let Some(choice) = SigningCertificate::pick(self.hwnd)?
+        {
+            session.certificate = Some(choice);
+            self.status();
+        }
+        Ok(())
+    }
+
     pub(super) fn choose_watermark(&mut self) -> Result<(), String> {
         let Some(session) = &mut self.signing else {
             return Ok(());
@@ -428,6 +454,13 @@ mod tests {
             session.appearance().unwrap().unwrap().target,
             pdfseal::Target::Field("field-8-0".into())
         );
+        session.certificate = Some(CertificateSelection {
+            name: "山田 太郎".into(),
+            hash: [1; 20],
+        });
+        let status = session.instructions(1);
+        assert!(status.starts_with("署名者：山田 太郎"));
+        assert!(status.contains("青枠が選択した署名欄"));
 
         session.selected = Some(1);
         assert!(session.appearance().is_err());

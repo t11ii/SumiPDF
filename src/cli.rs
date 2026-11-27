@@ -14,7 +14,7 @@ Pages start at 1. Rectangles use fractions of the visible page (top-left 0,0).
 For signed PDFs, alreadySigned and allowsNewField describe placement options.
 --preview saves a page PNG with an optional target outline. --sign creates a new PDF.
 If --certificate is omitted, Windows opens its certificate picker. Use --certificates
-to list eligible identities in CurrentUser/My. A key provider may request a PIN.
+to list eligible identities in CurrentUser/My and LocalMachine/My. A key provider may request a PIN.
 Existing output files are preserved. Commands return JSON except --help."#;
 
 enum Command {
@@ -244,7 +244,7 @@ pub fn run(args: Vec<OsString>) -> Result<(), String> {
             let (page, rect) = pdfseal::locate(&bytes, &target)?;
             let watermark = watermark.map(|p| crate::read_watermark(&p)).transpose()?;
             let cert = match certificate {
-                Some(mut hash) => SigningCertificate::by_thumbprint(&mut hash)?,
+                Some(hash) => SigningCertificate::by_thumbprint(hash, std::ptr::null_mut())?,
                 None => SigningCertificate::choose(std::ptr::null_mut())?,
             }
             .ok_or("証明書の選択をキャンセルしました。")?;

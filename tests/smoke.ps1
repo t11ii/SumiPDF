@@ -54,6 +54,11 @@ public static class SumiSmoke {
         if (handle == IntPtr.Zero || !PostMessageW(handle, message, new UIntPtr(keys), position))
             throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not post UI input.");
     }
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetLastActivePopup(IntPtr owner);
+    public static void CloseDialog(IntPtr dialog) {
+        Post(dialog, 0x0010, 0, IntPtr.Zero); // WM_CLOSE
+    }
     public static void Click(IntPtr window, int id) {
         Post(GetDlgItem(window, id), 0x00F5, 0, IntPtr.Zero); // BM_CLICK
     }
@@ -167,7 +172,9 @@ function Wait-SignatureState([IntPtr]$Window, [string]$StatusText, [bool]$CanSav
         $status = [SumiSmoke]::ReadText([SumiSmoke]::GetDlgItem($Window, 112))
         $save = [SumiSmoke]::GetDlgItem($Window, 129)
         $watermark = [SumiSmoke]::GetDlgItem($Window, 128)
+        $certificate = [SumiSmoke]::GetDlgItem($Window, 131)
         if ($status.Contains($StatusText) -and [SumiSmoke]::IsWindowVisible($save) -and
+            [SumiSmoke]::IsWindowVisible($certificate) -and [SumiSmoke]::IsWindowEnabled($certificate) -and
             ([SumiSmoke]::IsWindowEnabled($save) -eq $CanSave) -and
             ([SumiSmoke]::IsWindowEnabled($watermark) -eq $CanPickImage)) { return }
         Start-Sleep -Milliseconds 50
@@ -180,6 +187,7 @@ $dir = Join-Path ([IO.Path]::GetTempPath()) ("SumiPDF-smoke-" + [Guid]::NewGuid(
 $fixture = Join-Path $dir 'two pages.pdf'
 $signedFixture = Join-Path $dir 'signed once.pdf'
 $viewer = $null
+$pickerCert = $null
 try {
     [void][IO.Directory]::CreateDirectory($dir)
     Write-TestPdf $fixture
@@ -227,6 +235,21 @@ try {
     # Keep the pending underline while switching to signing. The existing empty field is on page 2.
     [SumiSmoke]::Click($window, 107)
     Wait-SignatureState $window '青枠が選択した署名欄' $true $true
+    $pickerCert = New-SelfSignedCertificate -Type Custom -Subject ("CN=SumiPDF Picker " + [guid]::NewGuid()) -KeyUsage DigitalSignature -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.36') -CertStoreLocation Cert:\CurrentUser\My
+    [SumiSmoke]::Click($window, 131)
+    $timer.Restart()
+    $title = ''
+    do {
+        $popup = [SumiSmoke]::GetLastActivePopup($window)
+        if ($popup -ne $window -and [SumiSmoke]::IsWindowVisible($popup)) {
+            $title = [SumiSmoke]::ReadText($popup)
+            if ($title -eq 'Windows 証明書ストアから選ぶ') { break }
+        }
+        Start-Sleep -Milliseconds 50
+    } while ($timer.Elapsed.TotalSeconds -lt 15)
+    if ($title -ne 'Windows 証明書ストアから選ぶ') { throw "Certificate picker did not open. Active popup: '$title'." }
+    [SumiSmoke]::CloseDialog($popup)
+    Wait-SignatureState $window '青枠が選択した署名欄' $true $true
     if ([SumiSmoke]::ReadText([SumiSmoke]::GetDlgItem($window, 111)) -ne '2 / 2') {
         throw 'Selecting the existing field did not navigate to its page.'
     }
@@ -240,7 +263,8 @@ try {
     Wait-SignatureState $window 'ページに表示しない電子署名' $true $false
     [SumiSmoke]::Click($window, 130)
     Wait-HighlightState $viewer $window 'ページ全体' $true
-    if ([SumiSmoke]::IsWindowVisible([SumiSmoke]::GetDlgItem($window, 129))) {
+    if ([SumiSmoke]::IsWindowVisible([SumiSmoke]::GetDlgItem($window, 129)) -or
+        [SumiSmoke]::IsWindowVisible([SumiSmoke]::GetDlgItem($window, 131))) {
         throw 'The signature toolbar remained visible after cancellation.'
     }
     [SumiSmoke]::Click($window, 114)
@@ -280,5 +304,6 @@ try {
         if (-not $viewer.HasExited) { $viewer.Kill(); $viewer.WaitForExit() }
         $viewer.Dispose()
     }
+    if ($null -ne $pickerCert) { Remove-Item -LiteralPath ("Cert:\CurrentUser\My\" + $pickerCert.Thumbprint) -DeleteKey -Force }
     if ([IO.Directory]::Exists($dir)) { [IO.Directory]::Delete($dir, $true) }
 }
