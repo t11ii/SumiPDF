@@ -32,18 +32,18 @@ fn choose_paths(hwnd: HWND, purpose: Purpose<'_>) -> Result<Vec<PathBuf>, String
         Purpose::SignedCopy(_) | Purpose::HighlightedCopy(_)
     );
     let title = wide(match purpose {
-        Purpose::SignedCopy(_) => "署名済みPDFを新しいファイルに保存",
-        Purpose::HighlightedCopy(_) => "注釈付きPDFを新しいファイルに保存",
-        Purpose::Pfx => "署名に使う PFX ファイルを開く",
-        Purpose::Open => "PDFを開く",
-        Purpose::Watermark => "電子署名の背景に使う PNG 画像を選択",
+        Purpose::SignedCopy(_) => "Save a signed copy",
+        Purpose::HighlightedCopy(_) => "Save an annotated copy",
+        Purpose::Pfx => "Open a PFX file for signing",
+        Purpose::Open => "Open PDF",
+        Purpose::Watermark => "Choose a PNG for the signature background",
     });
     let (filter, ext) = if matches!(purpose, Purpose::Pfx) {
         (wide("PKCS#12 (*.pfx, *.p12)\0*.pfx;*.p12\0"), wide("pfx"))
     } else if matches!(purpose, Purpose::Watermark) {
-        (wide("PNG 画像 (*.png)\0*.png\0"), wide("png"))
+        (wide("PNG images (*.png)\0*.png\0"), wide("png"))
     } else {
-        (wide("PDF ファイル (*.pdf)\0*.pdf\0"), wide("pdf"))
+        (wide("PDF files (*.pdf)\0*.pdf\0"), wide("pdf"))
     };
     let mut directory = Vec::new();
     if let Purpose::SignedCopy(path) | Purpose::HighlightedCopy(path) = purpose {
@@ -103,9 +103,7 @@ fn choose_paths(hwnd: HWND, purpose: Purpose<'_>) -> Result<Vec<PathBuf>, String
             return if code == 0 {
                 Ok(Vec::new())
             } else {
-                Err(format!(
-                    "ファイル選択ダイアログを開けません (0x{code:08X})。"
-                ))
+                Err(format!("Could not open the file dialog (0x{code:08X})."))
             };
         }
         let len = buffer.iter().position(|&u| u == 0).unwrap_or(buffer.len());
@@ -120,7 +118,7 @@ fn choose_paths(hwnd: HWND, purpose: Purpose<'_>) -> Result<Vec<PathBuf>, String
         if save && chosen.exists() {
             super::notice(
                 hwnd,
-                "この名前のファイルは既にあります。別の名前で保存してください。",
+                "A file with this name already exists. Choose a different name.",
                 false,
             );
             continue;

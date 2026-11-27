@@ -24,6 +24,16 @@ public static class ReadingProbe {
     [DllImport("user32.dll")] static extern bool ScreenToClient(IntPtr window, ref Point point);
     [DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
     [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr window, out Rect rect);
+    [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr window, uint command);
+    [DllImport("user32.dll")] static extern bool IsWindow(IntPtr window);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode, ExactSpelling=true)]
+    static extern IntPtr FindWindowExW(IntPtr parent, IntPtr after, string kind, string name);
+    [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", ExactSpelling=true, CharSet=CharSet.Unicode)]
+    static extern IntPtr FindListEntry(IntPtr list, uint message, UIntPtr startAfter, string value,
+        uint flags, uint timeout, out UIntPtr result);
+    [DllImport("user32.dll")] static extern IntPtr GetKeyboardLayout(uint id);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode, ExactSpelling=true)]
+    static extern short VkKeyScanExW(char character, IntPtr layout);
 
     static void Post(IntPtr window, uint message, uint key, IntPtr position) {
         if (!PostMessageW(window, message, new UIntPtr(key), position))
@@ -41,8 +51,7 @@ public static class ReadingProbe {
     public static void Command(IntPtr window, int id) {
         Post(window, 0x0111, (uint)id, IntPtr.Zero);
     }
-    public static void TabShortcut(IntPtr window, int key, bool shift, int expectedIndex, int expectedCount) {
-        var tabs = GetDlgItem(window, 133);
+    static void Shortcut(IntPtr window, int key, int modifiers, Func<bool> observed, string description) {
         uint self = GetCurrentThreadId(), viewer = GetWindowThreadProcessId(window, IntPtr.Zero);
         GetQueueStatus(0x04FF); // Create the caller's GUI queue before attaching.
         if (!AttachThreadInput(self, viewer, true))
@@ -53,23 +62,60 @@ public static class ReadingProbe {
             haveState = GetKeyboardState(saved);
             if (!haveState) throw new Win32Exception(Marshal.GetLastWin32Error());
             var keys = (byte[])saved.Clone();
-            keys[0x11] = 0x80; // VK_CONTROL
-            keys[0x10] = (byte)(shift ? 0x80 : 0);
-            keys[0x12] = 0; // VK_MENU
+            keys[0x10] = (byte)((modifiers & 1) != 0 ? 0x80 : 0); // VK_SHIFT
+            keys[0x11] = (byte)((modifiers & 2) != 0 ? 0x80 : 0); // VK_CONTROL
+            keys[0x12] = (byte)((modifiers & 4) != 0 ? 0x80 : 0); // VK_MENU
             if (!SetKeyboardState(keys)) throw new Win32Exception(Marshal.GetLastWin32Error());
             Post(window, 0x0100, (uint)key, new IntPtr(1)); // WM_KEYDOWN into the ordinary shortcut handler
             Post(window, 0x0101, (uint)key, new IntPtr(unchecked((int)0xC0000001))); // WM_KEYUP
             var elapsed = Stopwatch.StartNew();
             while (elapsed.ElapsedMilliseconds < 5000) {
-                if (Query(tabs, 0x1304) == expectedCount && Query(tabs, 0x130B) == expectedIndex) return;
+                if (observed()) return;
                 Thread.Sleep(15);
             }
-            throw new InvalidOperationException("Tab shortcut did not select index " + expectedIndex +
-                " of " + expectedCount + " tabs (index " + Query(tabs, 0x130B) + ", count " + Query(tabs, 0x1304) + ").");
+            throw new InvalidOperationException("Shortcut did not " + description + ".");
         } finally {
             if (haveState) SetKeyboardState(saved);
             AttachThreadInput(self, viewer, false);
         }
+    }
+
+    public static void TabShortcut(IntPtr window, int key, bool shift, int expectedIndex, int expectedCount) {
+        var tabs = GetDlgItem(window, 133);
+        Shortcut(window, key, shift ? 3 : 2,
+            () => Query(tabs, 0x1304) == expectedCount && Query(tabs, 0x130B) == expectedIndex,
+            "select tab " + expectedIndex + " of " + expectedCount);
+    }
+    public static void CheckShortcutHelp(IntPtr window) {
+        short mapping = VkKeyScanExW('?', GetKeyboardLayout(GetWindowThreadProcessId(window, IntPtr.Zero)));
+        if (mapping == -1) throw new InvalidOperationException("No question mark key on this test layout.");
+        IntPtr dialog = IntPtr.Zero;
+        Shortcut(window, mapping & 255, mapping >> 8, () => {
+            dialog = IntPtr.Zero;
+            while ((dialog = FindWindowExW(IntPtr.Zero, dialog, "#32770", "Keyboard shortcuts")) != IntPtr.Zero)
+                if (GetWindow(dialog, 4) == window) return true; // GW_OWNER
+            return false;
+        }, "open keyboard help");
+        var list = GetDlgItem(dialog, 1000);
+        if (Query(list, 0x018B) < 19) throw new InvalidOperationException("Shortcut list is incomplete.");
+        foreach (string item in new[] {"Ctrl+W\tClose the current tab", "H\tToggle highlight", "Ctrl+S\tSign PDF / save while signing"}) {
+            UIntPtr index;
+            if (FindListEntry(list, 0x01A2, UIntPtr.MaxValue, item, 2, 2000, out index) == IntPtr.Zero ||
+                index.ToUInt64() > int.MaxValue) throw new InvalidOperationException("Missing shortcut: " + item);
+        }
+        Shortcut(list, 0x1B, 0, () => !IsWindow(dialog), "dismiss help with Escape");
+    }
+    public static void ClickClose(IntPtr window, string name) {
+        var close = FindWindowExW(GetDlgItem(window, 133), IntPtr.Zero, "Button", "Close " + name);
+        Rect bounds;
+        if (close == IntPtr.Zero || !GetClientRect(close, out bounds) || bounds.Right < 1 || bounds.Bottom < 1)
+            throw new InvalidOperationException("Missing close button for " + name);
+        var point = new IntPtr(((bounds.Bottom / 2) << 16) | (bounds.Right / 2));
+        Post(close, 0x0201, 1, point);
+        Post(close, 0x0202, 0, point);
+    }
+    public static int TabCount(IntPtr window) {
+        return Query(GetDlgItem(window, 133), 0x1304);
     }
 
     [ComImport, Guid("618736E0-3C3D-11CF-810C-00AA00389B71"), InterfaceType(ComInterfaceType.InterfaceIsIDispatch)]

@@ -1,6 +1,7 @@
 mod canvas;
 mod dialog;
 mod save;
+mod shortcuts;
 mod signing;
 mod tabs;
 mod theme;
@@ -24,7 +25,13 @@ use windows_sys::Win32::{
     Foundation::*,
     Graphics::Gdi::*,
     System::{Com::*, LibraryLoader::GetModuleHandleW},
-    UI::{HiDpi::*, Input::KeyboardAndMouse::*, Shell::*, WindowsAndMessaging::*},
+    UI::{
+        Controls::{DRAWITEMSTRUCT, MEASUREITEMSTRUCT},
+        HiDpi::*,
+        Input::KeyboardAndMouse::*,
+        Shell::*,
+        WindowsAndMessaging::*,
+    },
 };
 use worker::{Event, Job};
 
@@ -61,6 +68,7 @@ const NEXT_TAB: usize = 135;
 const CLOSE_TAB: usize = 136;
 const SELECT_TAB: usize = 137;
 const SCROLLED: usize = 138;
+const SHOW_SHORTCUTS: usize = 144;
 const RENDER_TIMER: usize = 1;
 const ACTION: u32 = WM_APP + 1;
 const READY: u32 = WM_APP + 2;
@@ -118,12 +126,26 @@ fn action(hwnd: HWND, id: usize) {
 // procedure. Changes to the application model run only in the outer loop.
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     match msg {
+        WM_SYSCOMMAND if shortcuts::is_menu_command(w) => {
+            action(hwnd, SHOW_SHORTCUTS);
+            0
+        }
+        WM_MEASUREITEM if w == COLOR && l != 0 => {
+            let item = unsafe { &mut *(l as *mut MEASUREITEMSTRUCT) };
+            item.itemHeight = dips(hwnd, theme::COLOR_ROW_HEIGHT) as u32;
+            1
+        }
+        WM_DRAWITEM if w == COLOR && l != 0 => {
+            let item = unsafe { &*(l as *const DRAWITEMSTRUCT) };
+            theme::draw_color_item(item);
+            1
+        }
         WM_NOTIFY if l != 0 => {
             let header = unsafe { &*(l as *const windows_sys::Win32::UI::Controls::NMHDR) };
             if header.idFrom == TABS
                 && header.code == windows_sys::Win32::UI::Controls::TCN_SELCHANGE
             {
-                action(hwnd, SELECT_TAB);
+                tabs::post_selected(header.hwndFrom, SELECT_TAB);
             }
             unsafe { DefWindowProcW(hwnd, msg, w, l) }
         }
@@ -268,7 +290,6 @@ fn child(parent: HWND, class: &str, caption: &str, id: usize, style: u32) -> Res
 
 struct Controls {
     tab_bar: HWND,
-    tab_close: HWND,
     canvas: HWND,
     open: HWND,
     prev: HWND,
@@ -305,13 +326,13 @@ impl Controls {
             "COMBOBOX",
             "",
             COLOR,
-            WS_TABSTOP | CBS_DROPDOWNLIST as u32,
+            WS_TABSTOP | (CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS) as u32,
         )?;
         for color in MarkColor::ALL {
-            let label = wide(&format!("色：{}", color.label()));
+            let label = wide(color.label());
             let index = unsafe { SendMessageW(picker, CB_ADDSTRING, 0, label.as_ptr() as isize) };
             if index < 0 {
-                return Err("注釈の色を追加できませんでした。".into());
+                return Err("Could not add a markup color.".into());
             }
             if color == MarkColor::default() {
                 unsafe {
@@ -342,7 +363,6 @@ impl Controls {
         let mut toolbar = toolbar::Toolbar::new(hwnd)?;
         let mut ui = Self {
             tab_bar: tabs::create(hwnd)?,
-            tab_close: child(hwnd, "BUTTON", "×", CLOSE_TAB, WS_TABSTOP)?,
             open: toolbar.button(OPEN, toolbar::OPEN_FILE)?,
             prev: toolbar.button(PREV, toolbar::PREVIOUS)?,
             page: child(hwnd, "BUTTON", "— / —", PAGE, WS_TABSTOP)?,
@@ -373,7 +393,7 @@ impl Controls {
             status: child(
                 hwnd,
                 "STATIC",
-                "PDF を開いて閲覧・署名できます。",
+                "Open a PDF to read or sign it.",
                 STATUS,
                 0x4200,
             )?, // SS_CENTERIMAGE | SS_PATHELLIPSIS
@@ -384,14 +404,13 @@ impl Controls {
             font_dpi: 0,
         };
         ui.toolbar.page_tip(ui.page)?;
-        for control in [ui.page, ui.page_input, ui.color, ui.position, ui.tab_close] {
+        ui.toolbar.color_tip(ui.color)?;
+        for control in [ui.page, ui.page_input, ui.color, ui.position] {
             theme::style_control(control)?;
         }
-        ui.toolbar.tab_close_tip(ui.tab_close)?;
         ui.show_signing(false);
         unsafe {
             ShowWindow(ui.tab_bar, SW_HIDE);
-            ShowWindow(ui.tab_close, SW_HIDE);
         }
         Ok(ui)
     }
@@ -445,7 +464,6 @@ impl Controls {
         for c in [
             self.page,
             self.page_input,
-            self.tab_close,
             self.tab_bar,
             self.color,
             self.position,
@@ -482,10 +500,9 @@ impl Controls {
                 control(TABS),
                 s(6),
                 s(1),
-                (bounds.right - s(54)).max(1),
+                (bounds.right - s(12)).max(1),
                 s(32),
             );
-            place(control(CLOSE_TAB), bounds.right - s(43), s(1), s(36), s(32));
         }
         let button = 36;
         let page_x = 91;
@@ -676,10 +693,6 @@ impl App {
         for (c, enabled) in [
             (self.ui.open, !self.writing),
             (self.ui.tab_bar, !self.writing),
-            (
-                self.ui.tab_close,
-                self.active_tab.is_some() && !self.writing,
-            ),
             (self.ui.page, self.page_count() > 0),
             (self.ui.prev, self.page > 0),
             (self.ui.next, self.page + 1 < self.page_count()),
@@ -758,28 +771,31 @@ impl App {
     }
     fn discard_all_ok(&self) -> bool {
         if !self.tabs.iter().any(tabs::Tab::dirty) {
-            return self.discard_ok();
+            return self.marks == self.saved_marks || self.confirm_discard(&self.path);
         }
         unsafe {
             MessageBoxW(
                 self.hwnd,
-                wide("未保存の注釈があるタブがあります。変更を破棄してすべてのタブを閉じますか？")
+                wide("Some tabs have unsaved annotations. Discard the changes and close all tabs?")
                     .as_ptr(),
                 wide("SumiPDF").as_ptr(),
                 MB_YESNO | MB_DEFBUTTON2 | MB_ICONQUESTION,
             ) == IDYES
         }
     }
-    fn discard_ok(&self) -> bool {
-        self.marks == self.saved_marks
-            || unsafe {
-                MessageBoxW(
-                    self.hwnd,
-                    wide("注釈の変更がまだ保存されていません。変更を破棄して続けますか？").as_ptr(),
-                    wide("SumiPDF").as_ptr(),
-                    MB_YESNO | MB_DEFBUTTON2 | MB_ICONQUESTION,
-                ) == IDYES
-            }
+    fn confirm_discard(&self, path: &std::path::Path) -> bool {
+        unsafe {
+            MessageBoxW(
+                self.hwnd,
+                wide(&format!(
+                    "Discard unsaved annotations and close this PDF?\n\n{}",
+                    path.display()
+                ))
+                .as_ptr(),
+                wide("SumiPDF").as_ptr(),
+                MB_YESNO | MB_DEFBUTTON2 | MB_ICONQUESTION,
+            ) == IDYES
+        }
     }
     fn status(&self) {
         if self.writing {
@@ -792,30 +808,33 @@ impl App {
             signing.instructions(self.page)
         } else if let Some(kind) = self.tool {
             let name = match kind {
-                MarkKind::Highlight => "蛍光ペン",
-                MarkKind::Underline => "下線",
+                MarkKind::Highlight => "Highlight",
+                MarkKind::Underline => "Underline",
             };
             let help = if !self.text_ready {
-                "文字の位置を読み込み中…"
+                "Loading text positions…"
             } else if self.has_text {
-                "文字をドラッグして選択"
+                "Drag across text to select it"
             } else if kind == MarkKind::Underline {
-                "線を引く位置で横にドラッグ"
+                "Drag horizontally to underline"
             } else {
-                "ハイライトする範囲をドラッグ"
+                "Drag to highlight an area"
             };
-            format!("{name}（{}）  ·  {help}  ·  Esc で終了", self.color.label())
+            format!(
+                "{name} ({})  ·  {help}  ·  Esc to finish",
+                self.color.label()
+            )
         } else {
             let range = VIEW
                 .with_borrow(|v| v.visible_range)
                 .unwrap_or((self.page, self.page));
             let pages = if range.0 == range.1 {
-                (range.0 + 1).to_string()
+                format!("Page {}", range.0 + 1)
             } else {
-                format!("{}–{}", range.0 + 1, range.1 + 1)
+                format!("Pages {}–{}", range.0 + 1, range.1 + 1)
             };
             format!(
-                "表示中 {pages} ページ  ·  全体表示の {:.0}%  ·  ホイールでスクロール",
+                "{pages}  ·  {:.0}% of fit size  ·  Scroll with the mouse wheel",
                 self.zoom * 100.0
             )
         };
@@ -877,7 +896,7 @@ impl App {
                 page: self.page,
                 source,
             })
-            .map_err(|_| "文字位置を取得するスレッドが終了しました。".to_owned())
+            .map_err(|_| "The text selection service has stopped.".to_owned())
     }
     fn text_failed(&mut self, error: &str) {
         self.tool = None;
@@ -924,10 +943,7 @@ impl App {
             _ => {
                 set_text(
                     self.ui.status,
-                    &format!(
-                        "1 ～ {} のページ番号を入力してください。",
-                        self.page_count()
-                    ),
+                    &format!("Enter a page number from 1 to {}.", self.page_count()),
                 );
                 unsafe {
                     SendMessageW(
@@ -954,7 +970,7 @@ impl App {
         {
             notice(
                 self.hwnd,
-                "描画スレッドが終了しました。アプリを再起動してください。",
+                "The page renderer has stopped. Restart SumiPDF.",
                 true,
             );
         }
@@ -1012,7 +1028,7 @@ impl App {
             return;
         }
         self.page = page;
-        self.reset_canvas("ページを表示中…");
+        self.reset_canvas("Loading page…");
         self.sync_signature();
         if self.tool.is_some()
             && let Err(e) = self.request_text()
@@ -1020,7 +1036,7 @@ impl App {
             self.text_failed(&e);
         }
         if !self.writing {
-            set_text(self.ui.status, "ページを表示中…");
+            set_text(self.ui.status, "Loading page…");
         }
         self.controls();
         self.render();
@@ -1060,7 +1076,10 @@ impl App {
         };
         let source = doc.source.as_ref().map_err(Clone::clone)?.clone();
         let (cert, purpose, appearance) = if signed {
-            let session = self.signing.as_ref().ok_or("署名位置を選んでください。")?;
+            let session = self
+                .signing
+                .as_ref()
+                .ok_or("Choose a signature position.")?;
             let appearance = session.appearance()?;
             let certificate = match &session.certificate {
                 Some(choice) => choice.resolve(self.hwnd)?,
@@ -1100,9 +1119,9 @@ impl App {
         set_text(
             self.ui.status,
             if signed {
-                "署名しています…"
+                "Signing PDF…"
             } else {
-                "注釈を保存しています…"
+                "Saving annotations…"
             },
         );
         self.controls();
@@ -1136,8 +1155,8 @@ impl App {
                     self.render();
                 }
                 Err(e) => {
-                    self.reset_canvas("この PDF を開けませんでした。");
-                    set_text(self.ui.status, "読み込みエラー");
+                    self.reset_canvas("Could not open this PDF.");
+                    set_text(self.ui.status, "Could not load PDF");
                     notice(self.hwnd, &e, true);
                 }
             },
@@ -1202,19 +1221,16 @@ impl App {
                         self.title();
                         self.controls();
                         let what = if signed {
-                            "署名済みPDF"
+                            "signed PDF"
                         } else {
-                            "注釈付きPDF"
+                            "annotated PDF"
                         };
-                        let s = format!("{what}を保存しました。\n{}", path.display());
-                        set_text(
-                            self.ui.status,
-                            &format!("保存しました  ·  {}", path.display()),
-                        );
+                        let s = format!("Saved the {what}.\n{}", path.display());
+                        set_text(self.ui.status, &format!("Saved  ·  {}", path.display()));
                         notice(self.hwnd, &s, false);
                     }
                     Err(e) => {
-                        set_text(self.ui.status, "PDFを保存できませんでした。");
+                        set_text(self.ui.status, "Could not save the PDF.");
                         notice(self.hwnd, &e, true);
                     }
                 }
@@ -1222,17 +1238,29 @@ impl App {
             _ => {}
         }
     }
-    fn command(&mut self, id: usize) -> Result<(), String> {
+    fn command(&mut self, id: usize, tab_button: HWND) -> Result<(), String> {
         match id {
+            SHOW_SHORTCUTS => shortcuts::show(self.hwnd)?,
             OPEN if !self.writing => {
                 self.open_tabs(dialog::open_pdfs(self.hwnd)?)?;
             }
             PREVIOUS_TAB => self.cycle_tab(-1)?,
             NEXT_TAB => self.cycle_tab(1)?,
-            CLOSE_TAB => self.close_tab()?,
-            SELECT_TAB => {
-                if let Some(index) = tabs::selected(self.ui.tab_bar) {
-                    self.switch_tab(index)?;
+            CLOSE_TAB | SELECT_TAB => {
+                // Resolve the captured HWND after any earlier queued edits to the tab list.
+                let target = if tab_button.is_null() {
+                    tabs::selected(self.ui.tab_bar)
+                } else {
+                    self.tabs
+                        .iter()
+                        .position(|tab| tab.close_button == tab_button)
+                };
+                if let Some(index) = target {
+                    if id == CLOSE_TAB {
+                        self.close_tab(index)?
+                    } else {
+                        self.switch_tab(index)?
+                    }
                 }
             }
             SCROLLED => self.render(),
@@ -1302,7 +1330,7 @@ impl App {
                 }
             }
             CLOSE if self.writing => {
-                notice(self.hwnd, "保存処理が終わるまでお待ちください。", false)
+                notice(self.hwnd, "Please wait for the save to finish.", false)
             }
             CLOSE if self.discard_all_ok() => unsafe {
                 self.ui.toolbar.clear_names();
@@ -1453,7 +1481,11 @@ impl App {
                     && (msg.hwnd != self.ui.page_input
                         || matches!(id, CLOSE_TAB | NEXT_TAB | PREVIOUS_TAB | OPEN))
                 {
-                    action(self.hwnd, id);
+                    if id == CLOSE_TAB {
+                        tabs::post_selected(self.ui.tab_bar, id);
+                    } else {
+                        action(self.hwnd, id);
+                    }
                     continue;
                 }
                 if msg.wParam == VK_TAB as usize
@@ -1463,8 +1495,14 @@ impl App {
                 }
             }
             match msg.message {
+                // TranslateMessage uses the active keyboard layout to produce '?'.
+                WM_CHAR if msg.wParam == usize::from(b'?') => {
+                    if msg.lParam & (1 << 30) == 0 {
+                        action(self.hwnd, SHOW_SHORTCUTS);
+                    }
+                }
                 ACTION if msg.hwnd == self.hwnd => {
-                    if let Err(e) = self.command(msg.wParam) {
+                    if let Err(e) = self.command(msg.wParam, msg.lParam as HWND) {
                         notice(self.hwnd, &e, true);
                     }
                 }
@@ -1537,6 +1575,7 @@ pub fn run(files: Vec<OsString>) {
             return Err(std::io::Error::last_os_error().to_string());
         }
         theme::refresh(hwnd);
+        shortcuts::add_to_window_menu(hwnd);
         let mut app = App::new(hwnd)?;
         unsafe {
             DragAcceptFiles(hwnd, 1);

@@ -1,8 +1,8 @@
 <!doctype html>
-<html lang="ja">
+<html lang="en">
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>透かしデザイナー · SumiPDF</title>
+  <title>Watermark designer · SumiPDF</title>
   <style>
     :root {
       color-scheme: light;
@@ -250,80 +250,80 @@
     <span class="brand">SumiPDF</span>
   </header>
   <main>
-    <h1>透かしデザイナー</h1>
-    <p>署名の背景に使う印を作り、透過 PNG として保存できます。</p>
+    <h1>Watermark designer</h1>
+    <p>Design a mark for your signature and save it as a transparent PNG.</p>
     <div class="studio">
       <div class="stage">
         <svg
           id="drawing"
           class="artboard"
           viewBox="0 0 512 512"
-          aria-label="デザインの編集面"
+          aria-label="Watermark canvas"
         >
           <g id="art"></g>
         </svg>
       </div>
       <div class="controls">
         <label>
-          印の文字
+          Stamp text
           <input id="word" type="text" value="墨" maxlength="24" />
         </label>
         <div class="pair">
           <label>
-            書体
+            Font
             <select id="font">
-              <option value="serif">明朝</option>
-              <option value="sans-serif">ゴシック</option>
+              <option value="serif">Serif</option>
+              <option value="sans-serif">Sans serif</option>
             </select>
           </label>
           <label>
-            外枠
+            Border
             <select id="frame">
-              <option value="circle">丸</option>
-              <option value="square">角丸</option>
-              <option value="none">なし</option>
+              <option value="circle">Circle</option>
+              <option value="square">Rounded square</option>
+              <option value="none">None</option>
             </select>
           </label>
         </div>
         <div class="pair">
           <label>
-            インクの色
+            Ink color
             <input id="color" class="color" type="color" value="#a44839" />
           </label>
           <label>
-            ペンの太さ
+            Pen width
             <select id="width">
-              <option value="5">細</option>
-              <option value="12" selected>中</option>
-              <option value="22">太</option>
+              <option value="5">Fine</option>
+              <option value="12" selected>Medium</option>
+              <option value="22">Bold</option>
             </select>
           </label>
         </div>
         <div class="row">
           <button id="pen" type="button" aria-pressed="false">
-            手描きペン
+            Freehand pen
           </button>
-          <button id="undo" type="button" disabled>一筆戻す</button>
+          <button id="undo" type="button" disabled>Undo stroke</button>
         </div>
         <div class="row actions">
-          <button class="primary" id="png" type="button">PNG を保存</button>
-          <button id="svg" type="button">編集用 SVG を保存</button>
+          <button class="primary" id="png" type="button">Save PNG</button>
+          <button id="svg" type="button">Save editable SVG</button>
         </div>
         <p role="status" class="status" id="message"></p>
       </div>
     </div>
     <section class="proof">
       <div>
-        <h2>署名での見え方</h2>
-        <p>保存した PNG を SumiPDF の署名画面で選択してください。</p>
+        <h2>Signature preview</h2>
+        <p>Select the saved PNG in the SumiPDF signing toolbar.</p>
       </div>
-      <div class="example" aria-label="署名の表示例">
+      <div class="example" aria-label="Sample signature">
         <svg viewBox="0 0 512 512" aria-hidden="true"><use href="#art" /></svg>
-        <strong>署名者名</strong>
+        <strong>Signer name</strong>
         <small>
           Digitally signed by
           <br />
-          署名者名
+          Signer name
           <br />
           Date: 2026-01-01 09:00:00 UTC
         </small>
@@ -414,7 +414,7 @@
       pen = !pen;
       $("pen").setAttribute("aria-pressed", String(pen));
       $("drawing").classList.toggle("pen", pen);
-      $("message").textContent = pen ? "編集面をドラッグして描けます。" : "";
+      $("message").textContent = pen ? "Drag on the canvas to draw." : "";
     };
     function point(e) {
       const p = new DOMPoint(e.clientX, e.clientY).matrixTransform(
@@ -470,7 +470,7 @@
     }
     $("svg").onclick = () => {
       download(vector(), "signatureWatermark.svg");
-      $("message").textContent = "編集用 SVG を書き出しました。";
+      $("message").textContent = "Editable SVG saved.";
     };
     $("png").onclick = async () => {
       const url = URL.createObjectURL(vector());
@@ -487,9 +487,9 @@
         );
         if (!png) throw new Error();
         download(png, "signatureWatermark.png");
-        $("message").textContent = "透過 PNG を書き出しました。";
+        $("message").textContent = "Transparent PNG saved.";
       } catch {
-        $("message").textContent = "PNG を書き出せませんでした。";
+        $("message").textContent = "Could not export PNG.";
       } finally {
         URL.revokeObjectURL(url);
       }

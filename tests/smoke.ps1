@@ -206,7 +206,7 @@ function Write-PdfObjects([string]$Path, [string[]]$Objects) {
 }
 
 function Wait-Page([Diagnostics.Process]$Viewer, [string]$Filename, [string]$Expected, [Diagnostics.Stopwatch]$Elapsed,
-    [string]$StatusText = '全体表示の 100%', [switch]$Quiet) {
+    [string]$StatusText = '100% of fit size', [switch]$Quiet) {
     $class = $title = $page = $status = '<none>'
     do {
         $Viewer.Refresh()
@@ -309,7 +309,7 @@ function Test-PfxSigning([string]$ExecutablePath, [string]$InputPdf, [string]$Fo
         try {
             $stdout = $proc.StandardOutput.ReadToEndAsync()
             $stderr = $proc.StandardError.ReadToEndAsync()
-            $dialog = Wait-Dialog $proc.Id 'PFX のパスワード'
+            $dialog = Wait-Dialog $proc.Id 'PFX password'
             switch ($attempt) {
                 'cancel' { [SumiSmoke]::CloseDialog($dialog) }
                 'wrong' { [SumiSmoke]::EnterTestPassword($dialog, 'wrong') }
@@ -353,6 +353,7 @@ try {
     foreach ($path in @($readingFixture, $signedFixture, $fixture)) { $launch.ArgumentList.Add($path) }
     $viewer = [Diagnostics.Process]::Start($launch)
     $window = Wait-Page $viewer 'two pages.pdf' '1 / 2' $timer
+    [ReadingProbe]::CheckShortcutHelp($window)
     Test-ToolbarResize $window $false
     Test-ReadingTabs $viewer $window $ScreenshotPath
     $timer.Restart()
@@ -360,83 +361,102 @@ try {
     [void](Wait-Page $viewer 'two pages.pdf' '2 / 2' $timer)
     # The second page is graphics-only. Drag to mark a rectangle, then undo.
     [SumiSmoke]::Click($window, 108)
-    Wait-HighlightState $viewer $window '範囲をドラッグ' $false
+    Wait-HighlightState $viewer $window 'Drag to highlight an area' $false
     [SumiSmoke]::DragOnPage($window, 300, 200, 0.30, 0.40, 0.62, 0.54)
-    Wait-HighlightState $viewer $window '範囲をドラッグ' $true
+    Wait-HighlightState $viewer $window 'Drag to highlight an area' $true
     [SumiSmoke]::Click($window, 114)
-    Wait-HighlightState $viewer $window '範囲をドラッグ' $false
+    Wait-HighlightState $viewer $window 'Drag to highlight an area' $false
     [SumiSmoke]::Click($window, 115)
-    Wait-HighlightState $viewer $window '下線（黄）' $false
+    Wait-HighlightState $viewer $window 'Underline (Yellow)' $false
     [SumiSmoke]::Pick($window, 116, 3)
-    Wait-HighlightState $viewer $window '下線（青）' $false
+    Wait-HighlightState $viewer $window 'Underline (Blue)' $false
     [SumiSmoke]::DragOnPage($window, 300, 200, 0.62, 0.60, 0.30, 0.60)
-    Wait-HighlightState $viewer $window '下線（青）' $true
+    Wait-HighlightState $viewer $window 'Underline (Blue)' $true
     [SumiSmoke]::Click($window, 114)
-    Wait-HighlightState $viewer $window '下線（青）' $false
+    Wait-HighlightState $viewer $window 'Underline (Blue)' $false
     [SumiSmoke]::Click($window, 115)
-    Wait-HighlightState $viewer $window '全体表示の 100%' $false
+    Wait-HighlightState $viewer $window '100% of fit size' $false
     [SumiSmoke]::Click($window, 102)
     $timer.Restart()
     [void](Wait-Page $viewer 'two pages.pdf' '1 / 2' $timer)
     # The baseline is at y=180 on a 300-point-tall page. Drag through the glyphs.
     [SumiSmoke]::Click($window, 108)
-    Wait-HighlightState $viewer $window '文字をドラッグ' $false
-    Wait-HighlightState $viewer $window '蛍光ペン（青）' $false
+    Wait-HighlightState $viewer $window 'Drag across text' $false
+    Wait-HighlightState $viewer $window 'Highlight (Blue)' $false
     [SumiSmoke]::DragOnPage($window, 200, 300, 0.22, 0.38, 0.56, 0.38)
-    Wait-HighlightState $viewer $window '文字をドラッグ' $true
+    Wait-HighlightState $viewer $window 'Drag across text' $true
     [SumiSmoke]::Click($window, 114)
-    Wait-HighlightState $viewer $window '文字をドラッグ' $false
+    Wait-HighlightState $viewer $window 'Drag across text' $false
     [SumiSmoke]::Click($window, 115)
-    Wait-HighlightState $viewer $window '下線（青）' $false
+    Wait-HighlightState $viewer $window 'Underline (Blue)' $false
     [SumiSmoke]::DragOnPage($window, 200, 300, 0.56, 0.38, 0.22, 0.38)
-    Wait-HighlightState $viewer $window '文字をドラッグ' $true
+    Wait-HighlightState $viewer $window 'Drag across text' $true
     [ReadingProbe]::ClickTab($window, 'Reading notes.pdf')
     [void](Wait-Page $viewer 'Reading notes.pdf' '240 / 240' ([Diagnostics.Stopwatch]::StartNew()) '125%')
+    # Cancelling a background tab's discard prompt must preserve both tabs and the active page.
+    [ReadingProbe]::ClickClose($window, 'two pages.pdf')
+    $discard = Wait-Dialog $viewer.Id 'SumiPDF'
+    [SumiSmoke]::Click($discard, 7) # IDNO
+    [void](Wait-Page $viewer 'Reading notes.pdf' '240 / 240' ([Diagnostics.Stopwatch]::StartNew()) '125%')
+    if ([ReadingProbe]::TabCount($window) -ne 3) { throw 'Cancelling discard closed a tab.' }
     [ReadingProbe]::ClickTab($window, 'two pages.pdf')
-    Wait-HighlightState $viewer $window '下線（青）' $true
+    Wait-HighlightState $viewer $window 'Underline (Blue)' $true
     # Keep the pending underline while switching to signing. The existing empty field is on page 2.
     [SumiSmoke]::Click($window, 107)
-    Wait-SignatureState $window '青枠が選択した署名欄' $true $true
+    Wait-SignatureState $window 'The blue box shows the selected signature field' $true $true
     Test-ToolbarResize $window $true
     [SumiSmoke]::Click($window, 132)
-    $filePicker = Wait-Dialog $viewer.Id '署名に使う PFX ファイルを開く'
+    $filePicker = Wait-Dialog $viewer.Id 'Open a PFX file for signing'
     [SumiSmoke]::CloseDialog($filePicker)
-    Wait-SignatureState $window '青枠が選択した署名欄' $true $true
+    Wait-SignatureState $window 'The blue box shows the selected signature field' $true $true
     $pickerName = "SumiPDF Picker " + [guid]::NewGuid()
     $pickerCert = New-SelfSignedCertificate -Type Custom -Subject "CN=$pickerName" -KeyUsage DigitalSignature -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.36') -CertStoreLocation Cert:\CurrentUser\My
     [SumiSmoke]::Click($window, 131)
-    $popup = Wait-Dialog $viewer.Id 'Windows 証明書ストアから選ぶ'
+    $popup = Wait-Dialog $viewer.Id 'Choose from the Windows certificate store'
     [SumiSmoke]::ChooseCertificate($popup, $pickerName)
-    Wait-SignatureState $window "署名者：$pickerName" $true $true
+    Wait-SignatureState $window "Signer: $pickerName" $true $true
     [ReadingProbe]::TabShortcut($window, 9, $false, 0, 3)
     [void](Wait-Page $viewer 'Reading notes.pdf' '240 / 240' ([Diagnostics.Stopwatch]::StartNew()) '125%')
     [ReadingProbe]::TabShortcut($window, 0x57, $false, 0, 2)
     [void](Wait-Page $viewer 'signed once.pdf' '1 / 2' ([Diagnostics.Stopwatch]::StartNew()))
     [ReadingProbe]::TabShortcut($window, 9, $false, 1, 2)
-    Wait-SignatureState $window "署名者：$pickerName" $true $true
+    Wait-SignatureState $window "Signer: $pickerName" $true $true
     [SumiSmoke]::Click($window, 131)
-    $popup = Wait-Dialog $viewer.Id 'Windows 証明書ストアから選ぶ'
+    $popup = Wait-Dialog $viewer.Id 'Choose from the Windows certificate store'
     [SumiSmoke]::CloseDialog($popup)
-    Wait-SignatureState $window "署名者：$pickerName" $true $true
+    Wait-SignatureState $window "Signer: $pickerName" $true $true
     if ([SumiSmoke]::ReadText([SumiSmoke]::GetDlgItem($window, 111)) -ne '2 / 2') {
         throw 'Selecting the existing field did not navigate to its page.'
     }
     [SumiSmoke]::Pick($window, 127, 0)
-    Wait-SignatureState $window '枠の角から' $false $true
+    Wait-SignatureState $window 'Drag from corner to corner' $false $true
     [SumiSmoke]::DragOnPage($window, 300, 200, 0.83, 0.35, 0.40, 0.15)
-    Wait-SignatureState $window 'ドラッグで描き直す' $true $true
+    Wait-SignatureState $window 'Drag to redraw' $true $true
     [SumiSmoke]::Click($window, 102)
-    Wait-SignatureState $window '署名の位置は 2 ページ' $false $true
+    Wait-SignatureState $window 'The signature is on page 2' $false $true
     [SumiSmoke]::Pick($window, 127, 2)
-    Wait-SignatureState $window 'ページに表示しない電子署名' $true $false
+    Wait-SignatureState $window 'The signature will be invisible' $true $false
     [SumiSmoke]::Click($window, 130)
-    Wait-HighlightState $viewer $window '全体表示の 100%' $true
+    Wait-HighlightState $viewer $window '100% of fit size' $true
     if ([SumiSmoke]::IsWindowVisible([SumiSmoke]::GetDlgItem($window, 129)) -or
         [SumiSmoke]::IsWindowVisible([SumiSmoke]::GetDlgItem($window, 131))) {
         throw 'The signature toolbar remained visible after cancellation.'
     }
     [SumiSmoke]::Click($window, 114)
-    Wait-HighlightState $viewer $window '全体表示の 100%' $false
+    Wait-HighlightState $viewer $window '100% of fit size' $false
+    # Close the tab to the left of the active tab, then close the last tab by its own button.
+    foreach ($name in @('signed once.pdf', 'two pages.pdf')) {
+        $before = [ReadingProbe]::TabCount($window)
+        [ReadingProbe]::ClickClose($window, $name)
+        $deadline = [Diagnostics.Stopwatch]::StartNew()
+        while ([ReadingProbe]::TabCount($window) -eq $before -and $deadline.ElapsedMilliseconds -lt 5000) {
+            Start-Sleep -Milliseconds 15
+        }
+        if ([ReadingProbe]::TabCount($window) -ne $before - 1) { throw "Could not close $name by its button." }
+        if ($before -eq 2 -and !([SumiSmoke]::ReadText($window)).Contains('two pages.pdf')) {
+            throw 'Closing an inactive tab changed the visible document.'
+        }
+    }
     if (-not $viewer.CloseMainWindow() -or -not $viewer.WaitForExit(5000)) {
         throw 'The viewer did not close normally.'
     }
@@ -449,16 +469,16 @@ try {
     $viewer = Start-Process -FilePath $exe -ArgumentList ('"{0}"' -f $signedFixture) -PassThru
     $window = Wait-Page $viewer 'signed once.pdf' '1 / 2' $timer
     [SumiSmoke]::Click($window, 107)
-    Wait-SignatureState $window '青枠が選択した署名欄' $true $true
+    Wait-SignatureState $window 'The blue box shows the selected signature field' $true $true
     if ([SumiSmoke]::ReadText([SumiSmoke]::GetDlgItem($window, 111)) -ne '2 / 2') {
         throw 'Co-signing did not navigate to the remaining Approval field.'
     }
     [SumiSmoke]::Pick($window, 127, 0)
-    Wait-SignatureState $window '枠の角から' $false $true
+    Wait-SignatureState $window 'Drag from corner to corner' $false $true
     [SumiSmoke]::Pick($window, 127, 2)
-    Wait-SignatureState $window 'ページに表示しない電子署名' $true $false
+    Wait-SignatureState $window 'The signature will be invisible' $true $false
     [SumiSmoke]::Click($window, 130)
-    Wait-HighlightState $viewer $window '全体表示の 100%' $false
+    Wait-HighlightState $viewer $window '100% of fit size' $false
     foreach ($id in @(108, 115)) {
         if ([SumiSmoke]::IsWindowEnabled([SumiSmoke]::GetDlgItem($window, $id))) {
             throw 'Annotation tools were enabled after identifying an existing signature.'

@@ -95,10 +95,10 @@ impl MarkColor {
     #[cfg(windows)]
     pub fn label(self) -> &'static str {
         match self {
-            Self::Yellow => "黄",
-            Self::Red => "赤",
-            Self::Green => "緑",
-            Self::Blue => "青",
+            Self::Yellow => "Yellow",
+            Self::Red => "Red",
+            Self::Green => "Green",
+            Self::Blue => "Blue",
         }
     }
 }

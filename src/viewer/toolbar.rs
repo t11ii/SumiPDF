@@ -1,4 +1,4 @@
-//! Native button captions use Segoe MDL2 Assets. Give each glyph a Japanese
+//! Native button captions use Segoe MDL2 Assets. Give each glyph an English
 //! accessible name and a native tooltip while preserving native input and state.
 use super::*;
 use windows::{
@@ -24,30 +24,31 @@ const fn icon(glyph: &'static str, label: PCWSTR) -> Icon {
     Icon { glyph, label }
 }
 
-pub(super) const OPEN_FILE: Icon = icon("\u{e8e5}", w!("開く… (Ctrl+O)"));
-pub(super) const PREVIOUS: Icon = icon("\u{e76b}", w!("前のページ (←)"));
-pub(super) const NEXT_PAGE: Icon = icon("\u{e76c}", w!("次のページ (→)"));
-pub(super) const ZOOM_OUT: Icon = icon("\u{e71f}", w!("縮小 (Ctrl+−)"));
-pub(super) const ZOOM_IN: Icon = icon("\u{e8a3}", w!("拡大 (Ctrl++)"));
-pub(super) const FIT_PAGE: Icon = icon("\u{e9a6}", w!("全体表示 (Ctrl+0)"));
-pub(super) const MARKER: Icon = icon("\u{e7e6}", w!("蛍光ペン (H)"));
-pub(super) const UNDERLINE_TEXT: Icon = icon("\u{e8dc}", w!("下線 (U)"));
-pub(super) const UNDO_MARK: Icon = icon("\u{e7a7}", w!("元に戻す (Ctrl+Z)"));
-pub(super) const SAVE_ANNOTATIONS: Icon = icon("\u{e74e}", w!("注釈を保存… (Ctrl+Shift+S)"));
-pub(super) const SIGN_PDF: Icon = icon("\u{e76d}", w!("電子署名… (Ctrl+S)"));
-pub(super) const PFX: Icon = icon("\u{e8b5}", w!("PFX ファイルから署名用証明書を読み込む"));
-pub(super) const CERTIFICATE: Icon = icon("\u{e8d7}", w!("Windows 証明書ストアから選ぶ"));
-pub(super) const DEFAULT_WATERMARK: Icon = icon("\u{e81e}", w!("透かしを選択（現在は標準）"));
-const CUSTOM_WATERMARK: Icon = icon("\u{e8b9}", w!("透かしを選択（現在は指定画像）"));
-pub(super) const CONFIRM: Icon = icon("\u{e8fb}", w!("署名して保存… (Ctrl+S)"));
-pub(super) const CANCEL: Icon = icon("\u{e711}", w!("キャンセル (Esc)"));
+pub(super) const OPEN_FILE: Icon = icon("\u{e8e5}", w!("Open… (Ctrl+O)"));
+pub(super) const PREVIOUS: Icon = icon("\u{e76b}", w!("Previous page (←)"));
+pub(super) const NEXT_PAGE: Icon = icon("\u{e76c}", w!("Next page (→)"));
+pub(super) const ZOOM_OUT: Icon = icon("\u{e71f}", w!("Zoom out (Ctrl+−)"));
+pub(super) const ZOOM_IN: Icon = icon("\u{e8a3}", w!("Zoom in (Ctrl++)"));
+pub(super) const FIT_PAGE: Icon = icon("\u{e9a6}", w!("Fit page (Ctrl+0)"));
+pub(super) const MARKER: Icon = icon("\u{e7e6}", w!("Highlight (H)"));
+pub(super) const UNDERLINE_TEXT: Icon = icon("\u{e8dc}", w!("Underline (U)"));
+pub(super) const UNDO_MARK: Icon = icon("\u{e7a7}", w!("Undo (Ctrl+Z)"));
+pub(super) const SAVE_ANNOTATIONS: Icon = icon("\u{e74e}", w!("Save annotations… (Ctrl+Shift+S)"));
+pub(super) const SIGN_PDF: Icon = icon("\u{e76d}", w!("Sign PDF… (Ctrl+S)"));
+pub(super) const PFX: Icon = icon("\u{e8b5}", w!("Load certificate from PFX"));
+pub(super) const CERTIFICATE: Icon =
+    icon("\u{e8d7}", w!("Choose from the Windows certificate store"));
+pub(super) const DEFAULT_WATERMARK: Icon = icon("\u{e81e}", w!("Choose watermark (default)"));
+const CUSTOM_WATERMARK: Icon = icon("\u{e8b9}", w!("Choose watermark (custom image)"));
+pub(super) const CONFIRM: Icon = icon("\u{e8fb}", w!("Sign and save… (Ctrl+S)"));
+pub(super) const CANCEL: Icon = icon("\u{e711}", w!("Cancel (Esc)"));
 
 pub(super) struct Toolbar {
     parent: HWND,
     tips: HWND,
     names: IAccPropServices,
     buttons: Vec<HWND>,
-    tab_close: Option<HWND>,
+    color: Option<HWND>,
 }
 
 impl Toolbar {
@@ -57,7 +58,7 @@ impl Toolbar {
             dwICC: ICC_BAR_CLASSES,
         };
         let names = unsafe { CoCreateInstance(&CAccPropServices, None, CLSCTX_INPROC_SERVER) }
-            .map_err(|e| format!("ツールバーの読み上げ名を設定できません。{e}"))?;
+            .map_err(|e| format!("Could not set the toolbar accessibility labels. {e}"))?;
         let tips = unsafe {
             if InitCommonControlsEx(&init) == 0 {
                 return Err(std::io::Error::last_os_error().to_string());
@@ -85,7 +86,7 @@ impl Toolbar {
             tips,
             names,
             buttons: Vec::new(),
-            tab_close: None,
+            color: None,
         })
     }
 
@@ -103,19 +104,19 @@ impl Toolbar {
             if SendMessageW(self.tips, message, 0, &tool as *const _ as isize) == 0
                 && message == TTM_ADDTOOLW
             {
-                return Err("ツールバーの操作説明を登録できません。".into());
+                return Err("Could not register the toolbar tooltip.".into());
             }
         }
         Ok(())
     }
 
     pub fn page_tip(&self, button: HWND) -> Result<(), String> {
-        self.tooltip(button, w!("ページを指定 (Ctrl+G)"), TTM_ADDTOOLW)
+        self.tooltip(button, w!("Go to page (Ctrl+G)"), TTM_ADDTOOLW)
     }
 
-    pub fn tab_close_tip(&mut self, button: HWND) -> Result<(), String> {
-        self.describe(button, w!("現在のタブを閉じる (Ctrl+W)"), TTM_ADDTOOLW)?;
-        self.tab_close = Some(button);
+    pub fn color_tip(&mut self, picker: HWND) -> Result<(), String> {
+        self.describe(picker, w!("Markup color"), TTM_ADDTOOLW)?;
+        self.color = Some(picker);
         Ok(())
     }
 
@@ -169,7 +170,7 @@ impl Toolbar {
 
     // MSAA annotations must be removed while their HWNDs still exist.
     pub fn clear_names(&mut self) {
-        for button in self.buttons.drain(..).chain(self.tab_close.take()) {
+        for button in self.buttons.drain(..).chain(self.color.take()) {
             unsafe {
                 let _ = self.names.ClearHwndProps(
                     WinHwnd(button),
@@ -247,6 +248,95 @@ mod tests {
         }
     }
 
+    #[test]
+    fn color_picker_paints_each_swatch_in_its_field_and_native_dropdown() {
+        use windows_sys::Win32::UI::Controls::{COMBOBOXINFO, GetComboBoxInfo};
+
+        const COLORS: [(&str, COLORREF); 4] = [
+            ("Yellow", 0x00ffff),
+            ("Red", 0x0000ff),
+            ("Green", 0x00ff00),
+            ("Blue", 0xff0000),
+        ];
+        unsafe {
+            let class = "SumiPDF.ColorPickerTest";
+            assert!(register(class, Some(window_proc), null_mut()));
+            let parent = CreateWindowExW(
+                0,
+                wide(class).as_ptr(),
+                null(),
+                WS_POPUP,
+                0,
+                0,
+                240,
+                200,
+                null_mut(),
+                null_mut(),
+                GetModuleHandleW(null()),
+                null(),
+            );
+            assert!(!parent.is_null());
+            let picker = Controls::color_picker(parent).unwrap();
+            theme::style_control(picker).unwrap();
+            SendMessageW(
+                picker,
+                WM_SETFONT,
+                GetStockObject(DEFAULT_GUI_FONT) as usize,
+                0,
+            );
+            MoveWindow(picker, 0, 0, dips(parent, 82), dips(parent, 140), 1);
+            ShowWindow(parent, SW_SHOWNOACTIVATE);
+            let dc = GetDC(parent);
+            for (index, (name, expected)) in COLORS.into_iter().enumerate() {
+                assert_eq!(
+                    SendMessageW(
+                        picker,
+                        CB_FINDSTRINGEXACT,
+                        usize::MAX,
+                        wide(name).as_ptr() as isize
+                    ),
+                    index as isize
+                );
+                assert_eq!(SendMessageW(picker, CB_SETCURSEL, index, 0), index as isize);
+                let pixel = snapshot(picker, dc, |image, bounds| {
+                    GetPixel(image, bounds.right * 2 / 5, bounds.bottom / 2)
+                });
+                assert_eq!(pixel, expected, "closed picker: {name}");
+            }
+            SendMessageW(picker, CB_SHOWDROPDOWN, 1, 0);
+            let mut combo = COMBOBOXINFO {
+                cbSize: size_of::<COMBOBOXINFO>() as u32,
+                ..Default::default()
+            };
+            assert_ne!(GetComboBoxInfo(picker, &mut combo), 0);
+            assert_ne!(IsWindowVisible(combo.hwndList), 0);
+            SendMessageW(combo.hwndList, LB_SETTOPINDEX, 0, 0);
+            snapshot(combo.hwndList, dc, |image, _| {
+                for (index, (name, expected)) in COLORS.into_iter().enumerate() {
+                    let mut row = RECT::default();
+                    assert_ne!(
+                        SendMessageW(
+                            combo.hwndList,
+                            LB_GETITEMRECT,
+                            index,
+                            (&raw mut row) as isize
+                        ),
+                        LB_ERR as isize
+                    );
+                    let pixel = GetPixel(
+                        image,
+                        (row.left + row.right) / 2,
+                        (row.top + row.bottom) / 2,
+                    );
+                    assert_eq!(pixel, expected, "dropdown row: {name}");
+                }
+            });
+            SendMessageW(picker, CB_SHOWDROPDOWN, 0, 0);
+            ReleaseDC(parent, dc);
+            DestroyWindow(parent);
+        }
+    }
+
     fn glyph_pixels(button: HWND, dc: HDC) -> Vec<bool> {
         snapshot(button, dc, |image, bounds| {
             let mut ink = Vec::new();
@@ -268,7 +358,7 @@ mod tests {
     }
 
     #[test]
-    fn toolbar_buttons_render_distinct_glyphs_and_expose_their_japanese_labels() {
+    fn toolbar_buttons_render_distinct_glyphs_and_expose_their_english_labels() {
         unsafe {
             assert!(CoInitializeEx(null(), COINIT_APARTMENTTHREADED as u32) >= 0);
             assert!(register(CANVAS, Some(canvas::procedure), null_mut()));
@@ -322,18 +412,17 @@ mod tests {
                 assert!(index != 0xffff && indices.insert(index), "{name}: {index}");
             }
             assert_eq!(indices.len(), 16);
+            let (tip, name) = labels(&ui.toolbar, ui.color);
+            assert_eq!(tip, "Markup color");
+            assert_eq!(name, tip);
             assert_eq!(
                 labels(&ui.toolbar, ui.certificate).1,
-                "Windows 証明書ストアから選ぶ"
+                "Choose from the Windows certificate store"
             );
-            assert_eq!(labels(&ui.toolbar, ui.sign).1, "電子署名… (Ctrl+S)");
-            assert_eq!(
-                labels(&ui.toolbar, ui.tab_close).1,
-                "現在のタブを閉じる (Ctrl+W)"
-            );
+            assert_eq!(labels(&ui.toolbar, ui.sign).1, "Sign PDF… (Ctrl+S)");
             ui.toolbar.watermark(ui.watermark, true).unwrap();
             let (tip, name) = labels(&ui.toolbar, ui.watermark);
-            assert!(tip.contains("指定画像") && tip == name);
+            assert!(tip.contains("custom image") && tip == name);
             SelectObject(dc, old);
             ReleaseDC(parent, dc);
             ui.show_signing(true);

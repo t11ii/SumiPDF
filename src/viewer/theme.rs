@@ -9,7 +9,10 @@ use windows_sys::Win32::{
     },
     UI::{
         Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW},
-        Controls::{BST_CHECKED, WM_MOUSELEAVE},
+        Controls::{
+            BST_CHECKED, DRAWITEMSTRUCT, ODS_DISABLED, ODS_FOCUS, ODS_NOFOCUSRECT, ODS_SELECTED,
+            WM_MOUSELEAVE,
+        },
     },
 };
 
@@ -168,6 +171,61 @@ fn frame(dc: HDC, bounds: &RECT, color: COLORREF) {
     }
 }
 
+pub(super) const COLOR_ROW_HEIGHT: i32 = 20;
+
+fn swatch(hwnd: HWND, dc: HDC, area: &RECT, index: usize, edge: COLORREF) {
+    let Some(color) = MarkColor::ALL.get(index) else {
+        return;
+    };
+    let width = dips(hwnd, 36).min(area.right - area.left - dips(hwnd, 6));
+    let height = dips(hwnd, 12).min(area.bottom - area.top - dips(hwnd, 4));
+    if width < 3 || height < 3 {
+        return;
+    }
+    let left = (area.left + area.right - width) / 2;
+    let top = (area.top + area.bottom - height) / 2;
+    let bounds = RECT {
+        left,
+        top,
+        right: left + width,
+        bottom: top + height,
+    };
+    let [r, g, b] = color.rgb();
+    fill(dc, &bounds, u32::from_le_bytes([r, g, b, 0]));
+    frame(dc, &bounds, edge);
+}
+
+pub(super) fn draw_color_item(item: &DRAWITEMSTRUCT) {
+    let p = palette();
+    let selected = item.itemState & ODS_SELECTED != 0;
+    let edge = if item.itemState & ODS_DISABLED != 0 {
+        p.disabled
+    } else if selected {
+        p.accent
+    } else {
+        p.muted
+    };
+    unsafe {
+        let saved = SaveDC(item.hDC);
+        fill(
+            item.hDC,
+            &item.rcItem,
+            if selected { p.selected } else { p.field },
+        );
+        swatch(
+            item.hwndItem,
+            item.hDC,
+            &item.rcItem,
+            item.itemID as usize,
+            edge,
+        );
+        if item.itemState & (ODS_FOCUS | ODS_NOFOCUSRECT) == ODS_FOCUS {
+            DrawFocusRect(item.hDC, &item.rcItem);
+        }
+        RestoreDC(item.hDC, saved);
+    }
+}
+
 pub(super) fn paint_chrome(hwnd: HWND, dc: HDC) {
     let p = palette();
     let bounds = rect(hwnd);
@@ -258,16 +316,27 @@ fn paint_control(hwnd: HWND, dc: HDC, hot: bool) {
         } else {
             DT_CENTER
         };
-        // Common labels fit on the stack; ellipsize long signature field names.
-        let mut text = [0u16; 256];
-        let len = GetWindowTextW(hwnd, text.as_mut_ptr(), text.len() as i32);
-        DrawTextW(
-            dc,
-            text.as_ptr(),
-            len,
-            &mut label_bounds,
-            alignment | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
-        );
+        if id == COLOR {
+            let index = SendMessageW(hwnd, CB_GETCURSEL, 0, 0) as usize;
+            swatch(
+                hwnd,
+                dc,
+                &label_bounds,
+                index,
+                if enabled { p.muted } else { p.disabled },
+            );
+        } else {
+            // Common labels fit on the stack; ellipsize long signature field names.
+            let mut text = [0u16; 256];
+            let len = GetWindowTextW(hwnd, text.as_mut_ptr(), text.len() as i32);
+            DrawTextW(
+                dc,
+                text.as_ptr(),
+                len,
+                &mut label_bounds,
+                alignment | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+            );
+        }
         RestoreDC(dc, saved);
     }
 }
@@ -279,7 +348,7 @@ pub(super) fn style_control(hwnd: HWND) -> Result<(), String> {
         Some(control_proc)
     };
     if unsafe { SetWindowSubclass(hwnd, procedure, 1, 0) } == 0 {
-        return Err("ツールバーの外観を設定できません。".into());
+        return Err("Could not apply the toolbar appearance.".into());
     }
     Ok(())
 }
@@ -333,6 +402,13 @@ unsafe extern "system" fn control_proc(
     unsafe {
         if msg == WM_NCDESTROY {
             RemoveWindowSubclass(hwnd, Some(control_proc), id);
+        } else if msg == WM_SETFONT && GetDlgCtrlID(hwnd) == COLOR as i32 {
+            // Controls::fonts reapplies the font whenever the window DPI changes.
+            let result = DefSubclassProc(hwnd, msg, w, l);
+            let height = dips(hwnd, COLOR_ROW_HEIGHT) as isize;
+            SendMessageW(hwnd, CB_SETITEMHEIGHT, 0, height);
+            SendMessageW(hwnd, CB_SETITEMHEIGHT, usize::MAX, height);
+            return result;
         } else if !palette().high_contrast {
             match msg {
                 WM_PAINT => {

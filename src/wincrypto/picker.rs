@@ -52,7 +52,7 @@ pub(super) fn select(
     match result {
         0 => Ok(None),
         n if n > 0 && n as usize <= candidates.len() => Ok(Some(n as usize - 1)),
-        _ => Err(super::last_error("証明書の選択画面を開けません。")),
+        _ => Err(super::last_error("Could not open the certificate picker.")),
     }
 }
 
@@ -66,11 +66,11 @@ unsafe extern "system" fn dialog_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 SetDlgItemTextW(
                     hwnd,
                     PROMPT,
-                    w!("署名に使う証明書を選んでください（氏名と格納先）。"),
+                    w!("Select a signing certificate by name and store."),
                 );
-                SetDlgItemTextW(hwnd, DETAILS, w!("証明書の詳細"));
-                SetDlgItemTextW(hwnd, IDOK, w!("選択"));
-                SetDlgItemTextW(hwnd, IDCANCEL, w!("キャンセル"));
+                SetDlgItemTextW(hwnd, DETAILS, w!("View details"));
+                SetDlgItemTextW(hwnd, IDOK, w!("Select"));
+                SetDlgItemTextW(hwnd, IDCANCEL, w!("Cancel"));
                 let list = GetDlgItem(hwnd, IDENTITIES);
                 for label in &contents.labels {
                     if SendMessageW(list, LB_ADDSTRING, 0, label.as_ptr() as LPARAM) < 0 {

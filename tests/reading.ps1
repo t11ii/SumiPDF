@@ -69,7 +69,7 @@ function Test-ReadingTabs([Diagnostics.Process]$Viewer, [IntPtr]$Window, [string
     $baseline = $Viewer.WorkingSet64
     [SumiSmoke]::Click($Window, 105)
     [void](Wait-Page $Viewer $name '1 / 240' ([Diagnostics.Stopwatch]::StartNew()) '125%')
-    if ((Read-Status $Window) -notmatch '表示中 1 ページ') { throw 'A zoomed portrait page should fill the viewport.' }
+    if ((Read-Status $Window) -notmatch 'Page 1  ·') { throw 'A zoomed portrait page should fill the viewport.' }
     # Probe whether the runner exposes the release EXE's painted client surface.
     # Once a fixture color is visible, all later pixel checks are mandatory.
     $capture = [bool](Wait-Viewport $Window 'B{30,}' 3000 -IfAvailable)
@@ -79,9 +79,9 @@ function Test-ReadingTabs([Diagnostics.Process]$Viewer, [IntPtr]$Window, [string
     for ($steps = 0; $steps -lt 60; $steps++) {
         [ReadingProbe]::Wheel($Window, -30)
         Start-Sleep -Milliseconds 25
-        if ((Read-Status $Window).Contains('表示中 1–2 ページ')) { break }
+        if ((Read-Status $Window).Contains('Pages 1–2')) { break }
     }
-    [void](Wait-Page $Viewer $name '1 / 240' ([Diagnostics.Stopwatch]::StartNew()) '表示中 1–2 ページ')
+    [void](Wait-Page $Viewer $name '1 / 240' ([Diagnostics.Stopwatch]::StartNew()) 'Pages 1–2')
     # Leave enough of the second page exposed for a visible, reproducible boundary.
     [ReadingProbe]::Wheel($Window, -120)
     if ($capture) {
@@ -107,7 +107,7 @@ function Test-ReadingTabs([Diagnostics.Process]$Viewer, [IntPtr]$Window, [string
     [ReadingProbe]::TabShortcut($Window, 9, $true, 2, 3) # Ctrl+Shift+Tab, wrapping back
     [void](Wait-Page $Viewer 'two pages.pdf' '1 / 2' ([Diagnostics.Stopwatch]::StartNew()))
     [ReadingProbe]::ClickTab($Window, $name)
-    [void](Wait-Page $Viewer $name '1 / 240' ([Diagnostics.Stopwatch]::StartNew()) '表示中 1–2 ページ')
+    [void](Wait-Page $Viewer $name '1 / 240' ([Diagnostics.Stopwatch]::StartNew()) 'Pages 1–2')
     if (!(Read-Status $Window).Contains('125%')) { throw 'Switching tabs lost the zoom.' }
     if ($capture) {
         $restored = Wait-Viewport $Window 'B{4,}\.+O{4,}'

@@ -188,7 +188,7 @@ impl Canvas {
             redraw(hwnd);
         } else if !reading && let Some(mut old) = self.reading.take() {
             self.resume = Some(old.layout.position);
-            self.text = "ページを表示中…".into();
+            self.text = "Loading page…".into();
             if let Some(cached) = old.frames.remove(&page)
                 && let Ok(image) = cached.image
             {
@@ -283,7 +283,7 @@ impl Canvas {
     }
 
     pub fn surface_message(&self, reading: bool) -> Option<String> {
-        let pending = || "ページを表示中…".to_owned();
+        let pending = || "Loading page…".to_owned();
         if reading {
             let Some(r) = &self.reading else {
                 return Some(pending());
@@ -749,7 +749,7 @@ fn draw(hwnd: HWND, dc: HDC, clip: RECT, state: &mut Canvas) {
                 if bounds.right - bounds.left > dips(hwnd, 70)
                     && bounds.bottom - bounds.top > dips(hwnd, 20)
                 {
-                    line(dc, state.font, 0x00ab5419, bounds, "電子署名の位置");
+                    line(dc, state.font, 0x00ab5419, bounds, "Signature position");
                 }
             }
         } else {
@@ -766,7 +766,7 @@ fn draw(hwnd: HWND, dc: HDC, clip: RECT, state: &mut Canvas) {
                         bottom: cy + 2,
                         ..bounds
                     },
-                    "PDF を開く",
+                    "Open a PDF",
                 );
                 line(
                     dc,
@@ -777,7 +777,7 @@ fn draw(hwnd: HWND, dc: HDC, clip: RECT, state: &mut Canvas) {
                         bottom: cy + step,
                         ..bounds
                     },
-                    "ここにファイルをドロップ  /  Ctrl + O",
+                    "Drop a file here or press Ctrl+O",
                 );
             } else {
                 line(dc, state.font, palette.muted, bounds, &state.text);

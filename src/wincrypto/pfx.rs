@@ -22,19 +22,19 @@ impl SigningCertificate {
         owner: HWND,
         path: &Path,
     ) -> Result<Option<CertificateSelection>, String> {
-        let mut file = File::open(path).map_err(|e| format!("PFX ファイルを開けません。{e}"))?;
+        let mut file = File::open(path).map_err(|e| format!("Could not open the PFX file. {e}"))?;
         let len = file.metadata().map_err(|e| e.to_string())?.len();
         if !(1..=MAX_PFX_BYTES).contains(&len) {
-            return Err("空の PFX または 32 MiB を超える PFX は読み込めません。".into());
+            return Err("The PFX file is empty or larger than 32 MiB.".into());
         }
         let mut bytes = Zeroizing::new(vec![0; len as usize]);
         file.read_exact(&mut bytes)
-            .map_err(|e| format!("PFX を読み込めません。{e}"))?;
+            .map_err(|e| format!("Could not read the PFX file. {e}"))?;
         if file.read(&mut [0]).map_err(|e| e.to_string())? != 0 {
-            return Err("読み込み中に PFX のサイズが変わりました。もう一度開いてください。".into());
+            return Err("The PFX file size changed while reading it. Open the file again.".into());
         }
         if unsafe { PFXIsPFXBlob(&blob(&mut bytes)?) } == 0 {
-            return Err("PKCS#12 形式の PFX ファイルを選んでください。".into());
+            return Err("Choose a PFX file in PKCS#12 format.".into());
         }
         let candidates = {
             let Some(password) = ask_password(owner)? else {
@@ -45,8 +45,11 @@ impl SigningCertificate {
         drop(bytes);
         let index = match candidates.len() {
             1 => 0,
-            _ => match picker::select(owner, &candidates, w!("PFX の署名用証明書を選ぶ"))?
-            {
+            _ => match picker::select(
+                owner,
+                &candidates,
+                w!("Choose a signing certificate from the PFX file"),
+            )? {
                 Some(index) => index,
                 None => return Ok(None),
             },
@@ -65,14 +68,17 @@ impl SigningCertificate {
 
 fn blob(bytes: &mut [u8]) -> Result<CRYPT_INTEGER_BLOB, String> {
     Ok(CRYPT_INTEGER_BLOB {
-        cbData: bytes.len().try_into().map_err(|_| "PFX が大きすぎます。")?,
+        cbData: bytes
+            .len()
+            .try_into()
+            .map_err(|_| "The PFX file is too large.")?,
         pbData: bytes.as_mut_ptr(),
     })
 }
 
 pub(super) fn import(bytes: &mut [u8], password: &[u16]) -> Result<Vec<Candidate>, String> {
     if password.contains(&0) {
-        return Err("パスワードにヌル文字を含めることはできません。".into());
+        return Err("The password cannot contain a null character.".into());
     }
     let data = blob(bytes)?;
     let mut terminated = Zeroizing::new(vec![0u16; password.len() + 1]);
@@ -88,12 +94,15 @@ pub(super) fn import(bytes: &mut [u8], password: &[u16]) -> Result<Vec<Candidate
     }
     if store.0.is_null() {
         return Err(last_error(
-            "PFX を開けません。パスワードとファイルの形式を確認してください。",
+            "Could not open the PFX file. Check the password and file format.",
         ));
     }
     let mut candidates = SigningCertificate::in_store(&store, "PFX")?;
     if candidates.is_empty() {
-        return Err("PFX に有効な秘密鍵付きの文書署名用証明書がありません。".into());
+        return Err(
+            "The PFX file contains no valid document-signing certificate with a private key."
+                .into(),
+        );
     }
     for candidate in &mut candidates {
         candidate.certificate.1 = Some(Store(unsafe { CertDuplicateStore(store.0) }));
@@ -116,7 +125,7 @@ fn ask_password(owner: HWND) -> Result<Option<Zeroizing<Vec<u16>>>, String> {
     match result {
         1 => Ok(Some(password)),
         0 => Ok(None),
-        _ => Err(last_error("PFX のパスワード入力画面を開けません。")),
+        _ => Err(last_error("Could not open the PFX password dialog.")),
     }
 }
 
@@ -125,13 +134,13 @@ unsafe extern "system" fn password_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
         match msg {
             WM_INITDIALOG => {
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, lp);
-                SetWindowTextW(hwnd, w!("PFX のパスワード"));
+                SetWindowTextW(hwnd, w!("PFX password"));
                 SetDlgItemTextW(
                     hwnd,
                     1000,
-                    w!("パスワードを入力してください。未設定の場合は空欄のまま進めます。"),
+                    w!("Enter the password, or leave it blank if none was set."),
                 );
-                SetDlgItemTextW(hwnd, IDCANCEL, w!("キャンセル"));
+                SetDlgItemTextW(hwnd, IDCANCEL, w!("Cancel"));
                 1
             }
             WM_COMMAND if (wp & 0xffff) as i32 == IDOK => {

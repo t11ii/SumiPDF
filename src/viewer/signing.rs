@@ -30,7 +30,8 @@ enum Position {
 
 impl Choices {
     fn from_inspection(info: &serde_json::Value) -> Result<Self, String> {
-        let invalid = || "PDF の署名欄と署名の制限を読み取れませんでした。".to_owned();
+        let invalid =
+            || "Could not read the signature fields or signing permissions in this PDF.".to_owned();
         let new_field = info["allowsNewField"].as_bool().ok_or_else(invalid)?;
         let already_signed = info["alreadySigned"].as_bool().ok_or_else(invalid)?;
         let mut positions = Vec::new();
@@ -68,14 +69,14 @@ impl Choices {
     fn populate(&self, control: HWND, selected: Option<usize>) -> Result<(), String> {
         for position in &self.positions {
             let label = match position {
-                Position::Draw => "署名位置をドラッグして指定".to_owned(),
-                Position::Field(f) => format!("{} ページの署名欄：{}", f.page + 1, f.name),
-                Position::Invisible => "ページに表示しない署名".to_owned(),
+                Position::Draw => "Draw signature box".to_owned(),
+                Position::Field(f) => format!("Page {}: {}", f.page + 1, f.name),
+                Position::Invisible => "Invisible signature".to_owned(),
             };
             let index =
                 unsafe { SendMessageW(control, CB_ADDSTRING, 0, wide(&label).as_ptr() as isize) };
             if index < 0 {
-                return Err("署名位置の選択肢を表示できませんでした。".into());
+                return Err("Could not display the signature positions.".into());
             }
         }
         if let Some(index) = selected {
@@ -145,11 +146,11 @@ impl Session {
     }
 
     pub fn appearance(&self) -> Result<Option<save::Appearance>, String> {
-        let target = match self.position().ok_or("署名位置を選び直してください。")? {
+        let target = match self.position().ok_or("Choose a signature position.")? {
             Position::Draw => {
                 let (page, r) = self
                     .drawn
-                    .ok_or("署名を表示する位置をドラッグしてください。")?;
+                    .ok_or("Drag a box where the signature should appear.")?;
                 pdfseal::Target::Area {
                     page: page + 1,
                     rect: [r.left, r.top, r.right, r.bottom],
@@ -166,35 +167,37 @@ impl Session {
 
     pub fn instructions(&self, current_page: u32) -> String {
         if self.choices.is_none() {
-            return "空の署名欄を確認しています…".into();
+            return "Looking for empty signature fields…".into();
         }
         if !self.has_positions() {
-            return "この PDF には追加署名に使える空の署名欄がありません。".into();
+            return "This PDF has no empty field available for another signature.".into();
         }
         let position = self.position_instructions(current_page);
         match &self.certificate {
-            Some(cert) => format!("署名者：{}　·　{position}", cert.name),
-            None => format!("{position}　·　証明書ストアまたは PFX ファイルから選べます。"),
+            Some(cert) => format!("Signer: {}  ·  {position}", cert.name),
+            None => {
+                format!("{position}  ·  Choose a certificate from the Windows store or a PFX file.")
+            }
         }
     }
 
     fn position_instructions(&self, current_page: u32) -> String {
         if self.position().is_none() {
-            return "署名位置を選び直してください。".into();
+            return "Choose a signature position.".into();
         }
         if matches!(self.position(), Some(Position::Invisible)) {
-            return "ページに表示しない電子署名を作成します。".into();
+            return "The signature will be invisible.".into();
         }
         match self.placement() {
             Some((page, _)) if page != current_page => format!(
-                "署名の位置は {} ページです。そのページを開いて確認するか、署名位置を選び直してください。",
+                "The signature is on page {}. Open that page or choose a new position.",
                 page + 1
             ),
             Some(_) if self.drawing() => {
-                "青枠の位置に署名します。ドラッグで描き直すこともできます。".into()
+                "The blue box shows the signature position. Drag to redraw it.".into()
             }
-            Some(_) => "青枠が選択した署名欄です。".into(),
-            None => "署名を表示するページで、枠の角から反対側の角までドラッグしてください。".into(),
+            Some(_) => "The blue box shows the selected signature field.".into(),
+            None => "Drag from corner to corner to place the signature.".into(),
         }
     }
 }
@@ -297,7 +300,7 @@ impl App {
         };
         self.known_signed = choices.already_signed;
         if choices.already_signed && !self.marks.is_empty() {
-            return Err("署名済みの PDF には注釈を追加できません。「元に戻す」で注釈をすべて取り消してから署名してください。".into());
+            return Err("This PDF is already signed. Undo all unsaved annotations before adding another signature.".into());
         }
         let preferred = choices.preferred(self.page);
         choices.populate(self.ui.position, preferred)?;
@@ -391,8 +394,8 @@ fn watermark_menu(owner: HWND, button: HWND, name: Option<&str>) -> Result<i32, 
         return Err(std::io::Error::last_os_error().to_string());
     }
     let custom = match name {
-        Some(filename) => format!("PNG 画像を変更…（{}）", filename.replace('&', "&&")),
-        None => "PNG 画像を選択…".into(),
+        Some(filename) => format!("Change PNG… ({})", filename.replace('&', "&&")),
+        None => "Choose PNG…".into(),
     };
     let check = |value: bool| if value { MF_CHECKED } else { MF_UNCHECKED };
     let mut bounds = RECT::default();
@@ -401,7 +404,7 @@ fn watermark_menu(owner: HWND, button: HWND, name: Option<&str>) -> Result<i32, 
             menu,
             MF_STRING | check(name.is_none()),
             1,
-            wide("標準の透かし（用紙模様）").as_ptr(),
+            wide("Default watermark (paper pattern)").as_ptr(),
         );
         AppendMenuW(
             menu,
@@ -410,7 +413,7 @@ fn watermark_menu(owner: HWND, button: HWND, name: Option<&str>) -> Result<i32, 
             wide(&custom).as_ptr(),
         );
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
-        AppendMenuW(menu, MF_STRING, 3, wide("透かし画像を作成…").as_ptr());
+        AppendMenuW(menu, MF_STRING, 3, wide("Create watermark…").as_ptr());
         GetWindowRect(button, &mut bounds);
         let choice = TrackPopupMenu(
             menu,
@@ -434,7 +437,7 @@ fn open_designer(owner: HWND) -> Result<(), String> {
     if !path.is_file() {
         notice(
             owner,
-            "配布 ZIP の watermarkDesigner.html を SumiPDF.exe と同じフォルダーに置いてください。作成済みの PNG は「PNG 画像を選択」で使用できます。",
+            "Place watermarkDesigner.html from the ZIP in the same folder as SumiPDF.exe. You can also choose an existing PNG from the watermark menu.",
             false,
         );
         return Ok(());
@@ -451,7 +454,7 @@ fn open_designer(owner: HWND) -> Result<(), String> {
         )
     };
     if result as isize <= 32 {
-        return Err("透かし画像の作成画面をブラウザーで開けませんでした。".into());
+        return Err("Could not open the watermark designer in your browser.".into());
     }
     Ok(())
 }
@@ -482,8 +485,8 @@ mod tests {
         );
         session.certificate = Some(CertificateSelection::personal("山田 太郎".into(), [1; 20]));
         let status = session.instructions(1);
-        assert!(status.starts_with("署名者：山田 太郎"));
-        assert!(status.contains("青枠が選択した署名欄"));
+        assert!(status.starts_with("Signer: 山田 太郎"));
+        assert!(status.contains("The blue box shows the selected signature field"));
 
         session.selected = Some(1);
         assert!(session.appearance().is_err());
@@ -502,11 +505,7 @@ mod tests {
             ..Session::default()
         };
         assert!(!session.has_positions());
-        assert!(
-            session
-                .instructions(0)
-                .contains("使える空の署名欄がありません")
-        );
+        assert!(session.instructions(0).contains("no empty field available"));
         assert!(session.appearance().is_err());
     }
 }

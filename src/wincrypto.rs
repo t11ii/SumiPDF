@@ -75,9 +75,10 @@ impl CertificateSelection {
         match &self.source {
             CertificateSource::Personal(hash) => SigningCertificate::by_thumbprint(*hash, owner),
             CertificateSource::Pfx(cert) if permits_signing(cert.0) => Ok(Some(cert.duplicate())),
-            CertificateSource::Pfx(_) => {
-                Err("PFX の証明書が有効期限外か、署名に使用できません。".into())
-            }
+            CertificateSource::Pfx(_) => Err(
+                "The PFX certificate is outside its validity period or cannot be used for signing."
+                    .into(),
+            ),
         }
     }
 }
@@ -168,9 +169,13 @@ impl SigningCertificate {
         let mut candidates = Self::candidates()?;
         candidates.retain(|c| seen.insert(c.hash));
         if candidates.is_empty() {
-            return Err("Windows の「現在のユーザー」と「ローカル コンピューター」の読み取り可能な個人ストアに、有効な秘密鍵付きの文書署名用証明書がありません。IC カードを使う場合はカードを挿入してから再検索してください。".into());
+            return Err("No valid document-signing certificate with a private key was found in the available Windows personal stores for the current user or local machine. If you use a smart card, insert it and try again.".into());
         }
-        let Some(index) = picker::select(owner, &candidates, w!("Windows 証明書ストアから選ぶ"))?
+        let Some(index) = picker::select(
+            owner,
+            &candidates,
+            w!("Choose from the Windows certificate store"),
+        )?
         else {
             return Ok(None);
         };
