@@ -220,7 +220,7 @@ fn child(parent: HWND, class: &str, caption: &str, id: usize, style: u32) -> Res
             0,
             wide(class).as_ptr(),
             wide(caption).as_ptr(),
-            WS_VISIBLE | WS_CHILD | style,
+            WS_VISIBLE | WS_CHILD | WS_CLIPSIBLINGS | style,
             0,
             0,
             1,
@@ -426,20 +426,12 @@ impl Controls {
             return;
         }
         let bounds = rect(hwnd);
-        let s = |n| dips(hwnd, n);
+        let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96) as i32;
+        let s = |n: i32| (n * dpi + 48) / 96;
         let compact = bounds.right < s(650);
         let toolbar = if compact { 91 } else { 50 };
-        let place = |w, x, y, width, height| unsafe {
-            SetWindowPos(
-                w,
-                null_mut(),
-                x,
-                y,
-                width,
-                height,
-                SWP_NOZORDER | SWP_NOACTIVATE,
-            );
-        };
+        let mut positions = Vec::with_capacity(23);
+        let mut place = |w, x, y, width, height| positions.push((w, x, y, width, height));
         let button = 36;
         let page_x = 91;
         let page_width = 80;
@@ -500,6 +492,33 @@ impl Controls {
             (bounds.right - s(24)).max(1),
             s(28),
         );
+        // Move the rows together. Copied pixels can otherwise belong to a button's
+        // former neighbour when a resize moves the toolbar between one and two rows.
+        unsafe {
+            let flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS;
+            let mut batch = BeginDeferWindowPos(positions.len() as i32);
+            for &(child, x, y, w, h) in &positions {
+                if batch.is_null() {
+                    break;
+                }
+                batch = DeferWindowPos(batch, child, null_mut(), x, y, w, h, flags);
+            }
+            if batch.is_null() || EndDeferWindowPos(batch) == 0 {
+                for (child, x, y, w, h) in positions {
+                    SetWindowPos(child, null_mut(), x, y, w, h, flags);
+                }
+            }
+            let toolbar_bounds = RECT {
+                bottom: s(top),
+                ..bounds
+            };
+            RedrawWindow(
+                hwnd,
+                &toolbar_bounds,
+                null_mut(),
+                RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN,
+            );
+        }
         canvas::redraw(control(CANVAS_ID));
     }
 }

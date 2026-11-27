@@ -20,9 +20,9 @@ public static class SumiSmoke {
     [DllImport("user32.dll")]
     public static extern bool IsWindowVisible(IntPtr window);
     [StructLayout(LayoutKind.Sequential)]
-    struct Rect { public int Left, Top, Right, Bottom; }
+    public struct Rect { public int Left, Top, Right, Bottom; }
     [DllImport("user32.dll", SetLastError=true)]
-    static extern bool GetClientRect(IntPtr window, out Rect rect);
+    public static extern bool GetClientRect(IntPtr window, out Rect rect);
     [DllImport("user32.dll")]
     static extern uint GetDpiForWindow(IntPtr window);
     [DllImport("user32.dll")]
@@ -101,6 +101,53 @@ public static class SumiSmoke {
     }
     static IntPtr Point(int x, int y) {
         return new IntPtr((y << 16) | (x & 0xffff));
+    }
+    [DllImport("user32.dll", SetLastError=true)]
+    static extern bool GetWindowRect(IntPtr h, out Rect r);
+    [DllImport("user32.dll", SetLastError=true)]
+    static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int w, int height, uint flags);
+    [DllImport("user32.dll")]
+    static extern int MapWindowPoints(IntPtr from, IntPtr to, ref Rect rect, uint count);
+    [DllImport("user32.dll")]
+    public static extern bool PrintWindow(IntPtr window, IntPtr dc, uint flags);
+
+    public static void CheckResize(IntPtr window, int clientWidth, bool signing) {
+        var previous = SetThreadDpiAwarenessContext(new IntPtr(-4));
+        try {
+            Rect outer, client;
+            if (!GetWindowRect(window, out outer) || !GetClientRect(window, out client))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            int dpi = (int)GetDpiForWindow(window);
+            int width = (clientWidth * dpi + 48) / 96;
+            if (!SetWindowPos(window, IntPtr.Zero, 0, 0, outer.Right - outer.Left - client.Right + width,
+                outer.Bottom - outer.Top, 0x0016)) // NOMOVE | NOZORDER | NOACTIVATE
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            if (!GetClientRect(window, out client) || client.Right != width)
+                throw new InvalidOperationException("Did not reach the requested client width.");
+            int[] icons = signing ? new[] {101,102,103,104,105,106,107,108,109,114,115,128,129,130,131,132}
+                                  : new[] {101,102,103,104,105,106,107,108,109,114,115};
+            var occupied = new System.Collections.Generic.List<Rect>();
+            // Include the page number, color combo and signature-position combo in overlap checks.
+            foreach (int id in signing ? new[] {111,116,127} : new[] {111,116}) {
+                Rect field;
+                if (!GetWindowRect(GetDlgItem(window, id), out field)) throw new Win32Exception();
+                MapWindowPoints(IntPtr.Zero, window, ref field, 2);
+                occupied.Add(field);
+            }
+            foreach (int id in icons) {
+                var button = GetDlgItem(window, id);
+                Rect r;
+                if (!IsWindowVisible(button) || !GetWindowRect(button, out r)) throw new InvalidOperationException("Missing icon " + id);
+                MapWindowPoints(IntPtr.Zero, window, ref r, 2);
+                if (r.Right - r.Left != (36 * dpi + 48) / 96 || r.Bottom - r.Top != (32 * dpi + 48) / 96 ||
+                    r.Left < 0 || r.Top < 0 || r.Right > width || r.Bottom > client.Bottom)
+                    throw new InvalidOperationException("Clipped or resized icon " + id + " at width " + clientWidth);
+                foreach (var other in occupied)
+                    if (other.Left < r.Right && r.Left < other.Right && other.Top < r.Bottom && r.Top < other.Bottom)
+                        throw new InvalidOperationException("Overlapping controls at icon " + id + " at width " + clientWidth);
+                occupied.Add(r);
+            }
+        } finally { if (previous != IntPtr.Zero) SetThreadDpiAwarenessContext(previous); }
     }
     public static void DragOnPage(IntPtr window, int pageWidth, int pageHeight,
         double fromX, double fromY, double toX, double toY) {
@@ -221,6 +268,41 @@ function Wait-SignatureState([IntPtr]$Window, [string]$StatusText, [bool]$CanSav
     throw "Expected signature status '$StatusText', save $CanSave, watermark $CanPickImage; saw '$status'."
 }
 
+function Get-IconGlyph([IntPtr]$Window, [int]$Id) {
+    $button = [SumiSmoke]::GetDlgItem($Window, $Id)
+    $r = [SumiSmoke+Rect]::new()
+    if (![SumiSmoke]::GetClientRect($button, [ref]$r)) { throw "Could not measure icon $Id." }
+    $bitmap = [Drawing.Bitmap]::new($r.Right, $r.Bottom)
+    try {
+        $graphics = [Drawing.Graphics]::FromImage($bitmap)
+        try {
+            $dc = $graphics.GetHdc()
+            try {
+                if (![SumiSmoke]::PrintWindow($button, $dc, 1)) { throw "Could not capture icon $Id." }
+            } finally { $graphics.ReleaseHdc($dc) }
+        } finally { $graphics.Dispose() }
+        # Capture the central glyph, excluding focus rings and the button border.
+        $mask = [Text.StringBuilder]::new()
+        for ($y = [int]($r.Bottom * 0.22); $y -lt $r.Bottom * 0.78; $y++) {
+            for ($x = [int]($r.Right * 0.22); $x -lt $r.Right * 0.78; $x++) {
+                [void]$mask.Append([int]($bitmap.GetPixel($x, $y).GetBrightness() -lt 0.5))
+            }
+        }
+        $image = $mask.ToString()
+        if (!$image.Contains('0') -or !$image.Contains('1')) { throw "Icon $Id has no visible glyph." }
+        return $image
+    } finally { $bitmap.Dispose() }
+}
+
+function Test-ToolbarResize([IntPtr]$Window, [bool]$Signing) {
+    [SumiSmoke]::CheckResize($Window, 900, $Signing)
+    $before = Get-IconGlyph $Window 106
+    foreach ($width in @(650,649,440,700,480,900)) {
+        [SumiSmoke]::CheckResize($Window, $width, $Signing)
+        if ((Get-IconGlyph $Window 106) -ne $before) { throw "The fit-page glyph changed at width $width." }
+    }
+}
+
 function Test-PfxSigning([string]$ExecutablePath, [string]$InputPdf, [string]$Folder) {
     $name = "SumiPDF PFX " + [guid]::NewGuid()
     $password = "試験 " + [guid]::NewGuid()
@@ -288,6 +370,7 @@ try {
     $timer = [Diagnostics.Stopwatch]::StartNew()
     $viewer = Start-Process -FilePath $exe -ArgumentList ('"{0}"' -f $fixture) -PassThru
     $window = Wait-Page $viewer 'two pages.pdf' '1 / 2' $timer
+    Test-ToolbarResize $window $false
     $timer.Restart()
     [SumiSmoke]::NextPage($window)
     [void](Wait-Page $viewer 'two pages.pdf' '2 / 2' $timer)
@@ -326,6 +409,7 @@ try {
     # Keep the pending underline while switching to signing. The existing empty field is on page 2.
     [SumiSmoke]::Click($window, 107)
     Wait-SignatureState $window '青枠が選択した署名欄' $true $true
+    Test-ToolbarResize $window $true
     [SumiSmoke]::Click($window, 132)
     $filePicker = Wait-Dialog $viewer.Id '署名に使う PFX ファイルを開く'
     [SumiSmoke]::CloseDialog($filePicker)

@@ -418,7 +418,11 @@ fn paint(hwnd: HWND, state: &mut Canvas) {
                 },
                 ..Default::default()
             };
-            SetStretchBltMode(dc, COLORONCOLOR);
+            if (w, h) != (img.width as i32, img.height as i32) {
+                // Preserve fine lines while showing the last frame at a new size.
+                SetStretchBltMode(dc, HALFTONE);
+                SetBrushOrgEx(dc, x, y, null_mut());
+            }
             StretchDIBits(
                 dc,
                 x,
