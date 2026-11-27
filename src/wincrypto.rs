@@ -10,6 +10,7 @@ use windows_sys::Win32::Foundation::{
     GetLastError, HWND, NTE_BAD_KEYSET, NTE_NOT_FOUND, NTE_PERM, NTE_USER_CANCELLED,
     SCARD_W_CANCELLED_BY_USER,
 };
+mod pfx;
 mod picker;
 use windows_sys::Win32::Security::Cryptography::*;
 use windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
@@ -31,7 +32,9 @@ impl Drop for Store {
     }
 }
 
-pub(crate) struct SigningCertificate(*mut CERT_CONTEXT);
+// PFX signers retain their temporary store so bundled intermediate certificates
+// remain available while Windows builds the CMS certificate chain.
+pub(crate) struct SigningCertificate(*mut CERT_CONTEXT, Option<Store>);
 
 // SAFETY: CryptoAPI owns this thread-independent, reference-counted context. Each
 // instance holds exactly one reference. Moving it transfers that reference and the
@@ -52,7 +55,31 @@ struct Candidate {
 
 pub(crate) struct CertificateSelection {
     pub name: String,
-    pub hash: [u8; 20],
+    source: CertificateSource,
+}
+
+enum CertificateSource {
+    Personal([u8; 20]),
+    Pfx(SigningCertificate),
+}
+
+impl CertificateSelection {
+    pub(crate) fn personal(name: String, hash: [u8; 20]) -> Self {
+        Self {
+            name,
+            source: CertificateSource::Personal(hash),
+        }
+    }
+
+    pub(crate) fn resolve(&self, owner: HWND) -> Result<Option<SigningCertificate>, String> {
+        match &self.source {
+            CertificateSource::Personal(hash) => SigningCertificate::by_thumbprint(*hash, owner),
+            CertificateSource::Pfx(cert) if permits_signing(cert.0) => Ok(Some(cert.duplicate())),
+            CertificateSource::Pfx(_) => {
+                Err("PFX の証明書が有効期限外か、署名に使用できません。".into())
+            }
+        }
+    }
 }
 
 impl SigningCertificate {
@@ -82,41 +109,56 @@ impl SigningCertificate {
                 continue;
             }
             opened = true;
-            let mut current = null_mut();
-            loop {
-                current = unsafe { CertEnumCertificatesInStore(personal.0, current) };
-                if current.is_null() {
-                    let code = unsafe { GetLastError() };
-                    if code != CRYPT_E_NOT_FOUND as u32 && code != ERROR_NO_MORE_FILES {
-                        return Err(last_error("証明書を一覧表示できません。"));
-                    }
-                    break;
-                }
-                if permits_signing(current) {
-                    // Enumeration consumes the original reference on the next call.
-                    let certificate = Self(unsafe { CertDuplicateCertificateContext(current) });
-                    let hash = match certificate.thumbprint() {
-                        Ok(hash) => hash,
-                        Err(e) => {
-                            unsafe {
-                                CertFreeCertificateContext(current);
-                            }
-                            return Err(e);
-                        }
-                    };
-                    found.push(Candidate {
-                        certificate,
-                        hash,
-                        store,
-                    });
-                }
-            }
+            found.extend(Self::in_store(&personal, store)?);
         }
         if !opened {
             return Err(format!(
                 "Windows の個人証明書ストアを開けません。\n{}",
                 errors.join("\n")
             ));
+        }
+        Ok(found)
+    }
+
+    fn duplicate(&self) -> Self {
+        Self(
+            unsafe { CertDuplicateCertificateContext(self.0) },
+            self.1
+                .as_ref()
+                .map(|store| Store(unsafe { CertDuplicateStore(store.0) })),
+        )
+    }
+
+    fn in_store(personal: &Store, store: &'static str) -> Result<Vec<Candidate>, String> {
+        let mut found = Vec::new();
+        let mut current = null_mut();
+        loop {
+            current = unsafe { CertEnumCertificatesInStore(personal.0, current) };
+            if current.is_null() {
+                let code = unsafe { GetLastError() };
+                if code != CRYPT_E_NOT_FOUND as u32 && code != ERROR_NO_MORE_FILES {
+                    return Err(last_error("証明書を一覧表示できません。"));
+                }
+                break;
+            }
+            if permits_signing(current) {
+                // Enumeration consumes the original reference on the next call.
+                let certificate = Self(unsafe { CertDuplicateCertificateContext(current) }, None);
+                let hash = match certificate.thumbprint() {
+                    Ok(hash) => hash,
+                    Err(e) => {
+                        unsafe {
+                            CertFreeCertificateContext(current);
+                        }
+                        return Err(e);
+                    }
+                };
+                found.push(Candidate {
+                    certificate,
+                    hash,
+                    store,
+                });
+            }
         }
         Ok(found)
     }
@@ -128,19 +170,20 @@ impl SigningCertificate {
         if candidates.is_empty() {
             return Err("Windows の「現在のユーザー」と「ローカル コンピューター」の読み取り可能な個人ストアに、有効な秘密鍵付きの文書署名用証明書がありません。IC カードを使う場合はカードを挿入してから再検索してください。".into());
         }
-        let Some(index) = picker::select(owner, &candidates)? else {
+        let Some(index) = picker::select(owner, &candidates, w!("Windows 証明書ストアから選ぶ"))?
+        else {
             return Ok(None);
         };
         let selected = &candidates[index];
-        Ok(Some(CertificateSelection {
-            name: selected.certificate.display_name()?,
-            hash: selected.hash,
-        }))
+        Ok(Some(CertificateSelection::personal(
+            selected.certificate.display_name()?,
+            selected.hash,
+        )))
     }
 
     pub(crate) fn choose(owner: HWND) -> Result<Option<Self>, String> {
         match Self::pick(owner)? {
-            Some(choice) => Self::by_thumbprint(choice.hash, owner),
+            Some(choice) => choice.resolve(owner),
             None => Ok(None),
         }
     }
@@ -459,7 +502,7 @@ impl LocalChain {
                 null_mut(),
                 cert.0,
                 null(),
-                null_mut(),
+                cert.1.as_ref().map_or(null_mut(), |store| store.0),
                 &params,
                 flags,
                 null(),
@@ -521,21 +564,11 @@ try {
             String::from_utf8_lossy(&generated.stderr)
         );
         let mut bytes = generated.stdout;
-        let blob = CRYPT_INTEGER_BLOB {
-            cbData: bytes.len() as u32,
-            pbData: bytes.as_mut_ptr(),
-        };
-        let store = Store(unsafe {
-            PFXImportCertStore(
-                &blob,
-                w!("unit-test"),
-                PKCS12_NO_PERSIST_KEY | PKCS12_ALWAYS_CNG_KSP,
-            )
-        });
-        assert!(!store.0.is_null(), "{}", last_error("PFXImportCertStore"));
-        let cert = SigningCertificate(unsafe { CertEnumCertificatesInStore(store.0, null()) });
-        assert!(!cert.0.is_null());
-        assert!(permits_signing(cert.0));
+        let password: Vec<u16> = "unit-test".encode_utf16().collect();
+        assert!(pfx::import(&mut bytes, &[120]).is_err());
+        let mut candidates = pfx::import(&mut bytes, &password).unwrap();
+        assert_eq!(candidates.len(), 1);
+        let cert = candidates.remove(0).certificate;
         test(cert);
     }
 

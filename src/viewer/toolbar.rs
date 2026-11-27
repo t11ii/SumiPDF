@@ -35,6 +35,7 @@ pub(super) const UNDERLINE_TEXT: Icon = icon("\u{e8dc}", w!("下線 (U)"));
 pub(super) const UNDO_MARK: Icon = icon("\u{e7a7}", w!("元に戻す (Ctrl+Z)"));
 pub(super) const SAVE_ANNOTATIONS: Icon = icon("\u{e74e}", w!("注釈を保存… (Ctrl+Shift+S)"));
 pub(super) const SIGN_PDF: Icon = icon("\u{e76d}", w!("電子署名… (Ctrl+S)"));
+pub(super) const PFX: Icon = icon("\u{e8b5}", w!("PFX ファイルから署名用証明書を読み込む"));
 pub(super) const CERTIFICATE: Icon = icon("\u{e8d7}", w!("Windows 証明書ストアから選ぶ"));
 pub(super) const DEFAULT_WATERMARK: Icon = icon("\u{e81e}", w!("透かしを選択（現在は標準）"));
 const CUSTOM_WATERMARK: Icon = icon("\u{e8b9}", w!("透かしを選択（現在は指定画像）"));
@@ -274,7 +275,7 @@ mod tests {
                 );
                 assert!(index != 0xffff && indices.insert(index), "{name}: {index}");
             }
-            assert_eq!(indices.len(), 15);
+            assert_eq!(indices.len(), 16);
             assert_eq!(
                 labels(&ui.toolbar, ui.certificate).1,
                 "Windows 証明書ストアから選ぶ"

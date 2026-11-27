@@ -1,6 +1,6 @@
 [package]
 name = "sumi-pdf"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 publish = false
 
@@ -20,6 +20,7 @@ sha2 = "0.11"
 time = { version = "0.3", default-features = false, features = ["std"] }
 
 [target.'cfg(windows)'.dependencies]
+zeroize = "1.8"
 tempfile = "3"
 windows = { version = "0.62.2", features = ["Data_Pdf", "Foundation", "Storage_Streams", "Graphics_Imaging", "Win32_System_WinRT", "Win32_System_Com", "Win32_UI_Accessibility"] }
 windows-sys = { version = "0.61.2", features = [

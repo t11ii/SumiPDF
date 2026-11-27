@@ -149,7 +149,7 @@ impl Session {
         let position = self.position_instructions(current_page);
         match &self.certificate {
             Some(cert) => format!("署名者：{}　·　{position}", cert.name),
-            None => format!("{position}　·　鍵のボタンで証明書を選べます。"),
+            None => format!("{position}　·　証明書ストアまたは PFX ファイルから選べます。"),
         }
     }
 
@@ -310,11 +310,19 @@ impl App {
         self.status();
     }
 
-    pub(super) fn choose_certificate(&mut self) -> Result<(), String> {
-        if let Some(session) = &mut self.signing
-            && session.has_positions()
-            && let Some(choice) = SigningCertificate::pick(self.hwnd)?
-        {
+    pub(super) fn choose_certificate(&mut self, from_pfx: bool) -> Result<(), String> {
+        let Some(session) = self.signing.as_mut().filter(|s| s.has_positions()) else {
+            return Ok(());
+        };
+        let choice = if from_pfx {
+            let Some(path) = dialog::choose(self.hwnd, dialog::Purpose::Pfx)? else {
+                return Ok(());
+            };
+            SigningCertificate::pick_pfx(self.hwnd, &path)?
+        } else {
+            SigningCertificate::pick(self.hwnd)?
+        };
+        if let Some(choice) = choice {
             session.certificate = Some(choice);
             self.status();
         }
@@ -454,10 +462,7 @@ mod tests {
             session.appearance().unwrap().unwrap().target,
             pdfseal::Target::Field("field-8-0".into())
         );
-        session.certificate = Some(CertificateSelection {
-            name: "山田 太郎".into(),
-            hash: [1; 20],
-        });
+        session.certificate = Some(CertificateSelection::personal("山田 太郎".into(), [1; 20]));
         let status = session.instructions(1);
         assert!(status.starts_with("署名者：山田 太郎"));
         assert!(status.contains("青枠が選択した署名欄"));

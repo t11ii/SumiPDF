@@ -7,15 +7,21 @@ SumiPDF.exe --inspect FILE.pdf
 SumiPDF.exe --preview FILE.pdf --out PAGE.png (--page N [--rect L,T,R,B] | --field ID)
 SumiPDF.exe --certificates
 SumiPDF.exe --sign FILE.pdf --out SIGNED.pdf (--field ID | --page N --rect L,T,R,B)
-            [--watermark LOGO.png] [--certificate THUMBPRINT] [--expect-sha256 HASH]
+            [--watermark LOGO.png] [--certificate THUMBPRINT | --pfx FILE.pfx] [--expect-sha256 HASH]
 
 Pages start at 1. Rectangles use fractions of the visible page (top-left 0,0).
 --inspect returns JSON with page count, writable signature fields and input SHA-256.
 For signed PDFs, alreadySigned and allowsNewField describe placement options.
 --preview saves a page PNG with an optional target outline. --sign creates a new PDF.
-If --certificate is omitted, SumiPDF opens its Windows certificate store picker. Use --certificates
+With --pfx, enter the password in the Windows dialog. With neither identity option, SumiPDF opens its Windows certificate store picker. Use --certificates
 to list eligible identities in CurrentUser/My and LocalMachine/My. A key provider may request a PIN.
 Existing output files are preserved. Commands return JSON except --help."#;
+
+#[derive(Debug, PartialEq)]
+enum Identity {
+    Store([u8; 20]),
+    Pfx(PathBuf),
+}
 
 enum Command {
     Help,
@@ -32,7 +38,7 @@ enum Command {
         output: PathBuf,
         target: Target,
         watermark: Option<PathBuf>,
-        certificate: Option<[u8; 20]>,
+        certificate: Option<Identity>,
         expected: Option<[u8; 32]>,
     },
 }
@@ -154,16 +160,20 @@ fn parse(args: Vec<OsString>) -> Result<Command, String> {
                 target,
             }
         } else {
+            let certificate = match (flags.text("--certificate")?, flags.path("--pfx")) {
+                (Some(_), Some(_)) => {
+                    return Err("--certificate と --pfx はどちらか一方を指定してください。".into());
+                }
+                (Some(hash), None) => Some(Identity::Store(hash_bytes(&hash)?)),
+                (None, Some(path)) => Some(Identity::Pfx(path)),
+                (None, None) => None,
+            };
             Command::Sign {
                 input,
                 output,
                 target: target.ok_or("署名欄が必要です。")?,
                 watermark: flags.path("--watermark"),
-                certificate: flags
-                    .text("--certificate")?
-                    .as_deref()
-                    .map(hash_bytes)
-                    .transpose()?,
+                certificate,
                 expected: flags
                     .text("--expect-sha256")?
                     .as_deref()
@@ -244,7 +254,15 @@ pub fn run(args: Vec<OsString>) -> Result<(), String> {
             let (page, rect) = pdfseal::locate(&bytes, &target)?;
             let watermark = watermark.map(|p| crate::read_watermark(&p)).transpose()?;
             let cert = match certificate {
-                Some(hash) => SigningCertificate::by_thumbprint(hash, std::ptr::null_mut())?,
+                Some(Identity::Store(hash)) => {
+                    SigningCertificate::by_thumbprint(hash, std::ptr::null_mut())?
+                }
+                Some(Identity::Pfx(path)) => {
+                    match SigningCertificate::pick_pfx(std::ptr::null_mut(), &path)? {
+                        Some(choice) => choice.resolve(std::ptr::null_mut())?,
+                        None => None,
+                    }
+                }
                 None => SigningCertificate::choose(std::ptr::null_mut())?,
             }
             .ok_or("証明書の選択をキャンセルしました。")?;
@@ -388,7 +406,10 @@ mod tests {
             )
         );
         assert_eq!(watermark, Some(PathBuf::from("my.png")));
-        assert_eq!(certificate, Some([0xab; 20]));
+        assert_eq!(certificate, Some(Identity::Store([0xab; 20])));
+        assert!(
+            matches!(command(&["--sign","a","--field","one","--out","b","--pfx","自分の鍵.p12"]), Ok(Command::Sign { certificate: Some(Identity::Pfx(p)), .. }) if p==Path::new("自分の鍵.p12"))
+        );
         assert_eq!(expected, Some([1; 32]));
         assert!(
             matches!(command(&["--sign","a","--page","2","--rect","0,.1,.8,1","--out","b"]),
@@ -400,6 +421,18 @@ mod tests {
     fn rejects_conflicting_targets_and_invalid_options() {
         for args in [
             &["--help", "a"][..],
+            &[
+                "--sign",
+                "a",
+                "--out",
+                "b",
+                "--field",
+                "one",
+                "--pfx",
+                "a.pfx",
+                "--certificate",
+                "0000000000000000000000000000000000000000",
+            ],
             &["--inspect", "a", "--watermark", "b"],
             &["--preview", "a", "--page", "0", "--out", "b"],
             &["--sign", "a", "--page", "2", "--out", "b"],

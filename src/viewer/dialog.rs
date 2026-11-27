@@ -11,6 +11,7 @@ use windows_sys::Win32::{Foundation::HWND, UI::Controls::Dialogs::*};
 pub enum Purpose<'a> {
     Open,
     Watermark,
+    Pfx,
     SignedCopy(&'a Path),
     HighlightedCopy(&'a Path),
 }
@@ -24,10 +25,13 @@ pub fn choose(hwnd: HWND, purpose: Purpose<'_>) -> Result<Option<PathBuf>, Strin
     let title = wide(match purpose {
         Purpose::SignedCopy(_) => "署名済みPDFを新しいファイルに保存",
         Purpose::HighlightedCopy(_) => "注釈付きPDFを新しいファイルに保存",
+        Purpose::Pfx => "署名に使う PFX ファイルを開く",
         Purpose::Open => "PDFを開く",
         Purpose::Watermark => "電子署名の背景に使う PNG 画像を選択",
     });
-    let (filter, ext) = if matches!(purpose, Purpose::Watermark) {
+    let (filter, ext) = if matches!(purpose, Purpose::Pfx) {
+        (wide("PKCS#12 (*.pfx, *.p12)\0*.pfx;*.p12\0"), wide("pfx"))
+    } else if matches!(purpose, Purpose::Watermark) {
         (wide("PNG 画像 (*.png)\0*.png\0"), wide("png"))
     } else {
         (wide("PDF ファイル (*.pdf)\0*.pdf\0"), wide("pdf"))

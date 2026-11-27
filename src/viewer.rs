@@ -52,6 +52,7 @@ const WATERMARK: usize = 128;
 const SIGN_SAVE: usize = 129;
 const SIGN_CANCEL: usize = 130;
 const SIGN_CERTIFICATE: usize = 131;
+const SIGN_PFX: usize = 132;
 const RENDER_TIMER: usize = 1;
 const ACTION: u32 = WM_APP + 1;
 const READY: u32 = WM_APP + 2;
@@ -256,6 +257,7 @@ struct Controls {
     position: HWND,
     watermark: HWND,
     certificate: HWND,
+    pfx: HWND,
     sign_save: HWND,
     sign_cancel: HWND,
     status: HWND,
@@ -332,6 +334,7 @@ impl Controls {
             )?,
             watermark: toolbar.button(WATERMARK, toolbar::DEFAULT_WATERMARK)?,
             certificate: toolbar.button(SIGN_CERTIFICATE, toolbar::CERTIFICATE)?,
+            pfx: toolbar.button(SIGN_PFX, toolbar::PFX)?,
             sign_save: toolbar.button(SIGN_SAVE, toolbar::CONFIRM)?,
             sign_cancel: toolbar.button(SIGN_CANCEL, toolbar::CANCEL)?,
             canvas: child(hwnd, CANVAS, "", CANVAS_ID, 0)?,
@@ -358,6 +361,7 @@ impl Controls {
             self.position,
             self.watermark,
             self.certificate,
+            self.pfx,
             self.sign_save,
             self.sign_cancel,
         ] {
@@ -469,13 +473,14 @@ impl Controls {
         place(control(SIGN), bounds.right - s(46), s(9), s(button), s(32));
         let mut top = toolbar;
         if unsafe { GetWindowLongW(control(SIGN_POSITION), GWL_STYLE) } as u32 & WS_VISIBLE != 0 {
-            let width = (bounds.right - s(188)).min(s(390));
+            let width = (bounds.right - s(227)).min(s(390));
             place(control(SIGN_POSITION), s(10), s(toolbar + 2), width, s(280));
             for (id, x) in [
                 (WATERMARK, 17),
                 (SIGN_CERTIFICATE, 56),
-                (SIGN_SAVE, 103),
-                (SIGN_CANCEL, 142),
+                (SIGN_PFX, 95),
+                (SIGN_SAVE, 142),
+                (SIGN_CANCEL, 181),
             ] {
                 place(control(id), width + s(x), s(toolbar), s(button), s(32));
             }
@@ -604,6 +609,10 @@ impl App {
             ),
             (
                 self.ui.certificate,
+                self.signing.as_ref().is_some_and(|s| s.has_positions()) && !self.writing,
+            ),
+            (
+                self.ui.pfx,
                 self.signing.as_ref().is_some_and(|s| s.has_positions()) && !self.writing,
             ),
             (self.ui.sign_save, self.can_sign_here() && !self.writing),
@@ -951,7 +960,7 @@ impl App {
             let session = self.signing.as_ref().ok_or("署名位置を選んでください。")?;
             let appearance = session.appearance()?;
             let certificate = match &session.certificate {
-                Some(choice) => SigningCertificate::by_thumbprint(choice.hash, self.hwnd)?,
+                Some(choice) => choice.resolve(self.hwnd)?,
                 None => SigningCertificate::choose(self.hwnd)?,
             };
             let Some(cert) = certificate else {
@@ -1106,7 +1115,8 @@ impl App {
             FIT => self.scale(1.0),
             SIGN => self.begin_signing()?,
             SIGN_POSITION if !self.writing => self.choose_position(),
-            SIGN_CERTIFICATE if !self.writing => self.choose_certificate()?,
+            SIGN_CERTIFICATE if !self.writing => self.choose_certificate(false)?,
+            SIGN_PFX if !self.writing => self.choose_certificate(true)?,
             WATERMARK if !self.writing => self.choose_watermark()?,
             SIGN_SAVE => self.save_copy(true)?,
             SIGN_CANCEL if !self.writing => self.end_signing(),

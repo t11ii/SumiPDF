@@ -59,9 +59,9 @@ public static class SumiSmoke {
     [DllImport("user32.dll")]
     static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
 
-    public static IntPtr CertificateDialog(int processId) {
+    public static IntPtr Dialog(int processId, string title) {
         var h = IntPtr.Zero;
-        while ((h = FindWindowExW(IntPtr.Zero, h, "#32770", "Windows 証明書ストアから選ぶ")) != IntPtr.Zero) {
+        while ((h = FindWindowExW(IntPtr.Zero, h, "#32770", title)) != IntPtr.Zero) {
             uint pid;
             GetWindowThreadProcessId(h, out pid);
             if (pid == (uint)processId && IsWindowVisible(h)) return h;
@@ -71,6 +71,13 @@ public static class SumiSmoke {
     [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", ExactSpelling=true, CharSet=CharSet.Unicode)]
     static extern IntPtr SendString(IntPtr h, uint message, UIntPtr wparam, string text,
         uint flags, uint timeout, out UIntPtr result);
+    public static void EnterTestPassword(IntPtr dialog, string password) {
+        UIntPtr result;
+        if (SendString(GetDlgItem(dialog, 1001), 0x000c, UIntPtr.Zero,
+            password, 2, 2000, out result) == IntPtr.Zero || result == UIntPtr.Zero)
+            throw new InvalidOperationException("Could not fill the test password dialog.");
+        Click(dialog, 1);
+    }
     public static void ChooseCertificate(IntPtr dialog, string name) {
         UIntPtr index;
         if (SendString(GetDlgItem(dialog, 1001), 0x018c, UIntPtr.MaxValue,
@@ -188,15 +195,14 @@ function Wait-HighlightState([Diagnostics.Process]$Viewer, [IntPtr]$Window, [str
     throw "Expected '$ModeText', dirty $Dirty. Status '$status', title '$title', Save $save, Undo $undo."
 }
 
-function Open-CertificatePicker([IntPtr]$Window, [int]$ViewerId) {
-    [SumiSmoke]::Click($Window, 131)
+function Wait-Dialog([int]$ViewerId, [string]$Title) {
     $timer = [Diagnostics.Stopwatch]::StartNew()
     do {
-        $popup = [SumiSmoke]::CertificateDialog($ViewerId)
+        $popup = [SumiSmoke]::Dialog($ViewerId, $Title)
         if ($popup -ne [IntPtr]::Zero) { return $popup }
         Start-Sleep -Milliseconds 50
     } while ($timer.Elapsed.TotalSeconds -lt 15)
-    throw 'Certificate picker did not open.'
+    throw "The dialog did not open: $Title"
 }
 
 function Wait-SignatureState([IntPtr]$Window, [string]$StatusText, [bool]$CanSave, [bool]$CanPickImage) {
@@ -215,6 +221,57 @@ function Wait-SignatureState([IntPtr]$Window, [string]$StatusText, [bool]$CanSav
     throw "Expected signature status '$StatusText', save $CanSave, watermark $CanPickImage; saw '$status'."
 }
 
+function Test-PfxSigning([string]$ExecutablePath, [string]$InputPdf, [string]$Folder) {
+    $name = "SumiPDF PFX " + [guid]::NewGuid()
+    $password = "試験 " + [guid]::NewGuid()
+    $pfx = Join-Path $Folder '署名用 ID.pfx'
+    $out = Join-Path $Folder 'PFX signed.pdf'
+    $rsa = [Security.Cryptography.RSA]::Create(2048)
+    try {
+        $request = [Security.Cryptography.X509Certificates.CertificateRequest]::new(
+            "CN=$name", $rsa, [Security.Cryptography.HashAlgorithmName]::SHA256, [Security.Cryptography.RSASignaturePadding]::Pkcs1)
+        $cert = $request.CreateSelfSigned([DateTimeOffset]::UtcNow.AddMinutes(-5), [DateTimeOffset]::UtcNow.AddDays(1))
+        try {
+            $thumbprint = $cert.Thumbprint
+            [IO.File]::WriteAllBytes($pfx, $cert.Export([Security.Cryptography.X509Certificates.X509ContentType]::Pfx, $password))
+        } finally { $cert.Dispose() }
+    } finally { $rsa.Dispose() }
+    $start = [Diagnostics.ProcessStartInfo]::new($ExecutablePath)
+    $start.UseShellExecute = $false
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    $start.StandardOutputEncoding = $start.StandardErrorEncoding = [Text.Encoding]::UTF8
+    foreach ($arg in @('--sign', $InputPdf, '--out', $out, '--page', '1', '--rect', '0.1,0.4,0.7,0.6', '--pfx', $pfx)) {
+        $start.ArgumentList.Add($arg)
+    }
+    foreach ($attempt in @('cancel', 'wrong', 'correct')) {
+        $proc = [Diagnostics.Process]::Start($start)
+        try {
+            $stdout = $proc.StandardOutput.ReadToEndAsync()
+            $stderr = $proc.StandardError.ReadToEndAsync()
+            $dialog = Wait-Dialog $proc.Id 'PFX のパスワード'
+            switch ($attempt) {
+                'cancel' { [SumiSmoke]::CloseDialog($dialog) }
+                'wrong' { [SumiSmoke]::EnterTestPassword($dialog, 'wrong') }
+                'correct' { [SumiSmoke]::EnterTestPassword($dialog, $password) }
+            }
+            if (!$proc.WaitForExit(30000)) { throw 'PFX signing timed out.' }
+            if ($attempt -eq 'correct') {
+                if ($proc.ExitCode -ne 0) { throw "PFX signing failed: $($stderr.Result)" }
+                $result = $stdout.Result | ConvertFrom-Json
+                if ($result.signer -ne $name -or $result.sha256 -ne (Get-FileHash $out).Hash) { throw 'Wrong PFX signer or digest.' }
+            } elseif ($proc.ExitCode -eq 0 -or (Test-Path $out)) { throw "Unexpected output after $attempt." }
+        } finally {
+            if (!$proc.HasExited) { $proc.Kill(); $proc.WaitForExit() }
+            $proc.Dispose()
+        }
+    }
+    if ((Test-Path "Cert:\CurrentUser\My\$thumbprint") -or (Test-Path "Cert:\LocalMachine\My\$thumbprint")) {
+        throw 'The PFX test certificate was installed in a personal store.'
+    }
+    Write-Host 'Verified PFX co-signing with a Unicode password, cancellation, wrong-password handling and no personal-store registration.'
+}
+
 $exe = (Resolve-Path -LiteralPath $Executable).Path
 $dir = Join-Path ([IO.Path]::GetTempPath()) ("SumiPDF-smoke-" + [Guid]::NewGuid().ToString('N'))
 $fixture = Join-Path $dir 'two pages.pdf'
@@ -225,6 +282,7 @@ try {
     [void][IO.Directory]::CreateDirectory($dir)
     Write-TestPdf $fixture
     & (Join-Path $PSScriptRoot 'signingCli.ps1') -Executable $exe -Pdf $fixture -SignedGuiFixture $signedFixture
+    Test-PfxSigning $exe $signedFixture $dir
     Write-Host "Release EXE size $((Get-Item -LiteralPath $exe).Length) bytes."
     # The first observation includes process launch. Both include polling latency.
     $timer = [Diagnostics.Stopwatch]::StartNew()
@@ -268,12 +326,18 @@ try {
     # Keep the pending underline while switching to signing. The existing empty field is on page 2.
     [SumiSmoke]::Click($window, 107)
     Wait-SignatureState $window '青枠が選択した署名欄' $true $true
+    [SumiSmoke]::Click($window, 132)
+    $filePicker = Wait-Dialog $viewer.Id '署名に使う PFX ファイルを開く'
+    [SumiSmoke]::CloseDialog($filePicker)
+    Wait-SignatureState $window '青枠が選択した署名欄' $true $true
     $pickerName = "SumiPDF Picker " + [guid]::NewGuid()
     $pickerCert = New-SelfSignedCertificate -Type Custom -Subject "CN=$pickerName" -KeyUsage DigitalSignature -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.36') -CertStoreLocation Cert:\CurrentUser\My
-    $popup = Open-CertificatePicker $window $viewer.Id
+    [SumiSmoke]::Click($window, 131)
+    $popup = Wait-Dialog $viewer.Id 'Windows 証明書ストアから選ぶ'
     [SumiSmoke]::ChooseCertificate($popup, $pickerName)
     Wait-SignatureState $window "署名者：$pickerName" $true $true
-    $popup = Open-CertificatePicker $window $viewer.Id
+    [SumiSmoke]::Click($window, 131)
+    $popup = Wait-Dialog $viewer.Id 'Windows 証明書ストアから選ぶ'
     [SumiSmoke]::CloseDialog($popup)
     Wait-SignatureState $window "署名者：$pickerName" $true $true
     if ([SumiSmoke]::ReadText([SumiSmoke]::GetDlgItem($window, 111)) -ne '2 / 2') {

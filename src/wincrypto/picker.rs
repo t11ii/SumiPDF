@@ -20,16 +20,25 @@ const DETAILS: i32 = 1002;
 struct Contents<'a> {
     candidates: &'a [Candidate],
     labels: Vec<Vec<u16>>,
+    title: *const u16,
 }
 
-pub(super) fn select(owner: HWND, candidates: &[Candidate]) -> Result<Option<usize>, String> {
+pub(super) fn select(
+    owner: HWND,
+    candidates: &[Candidate],
+    title: *const u16,
+) -> Result<Option<usize>, String> {
     let mut labels = Vec::with_capacity(candidates.len());
     for candidate in candidates {
         let name = candidate.certificate.display_name()?;
         let label = format!("{name}   ({})", candidate.store);
         labels.push(label.encode_utf16().chain([0]).collect());
     }
-    let contents = Contents { candidates, labels };
+    let contents = Contents {
+        candidates,
+        labels,
+        title,
+    };
     // DialogBoxParamW is synchronous. All context references outlive the window.
     let result = unsafe {
         DialogBoxParamW(
@@ -52,7 +61,8 @@ unsafe extern "system" fn dialog_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         match msg {
             WM_INITDIALOG => {
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, lp);
-                SetWindowTextW(hwnd, w!("Windows 証明書ストアから選ぶ"));
+                let contents = &*(lp as *const Contents);
+                SetWindowTextW(hwnd, contents.title);
                 SetDlgItemTextW(
                     hwnd,
                     PROMPT,
@@ -61,7 +71,6 @@ unsafe extern "system" fn dialog_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 SetDlgItemTextW(hwnd, DETAILS, w!("証明書の詳細"));
                 SetDlgItemTextW(hwnd, IDOK, w!("選択"));
                 SetDlgItemTextW(hwnd, IDCANCEL, w!("キャンセル"));
-                let contents = &*(lp as *const Contents);
                 let list = GetDlgItem(hwnd, IDENTITIES);
                 for label in &contents.labels {
                     if SendMessageW(list, LB_ADDSTRING, 0, label.as_ptr() as LPARAM) < 0 {
