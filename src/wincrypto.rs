@@ -10,7 +10,7 @@ use windows_sys::Win32::Foundation::{
     GetLastError, HWND, NTE_BAD_KEYSET, NTE_NOT_FOUND, NTE_PERM, NTE_USER_CANCELLED,
     SCARD_W_CANCELLED_BY_USER,
 };
-use windows_sys::Win32::Security::Cryptography::UI::CryptUIDlgSelectCertificateFromStore;
+mod picker;
 use windows_sys::Win32::Security::Cryptography::*;
 use windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
 use windows_sys::core::w;
@@ -122,59 +122,19 @@ impl SigningCertificate {
     }
 
     pub(crate) fn pick(owner: HWND) -> Result<Option<CertificateSelection>, String> {
-        let candidates = Self::candidates()?;
+        let mut seen = HashSet::new();
+        let mut candidates = Self::candidates()?;
+        candidates.retain(|c| seen.insert(c.hash));
         if candidates.is_empty() {
             return Err("Windows の「現在のユーザー」と「ローカル コンピューター」の読み取り可能な個人ストアに、有効な秘密鍵付きの文書署名用証明書がありません。IC カードを使う場合はカードを挿入してから再検索してください。".into());
         }
-        let picker = Store(unsafe {
-            CertOpenStore(
-                CERT_STORE_PROV_MEMORY,
-                0,
-                0,
-                CERT_STORE_DEFER_CLOSE_UNTIL_LAST_FREE_FLAG,
-                null(),
-            )
-        });
-        if picker.0.is_null() {
-            return Err(last_error("証明書を選択できません。"));
-        }
-        let mut linked = HashSet::new();
-        for candidate in &candidates {
-            if !linked.insert(candidate.hash) {
-                continue;
-            }
-            if unsafe {
-                CertAddCertificateLinkToStore(
-                    picker.0,
-                    candidate.certificate.0,
-                    CERT_STORE_ADD_ALWAYS,
-                    null_mut(),
-                )
-            } == 0
-            {
-                return Err(last_error("署名用証明書を一覧に追加できません。"));
-            }
-        }
-        let selected = unsafe {
-            CryptUIDlgSelectCertificateFromStore(
-                picker.0,
-                owner,
-                w!("Windows 証明書ストアから選ぶ"),
-                w!(
-                    "現在のユーザーとローカル コンピューターの個人ストアから、この PDF の署名者を選択してください。"
-                ),
-                0,
-                0,
-                null(),
-            )
-        };
-        if selected.is_null() {
+        let Some(index) = picker::select(owner, &candidates)? else {
             return Ok(None);
-        }
-        let cert = Self(selected);
+        };
+        let selected = &candidates[index];
         Ok(Some(CertificateSelection {
-            name: cert.display_name()?,
-            hash: cert.thumbprint()?,
+            name: selected.certificate.display_name()?,
+            hash: selected.hash,
         }))
     }
 

@@ -13,7 +13,7 @@ Pages start at 1. Rectangles use fractions of the visible page (top-left 0,0).
 --inspect returns JSON with page count, writable signature fields and input SHA-256.
 For signed PDFs, alreadySigned and allowsNewField describe placement options.
 --preview saves a page PNG with an optional target outline. --sign creates a new PDF.
-If --certificate is omitted, Windows opens its certificate picker. Use --certificates
+If --certificate is omitted, SumiPDF opens its Windows certificate store picker. Use --certificates
 to list eligible identities in CurrentUser/My and LocalMachine/My. A key provider may request a PIN.
 Existing output files are preserved. Commands return JSON except --help."#;
 

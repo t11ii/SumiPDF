@@ -34,7 +34,7 @@ $rect = '0.5,0.75,0.9,0.85'
 ```
 
 - `--watermark` を省略すると、SumiPDF の標準の透かしを使用します。同梱の `watermarkDesigner.html` では、手描きや文字を組み合わせて透過 PNG を作れます。
-- `--certificate` を省略すると Windows の証明書選択画面が開きます。指定した証明書で処理する場合は `--certificates` の JSON で氏名（`name`）、拇印（`thumbprint`）、格納先（`store`）を確認し、`--certificate <thumbprint>` を付けます。IC カード等の鍵は PIN 入力を要求することがあります。
+- `--certificate` を省略すると 証明書の氏名と Windows ストアの格納先を一覧で確認できます。指定した証明書で処理する場合は `--certificates` の JSON で氏名（`name`）、拇印（`thumbprint`）、格納先（`store`）を確認し、`--certificate <thumbprint>` を付けます。IC カード等の鍵は PIN 入力を要求することがあります。
 - `--expect-sha256` は、確認したファイルと署名時のファイルの一致を検査します。対象が変わっていたら、新しい PDF で署名欄を再確認します。
 - 出力先には新しいパスを指定します。成功時は標準出力に JSON が返ります。失敗時は標準エラーに JSON が返り、終了コードは 1 です。GUI 形式の EXE のため、PowerShell の例ではパイプで出力を受けています。エージェントから子プロセスとして呼ぶときは標準出力・標準エラーを取得し、終了を待ちます。
 - 電子署名の検証には Acrobat Reader などの署名パネルを使えます。署名の外観には証明書の氏名と UTC 日時が入り、秘密鍵の処理は Windows の鍵プロバイダーが担当します。

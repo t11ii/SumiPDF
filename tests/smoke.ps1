@@ -54,8 +54,30 @@ public static class SumiSmoke {
         if (handle == IntPtr.Zero || !PostMessageW(handle, message, new UIntPtr(keys), position))
             throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not post UI input.");
     }
+    [DllImport("user32.dll", CharSet=CharSet.Unicode, ExactSpelling=true)]
+    static extern IntPtr FindWindowExW(IntPtr parent, IntPtr previous, string kind, string title);
     [DllImport("user32.dll")]
-    public static extern IntPtr GetLastActivePopup(IntPtr owner);
+    static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+
+    public static IntPtr CertificateDialog(int processId) {
+        var h = IntPtr.Zero;
+        while ((h = FindWindowExW(IntPtr.Zero, h, "#32770", "Windows 証明書ストアから選ぶ")) != IntPtr.Zero) {
+            uint pid;
+            GetWindowThreadProcessId(h, out pid);
+            if (pid == (uint)processId && IsWindowVisible(h)) return h;
+        }
+        return IntPtr.Zero;
+    }
+    [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", ExactSpelling=true, CharSet=CharSet.Unicode)]
+    static extern IntPtr SendString(IntPtr h, uint message, UIntPtr wparam, string text,
+        uint flags, uint timeout, out UIntPtr result);
+    public static void ChooseCertificate(IntPtr dialog, string name) {
+        UIntPtr index;
+        if (SendString(GetDlgItem(dialog, 1001), 0x018c, UIntPtr.MaxValue,
+            name, 2, 2000, out index) == IntPtr.Zero || index.ToUInt64() > int.MaxValue)
+            throw new InvalidOperationException("The test identity is missing from the certificate picker.");
+        Click(dialog, 1);
+    }
     public static void CloseDialog(IntPtr dialog) {
         Post(dialog, 0x0010, 0, IntPtr.Zero); // WM_CLOSE
     }
@@ -166,6 +188,17 @@ function Wait-HighlightState([Diagnostics.Process]$Viewer, [IntPtr]$Window, [str
     throw "Expected '$ModeText', dirty $Dirty. Status '$status', title '$title', Save $save, Undo $undo."
 }
 
+function Open-CertificatePicker([IntPtr]$Window, [int]$ViewerId) {
+    [SumiSmoke]::Click($Window, 131)
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        $popup = [SumiSmoke]::CertificateDialog($ViewerId)
+        if ($popup -ne [IntPtr]::Zero) { return $popup }
+        Start-Sleep -Milliseconds 50
+    } while ($timer.Elapsed.TotalSeconds -lt 15)
+    throw 'Certificate picker did not open.'
+}
+
 function Wait-SignatureState([IntPtr]$Window, [string]$StatusText, [bool]$CanSave, [bool]$CanPickImage) {
     $timer = [Diagnostics.Stopwatch]::StartNew()
     do {
@@ -173,7 +206,7 @@ function Wait-SignatureState([IntPtr]$Window, [string]$StatusText, [bool]$CanSav
         $save = [SumiSmoke]::GetDlgItem($Window, 129)
         $watermark = [SumiSmoke]::GetDlgItem($Window, 128)
         $certificate = [SumiSmoke]::GetDlgItem($Window, 131)
-        if ($status.Contains($StatusText) -and [SumiSmoke]::IsWindowVisible($save) -and
+        if ($status.Contains($StatusText) -and [SumiSmoke]::IsWindowEnabled($Window) -and [SumiSmoke]::IsWindowVisible($save) -and
             [SumiSmoke]::IsWindowVisible($certificate) -and [SumiSmoke]::IsWindowEnabled($certificate) -and
             ([SumiSmoke]::IsWindowEnabled($save) -eq $CanSave) -and
             ([SumiSmoke]::IsWindowEnabled($watermark) -eq $CanPickImage)) { return }
@@ -235,21 +268,14 @@ try {
     # Keep the pending underline while switching to signing. The existing empty field is on page 2.
     [SumiSmoke]::Click($window, 107)
     Wait-SignatureState $window '青枠が選択した署名欄' $true $true
-    $pickerCert = New-SelfSignedCertificate -Type Custom -Subject ("CN=SumiPDF Picker " + [guid]::NewGuid()) -KeyUsage DigitalSignature -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.36') -CertStoreLocation Cert:\CurrentUser\My
-    [SumiSmoke]::Click($window, 131)
-    $timer.Restart()
-    $title = ''
-    do {
-        $popup = [SumiSmoke]::GetLastActivePopup($window)
-        if ($popup -ne $window -and [SumiSmoke]::IsWindowVisible($popup)) {
-            $title = [SumiSmoke]::ReadText($popup)
-            if ($title -eq 'Windows 証明書ストアから選ぶ') { break }
-        }
-        Start-Sleep -Milliseconds 50
-    } while ($timer.Elapsed.TotalSeconds -lt 15)
-    if ($title -ne 'Windows 証明書ストアから選ぶ') { throw "Certificate picker did not open. Active popup: '$title'." }
+    $pickerName = "SumiPDF Picker " + [guid]::NewGuid()
+    $pickerCert = New-SelfSignedCertificate -Type Custom -Subject "CN=$pickerName" -KeyUsage DigitalSignature -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.36') -CertStoreLocation Cert:\CurrentUser\My
+    $popup = Open-CertificatePicker $window $viewer.Id
+    [SumiSmoke]::ChooseCertificate($popup, $pickerName)
+    Wait-SignatureState $window "署名者：$pickerName" $true $true
+    $popup = Open-CertificatePicker $window $viewer.Id
     [SumiSmoke]::CloseDialog($popup)
-    Wait-SignatureState $window '青枠が選択した署名欄' $true $true
+    Wait-SignatureState $window "署名者：$pickerName" $true $true
     if ([SumiSmoke]::ReadText([SumiSmoke]::GetDlgItem($window, 111)) -ne '2 / 2') {
         throw 'Selecting the existing field did not navigate to its page.'
     }
