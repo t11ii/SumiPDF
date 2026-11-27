@@ -92,9 +92,13 @@ function Test-SigningPreferences([string]$ExecutablePath, [string]$InputPdf, [st
     } finally { $bitmap.Dispose() }
 
     foreach ($run in 1..4) {
-        $viewer = Start-SmokeViewer $ExecutablePath $profileDir @($InputPdf)
+        # Exercise the filename proposed by the viewer in the real Save dialog.
+        # Give each launch its own input so the proposed output is always new.
+        $runPdf = Join-Path $Folder "Preference test $run.pdf"
+        Copy-Item -LiteralPath $InputPdf -Destination $runPdf
+        $viewer = Start-SmokeViewer $ExecutablePath $profileDir @($runPdf)
         try {
-            $window = Wait-Page $viewer ([IO.Path]::GetFileName($InputPdf)) '1 / 2' ([Diagnostics.Stopwatch]::StartNew()) -Quiet
+            $window = Wait-Page $viewer ([IO.Path]::GetFileName($runPdf)) '1 / 2' ([Diagnostics.Stopwatch]::StartNew()) -Quiet
             [SumiSmoke]::Click($window, 107)
             Wait-SignatureState $window 'The blue box shows the selected signature field' $true $true
             if ($run -eq 1) {
@@ -111,8 +115,8 @@ function Test-SigningPreferences([string]$ExecutablePath, [string]$InputPdf, [st
             }
             # After opting in, the saved PFX must reach Save without another password prompt.
             $dialog = Wait-Dialog $viewer.Id 'Save a signed copy'
-            $out = Join-Path $Folder "GUI signed $run.pdf"
-            [SumiSmoke]::SetFileName($dialog, $out)
+            $out = Join-Path $Folder "Preference test $run-signed.pdf"
+            [SumiSmoke]::AcceptFileDialog($dialog)
             $notice = Wait-Dialog $viewer.Id 'SumiPDF'
             $expectedWatermark = @('pdf', 'png', 'pdf', 'builtin')[$run - 1]
             Assert-GuiSignature $out $Identity.Thumbprint $expectedWatermark

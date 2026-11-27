@@ -77,6 +77,33 @@ public static class SumiSmoke {
     static extern IntPtr SendString(IntPtr h, uint message, UIntPtr wparam, string text,
         uint flags, uint timeout, out UIntPtr result);
     public static void SetFileName(IntPtr dialog, string path) {
+        var timer = System.Diagnostics.Stopwatch.StartNew();
+        do {
+            var edit = FileNameEdit(dialog);
+            UIntPtr result;
+            if (edit != IntPtr.Zero && IsWindowVisible(edit) && IsWindowEnabled(edit)
+                && SendString(edit, 0x000c, UIntPtr.Zero, path, 2, 2000, out result) != IntPtr.Zero
+                && result != UIntPtr.Zero && ReadText(edit) == path) {
+                AcceptFileDialog(dialog);
+                return;
+            }
+            System.Threading.Thread.Sleep(30);
+        } while (timer.ElapsedMilliseconds < 8000);
+        throw new InvalidOperationException("Could not enter the filename in " + ReadText(dialog));
+    }
+    public static void AcceptFileDialog(IntPtr dialog) {
+        var timer = System.Diagnostics.Stopwatch.StartNew();
+        do {
+            var ok = GetDlgItem(dialog, 1);
+            if (ok != IntPtr.Zero && IsWindowVisible(ok) && IsWindowEnabled(ok)) {
+                Post(dialog, 0x0111, 1, ok);
+                return;
+            }
+            System.Threading.Thread.Sleep(30);
+        } while (timer.ElapsedMilliseconds < 8000);
+        throw new InvalidOperationException("The file dialog has no enabled confirmation button.");
+    }
+    static IntPtr FileNameEdit(IntPtr dialog) {
         // cmb13 can be a ComboBoxEx with a nested ComboBox and Edit.
         var edit = IntPtr.Zero;
         EnumChildWindows(dialog, (control, unused) => {
@@ -90,11 +117,7 @@ public static class SumiSmoke {
             return edit == IntPtr.Zero;
         }, IntPtr.Zero);
         if (edit == IntPtr.Zero) edit = GetDlgItem(dialog, 0x0480); // edt1
-        UIntPtr result;
-        if (edit == IntPtr.Zero || SendString(edit, 0x000c, UIntPtr.Zero, path, 2, 2000, out result) == IntPtr.Zero
-            || result == UIntPtr.Zero)
-            throw new InvalidOperationException("Could not set the file dialog's filename.");
-        Post(dialog, 0x0111, 1, GetDlgItem(dialog, 1)); // WM_COMMAND / IDOK
+        return edit;
     }
     public static void PasswordPreference(IntPtr dialog, bool remember) {
         var check = GetDlgItem(dialog, 1003);
@@ -415,7 +438,12 @@ try {
     & (Join-Path $PSScriptRoot 'signingCli.ps1') -Executable $exe -Pdf $fixture -SignedGuiFixture $signedFixture
     $identity = New-TestPfx $dir
     Test-PfxSigning $exe $signedFixture $dir $identity
-    Test-SigningPreferences $exe $fixture $dir $identity
+    $preferenceFailure = $null
+    try { Test-SigningPreferences $exe $fixture $dir $identity }
+    catch {
+        $preferenceFailure = $_
+        Write-Warning "Signing preference check failed at $($_.InvocationInfo.PositionMessage): $($_.Exception.Message)"
+    }
     if ((Test-Path "Cert:\CurrentUser\My\$($identity.Thumbprint)") -or (Test-Path "Cert:\LocalMachine\My\$($identity.Thumbprint)")) {
         throw 'The PFX test certificate was installed in a personal store.'
     }
@@ -560,6 +588,7 @@ try {
     if (-not $viewer.CloseMainWindow() -or -not $viewer.WaitForExit(5000) -or $viewer.ExitCode -ne 0) {
         throw 'The viewer did not close the signed document normally.'
     }
+    if ($null -ne $preferenceFailure) { throw $preferenceFailure }
 } finally {
     if ($null -ne $viewer) {
         if (-not $viewer.HasExited) { $viewer.Kill(); $viewer.WaitForExit() }

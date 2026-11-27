@@ -13,6 +13,9 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
+      - name: Check the executable distributed in the release ZIP
+        shell: pwsh
+        run: ./tests/smoke.ps1 -Executable ./dist/SumiPDF.exe -ScreenshotPath ./SumiPDF-reading.png
       - name: Install stable Rust
         run: rustup toolchain install stable --profile minimal --no-self-update
       - name: Test PDF signing and native rendering
@@ -24,9 +27,6 @@ jobs:
       - name: Open a PDF and navigate in the release viewer
         shell: pwsh
         run: ./tests/smoke.ps1 -Executable ./target/x86_64-pc-windows-msvc/release/SumiPDF.exe
-      - name: Check the executable distributed in the release ZIP
-        shell: pwsh
-        run: ./tests/smoke.ps1 -Executable ./dist/SumiPDF.exe -ScreenshotPath ./SumiPDF-reading.png
       - uses: actions/upload-artifact@v7
         with:
           name: SumiPDF-reading-preview
