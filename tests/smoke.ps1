@@ -20,9 +20,9 @@ public static class SumiSmoke {
     [DllImport("user32.dll")]
     public static extern bool IsWindowVisible(IntPtr window);
     [StructLayout(LayoutKind.Sequential)]
-    public struct Rect { public int Left, Top, Right, Bottom; }
+    struct Rect { public int Left, Top, Right, Bottom; }
     [DllImport("user32.dll", SetLastError=true)]
-    public static extern bool GetClientRect(IntPtr window, out Rect rect);
+    static extern bool GetClientRect(IntPtr window, out Rect rect);
     [DllImport("user32.dll")]
     static extern uint GetDpiForWindow(IntPtr window);
     [DllImport("user32.dll")]
@@ -108,8 +108,6 @@ public static class SumiSmoke {
     static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int w, int height, uint flags);
     [DllImport("user32.dll")]
     static extern int MapWindowPoints(IntPtr from, IntPtr to, ref Rect rect, uint count);
-    [DllImport("user32.dll")]
-    public static extern bool PrintWindow(IntPtr window, IntPtr dc, uint flags);
 
     public static void CheckResize(IntPtr window, int clientWidth, bool signing) {
         var previous = SetThreadDpiAwarenessContext(new IntPtr(-4));
@@ -268,38 +266,9 @@ function Wait-SignatureState([IntPtr]$Window, [string]$StatusText, [bool]$CanSav
     throw "Expected signature status '$StatusText', save $CanSave, watermark $CanPickImage; saw '$status'."
 }
 
-function Get-IconGlyph([IntPtr]$Window, [int]$Id) {
-    $button = [SumiSmoke]::GetDlgItem($Window, $Id)
-    $r = [SumiSmoke+Rect]::new()
-    if (![SumiSmoke]::GetClientRect($button, [ref]$r)) { throw "Could not measure icon $Id." }
-    $bitmap = [Drawing.Bitmap]::new($r.Right, $r.Bottom)
-    try {
-        $graphics = [Drawing.Graphics]::FromImage($bitmap)
-        try {
-            $dc = $graphics.GetHdc()
-            try {
-                if (![SumiSmoke]::PrintWindow($button, $dc, 1)) { throw "Could not capture icon $Id." }
-            } finally { $graphics.ReleaseHdc($dc) }
-        } finally { $graphics.Dispose() }
-        # Capture the central glyph, excluding focus rings and the button border.
-        $mask = [Text.StringBuilder]::new()
-        for ($y = [int]($r.Bottom * 0.22); $y -lt $r.Bottom * 0.78; $y++) {
-            for ($x = [int]($r.Right * 0.22); $x -lt $r.Right * 0.78; $x++) {
-                [void]$mask.Append([int]($bitmap.GetPixel($x, $y).GetBrightness() -lt 0.5))
-            }
-        }
-        $image = $mask.ToString()
-        if (!$image.Contains('0') -or !$image.Contains('1')) { throw "Icon $Id has no visible glyph." }
-        return $image
-    } finally { $bitmap.Dispose() }
-}
-
 function Test-ToolbarResize([IntPtr]$Window, [bool]$Signing) {
-    [SumiSmoke]::CheckResize($Window, 900, $Signing)
-    $before = Get-IconGlyph $Window 106
-    foreach ($width in @(650,649,440,700,480,900)) {
+    foreach ($width in @(900,650,649,440,700,480,900)) {
         [SumiSmoke]::CheckResize($Window, $width, $Signing)
-        if ((Get-IconGlyph $Window 106) -ne $before) { throw "The fit-page glyph changed at width $width." }
     }
 }
 

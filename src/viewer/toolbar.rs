@@ -221,6 +221,33 @@ mod tests {
         }
     }
 
+    fn glyph_pixels(button: HWND, dc: HDC) -> Vec<bool> {
+        let bounds = rect(button);
+        unsafe {
+            let memory = CreateCompatibleDC(dc);
+            let image = CreateCompatibleBitmap(dc, bounds.right, bounds.bottom);
+            assert!(!memory.is_null() && !image.is_null());
+            let old = SelectObject(memory, image);
+            FillRect(memory, &bounds, GetSysColorBrush(COLOR_BTNFACE));
+            SendMessageW(button, WM_PRINTCLIENT, memory as usize, PRF_CLIENT as isize);
+            let mut ink = Vec::new();
+            for y in bounds.bottom / 4..bounds.bottom * 3 / 4 {
+                for x in bounds.right / 4..bounds.right * 3 / 4 {
+                    let color = GetPixel(memory, x, y);
+                    ink.push((color & 0xff) < 128);
+                }
+            }
+            SelectObject(memory, old);
+            DeleteObject(image);
+            DeleteDC(memory);
+            assert!(
+                ink.contains(&true) && ink.contains(&false),
+                "button did not paint a glyph"
+            );
+            ink
+        }
+    }
+
     #[test]
     fn toolbar_buttons_render_distinct_glyphs_and_expose_their_japanese_labels() {
         unsafe {
@@ -285,6 +312,29 @@ mod tests {
             let (tip, name) = labels(&ui.toolbar, ui.watermark);
             assert!(tip.contains("指定画像") && tip == name);
             SelectObject(dc, old);
+            ReleaseDC(parent, dc);
+            ui.show_signing(true);
+            Controls::layout(parent);
+            let dc = GetDC(parent);
+            let icons = [ui.fit, ui.sign, ui.pfx];
+            let reference = icons.map(|button| glyph_pixels(button, dc));
+            for width in [440, 649, 650, 900] {
+                SetWindowPos(
+                    parent,
+                    null_mut(),
+                    0,
+                    0,
+                    dips(parent, width),
+                    480,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                Controls::layout(parent);
+                assert_eq!(
+                    icons.map(|button| glyph_pixels(button, dc)),
+                    reference,
+                    "width {width}"
+                );
+            }
             ReleaseDC(parent, dc);
             ui.toolbar.clear_names();
             DestroyWindow(parent);
