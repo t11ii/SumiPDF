@@ -1677,11 +1677,6 @@ impl App {
                     }
                     self.render();
                 }
-                WM_TIMER if msg.hwnd == self.hwnd && msg.wParam == find::TIMER => {
-                    if let Err(error) = self.start_find() {
-                        self.find_failed(&error);
-                    }
-                }
                 _ => unsafe {
                     TranslateMessage(&msg);
                     DispatchMessageW(&msg);

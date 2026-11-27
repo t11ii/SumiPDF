@@ -1,10 +1,15 @@
 //! Modeless document search. The UI acknowledges each scanned page before the
 //! worker proceeds, so results cannot accumulate while a native dialog is open.
 use super::*;
-use crate::{highlight::UnitRect, textselect::TextDocument, winpdf::SigningSource};
-use std::sync::{
-    Arc, Mutex,
-    mpsc::{SyncSender, TrySendError},
+use crate::{
+    highlight::UnitRect,
+    textselect::{SearchPageCache, TextDocument},
+    winpdf::SigningSource,
+};
+use std::{
+    sync::{Arc, Condvar, Mutex},
+    thread::JoinHandle,
+    time::{Duration, Instant},
 };
 use windows_sys::Win32::UI::Controls::{EM_SETLIMITTEXT, EM_SETSEL};
 
@@ -15,7 +20,7 @@ pub(super) const NEXT: usize = 163;
 pub(super) const CLOSE: usize = 164;
 const STATUS: usize = 165;
 const LABEL: usize = 166;
-pub(super) const TIMER: usize = 3;
+const COLD_DELAY: Duration = Duration::from_millis(160);
 const MAX_QUERY: usize = 256;
 const MAX_HITS: usize = 5_000;
 const MAX_RECTS: usize = 32_768;
@@ -138,20 +143,82 @@ enum PendingStep {
     Last,
 }
 
-// While a page or the document itself is being parsed, only the latest request
-// is useful. Keep one job and one wake-up, even if the user types continuously.
+#[derive(Default)]
+struct Pending {
+    job: Option<Job>,
+    // Closing Find must release its data even when another job replaces Release.
+    release_cache: bool,
+}
+
+#[derive(Default)]
+struct Mailbox {
+    pending: Mutex<Pending>,
+    changed: Condvar,
+}
+
+impl Mailbox {
+    fn post(&self, job: Job) {
+        let mut pending = self.pending.lock().unwrap();
+        pending.release_cache |= matches!(job, Job::Release);
+        pending.job = Some(job);
+        self.changed.notify_one();
+    }
+
+    fn receive(&self) -> (Job, bool) {
+        let pending = self.pending.lock().unwrap();
+        let mut ready = self
+            .changed
+            .wait_while(pending, |p| p.job.is_none())
+            .unwrap();
+        (
+            ready.job.take().unwrap(),
+            std::mem::take(&mut ready.release_cache),
+        )
+    }
+
+    // A newer edit interrupts the debounce. Never hold this lock while decoding
+    // or matching a page. A warm page has no deadline and can be read immediately.
+    fn superseded(&self, defer_until: Option<Instant>) -> bool {
+        let mut pending = self.pending.lock().unwrap();
+        if let Some(delay) = defer_until.and_then(|t| t.checked_duration_since(Instant::now())) {
+            pending = self
+                .changed
+                .wait_timeout_while(pending, delay, |p| p.job.is_none())
+                .unwrap()
+                .0;
+        }
+        pending.job.is_some()
+    }
+}
+
 struct SearchWorker {
-    job: Arc<Mutex<Option<Job>>>,
-    wake: SyncSender<()>,
+    mailbox: Arc<Mailbox>,
+    thread: JoinHandle<()>,
 }
 
 impl SearchWorker {
+    fn new(hwnd: usize, events: Sender<Event>) -> Result<Self, String> {
+        let mailbox = Arc::new(Mailbox::default());
+        let reader = Arc::clone(&mailbox);
+        let thread = std::thread::Builder::new()
+            .name("pdf-find".into())
+            .spawn(move || run(hwnd, &reader, events))
+            .map_err(|e| e.to_string())?;
+        Ok(Self { mailbox, thread })
+    }
+
     fn send(&self, job: Job) -> Result<(), String> {
-        *self.job.lock().unwrap() = Some(job);
-        match self.wake.try_send(()) {
-            Ok(()) | Err(TrySendError::Full(())) => Ok(()),
-            Err(TrySendError::Disconnected(())) => Err("Search service stopped.".into()),
+        if self.thread.is_finished() {
+            return Err("Search service stopped.".into());
         }
+        self.mailbox.post(job);
+        Ok(())
+    }
+}
+
+impl Drop for SearchWorker {
+    fn drop(&mut self) {
+        self.mailbox.post(Job::Stop);
     }
 }
 
@@ -161,9 +228,12 @@ enum Job {
         revision: u64,
         source: SigningSource,
         query: String,
+        cold_after: Instant,
     },
     Next(u64),
+    Cancel,
     Release,
+    Stop,
 }
 
 pub(super) struct Page {
@@ -180,11 +250,18 @@ struct Scan {
     page: u32,
     hits: usize,
     boxes: usize,
+    cold_after: Instant,
+}
+
+struct SearchDocument {
+    revision: u64,
+    doc: TextDocument,
+    pages: SearchPageCache,
 }
 
 impl Scan {
-    fn next(&mut self, doc: &TextDocument) -> Page {
-        let result = doc.search_page(self.page, &self.query);
+    fn next(&mut self, document: &mut SearchDocument) -> Page {
+        let result = document.pages.search(&document.doc, self.page, &self.query);
         let skipped = result.is_err();
         let mut hits = Vec::new();
         let mut limited = false;
@@ -206,22 +283,23 @@ impl Scan {
             index,
             hits,
             skipped,
-            last: limited || self.page as usize >= doc.page_count(),
+            last: limited || self.page as usize >= document.doc.page_count(),
             limited,
         }
     }
 }
 
-fn run(hwnd: usize, wake: Receiver<()>, pending: Arc<Mutex<Option<Job>>>, events: Sender<Event>) {
-    let mut cache: Option<(u64, TextDocument)> = None;
+fn run(hwnd: usize, mailbox: &Mailbox, events: Sender<Event>) {
+    let mut cache: Option<SearchDocument> = None;
     let mut scan: Option<Scan> = None;
-    while wake.recv().is_ok() {
-        let Some(job) = pending.lock().unwrap().take() else {
-            continue;
-        };
+    loop {
+        let (job, release) = mailbox.receive();
+        if release {
+            cache = None;
+        }
         match job {
-            Job::Release => {
-                cache = None;
+            Job::Stop => return,
+            Job::Release | Job::Cancel => {
                 scan = None;
                 continue;
             }
@@ -230,14 +308,24 @@ fn run(hwnd: usize, wake: Receiver<()>, pending: Arc<Mutex<Option<Job>>>, events
                 revision,
                 source,
                 query,
+                cold_after,
             } => {
-                if cache.as_ref().is_none_or(|(id, _)| *id != revision) {
+                if cache.as_ref().is_none_or(|d| d.revision != revision) {
                     cache = None;
+                    if mailbox.superseded(Some(cold_after)) {
+                        continue;
+                    }
                     match source
                         .read_for_search()
                         .and_then(|bytes| TextDocument::load_for_search(&bytes))
                     {
-                        Ok(doc) => cache = Some((revision, doc)),
+                        Ok(doc) => {
+                            cache = Some(SearchDocument {
+                                revision,
+                                doc,
+                                pages: SearchPageCache::default(),
+                            })
+                        }
                         Err(error) => {
                             scan = None;
                             worker::report(hwnd, &events, Event::Find(epoch, Err(error)));
@@ -251,14 +339,18 @@ fn run(hwnd: usize, wake: Receiver<()>, pending: Arc<Mutex<Option<Job>>>, events
                     page: 0,
                     hits: 0,
                     boxes: 0,
+                    cold_after,
                 });
             }
             Job::Next(epoch) if scan.as_ref().is_some_and(|s| s.epoch == epoch) => {}
             Job::Next(_) => continue,
         }
-        let superseded = pending.lock().unwrap().is_some();
-        if !superseded && let (Some((_, doc)), Some(current)) = (&cache, &mut scan) {
-            let page = current.next(doc);
+        if let (Some(document), Some(current)) = (&mut cache, &mut scan) {
+            let deadline = (!document.pages.contains(current.page)).then_some(current.cold_after);
+            if mailbox.superseded(deadline) {
+                continue;
+            }
+            let page = current.next(document);
             let last = page.last;
             worker::report(hwnd, &events, Event::Find(current.epoch, Ok(page)));
             if last {
@@ -298,7 +390,6 @@ impl App {
             let _ = worker.send(Job::Release);
         }
         unsafe {
-            KillTimer(self.hwnd, TIMER);
             if self.ui.find.controls.contains(&GetFocus()) {
                 SetFocus(self.ui.canvas);
             }
@@ -333,47 +424,30 @@ impl App {
         self.find.skipped = 0;
         self.find.pending_step = None;
         self.clear_find_hits();
-        unsafe {
-            KillTimer(self.hwnd, TIMER);
-        }
         if self.find.scanning {
             set_text(self.ui.find.status, "Searching…");
-            if unsafe { SetTimer(self.hwnd, TIMER, 160, None) } == 0
-                && let Err(error) = self.start_find()
-            {
+            if let Err(error) = self.start_find() {
                 self.find_failed(&error);
             }
+        } else if let Some(worker) = &self.find.worker {
+            let _ = worker.send(Job::Cancel);
         }
     }
 
-    pub(super) fn start_find(&mut self) -> Result<(), String> {
-        unsafe {
-            KillTimer(self.hwnd, TIMER);
-        }
-        if !self.find.open || !self.find.scanning {
-            return Ok(());
-        }
+    fn start_find(&mut self) -> Result<(), String> {
         let Some(doc) = &self.document else {
             return Ok(());
         };
         let source = doc.source.as_ref().map_err(Clone::clone)?.clone();
         if self.find.worker.is_none() {
-            let (wake, rx) = mpsc::sync_channel(1);
-            let job = Arc::new(Mutex::new(None));
-            let pending = Arc::clone(&job);
-            let events = self.events.clone();
-            let hwnd = self.hwnd as usize;
-            std::thread::Builder::new()
-                .name("pdf-find".into())
-                .spawn(move || run(hwnd, rx, pending, events))
-                .map_err(|e| e.to_string())?;
-            self.find.worker = Some(SearchWorker { job, wake });
+            self.find.worker = Some(SearchWorker::new(self.hwnd as usize, self.events.clone())?);
         }
         self.find.worker.as_ref().unwrap().send(Job::Start {
             epoch: self.find.epoch,
             revision: self.revision,
             source,
             query: self.find.query.clone(),
+            cold_after: Instant::now() + COLD_DELAY,
         })
     }
 
@@ -524,5 +598,25 @@ impl App {
             canvas::redraw(self.ui.canvas);
             self.render();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replacing_a_release_still_discards_the_cache_once() {
+        let mailbox = Mailbox::default();
+        mailbox.post(Job::Release);
+        mailbox.post(Job::Cancel);
+        assert!(mailbox.superseded(Some(Instant::now() + COLD_DELAY)));
+        let (job, release) = mailbox.receive();
+        assert!(release && matches!(job, Job::Cancel));
+        assert!(!mailbox.superseded(None));
+
+        mailbox.post(Job::Next(3));
+        let (job, release) = mailbox.receive();
+        assert!(!release && matches!(job, Job::Next(3)));
     }
 }

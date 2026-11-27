@@ -2,6 +2,7 @@
 mod fonts;
 mod search;
 mod standard;
+pub(crate) use search::SearchPageCache;
 pub(crate) const HELVETICA_WIDTHS: &[u16; 95] = &standard::HELVETICA;
 
 use crate::highlight::{Direction, PageGeometry, TextRun, UnitRect, inherited};
@@ -45,6 +46,7 @@ impl TextDocument {
         self.pages.len()
     }
 
+    #[cfg(test)]
     pub fn search_page(&self, index: u32, query: &str) -> Result<Vec<Vec<UnitRect>>, String> {
         let (layout, text) = self.scan_page(index, Some(SearchText::default()))?;
         Ok(text.map_or_else(Vec::new, |text| text.matches(&layout, query)))

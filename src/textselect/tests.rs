@@ -227,3 +227,59 @@ fn winansi_text_and_following_glyphs_remain_searchable() {
     let doc = TextDocument::from_document(doc);
     assert_eq!(doc.search_page(0, "CAFÉ STRASSE").unwrap().len(), 1);
 }
+
+#[test]
+fn rereading_cached_text_preserves_the_original_match_rectangles() {
+    for angle in [0, 90, 180, 270] {
+        let doc = TextDocument::load_for_search(&sample(angle)).unwrap();
+        let mut cache = SearchPageCache::default();
+        assert!(!cache.contains(0));
+        for query in ["absent", "aB  cd", "東", "東京", "ab", "　"] {
+            assert_eq!(
+                cache.search(&doc, 0, query).unwrap(),
+                doc.search_page(0, query).unwrap()
+            );
+            assert!(cache.contains(0));
+        }
+        let bytes = cache.retained_bytes();
+        assert!(cache.search(&doc, 1, "ab").is_err());
+        assert!(!cache.contains(1));
+        assert_eq!(cache.retained_bytes(), bytes);
+    }
+}
+
+#[test]
+fn repeated_full_scans_keep_the_pages_that_fit_and_search_the_rest() {
+    let mut doc = TextDocument::load_for_search(&sample(0)).unwrap();
+    let page = doc.pages[0];
+    doc.pages.push(page);
+    let expected = doc.search_page(0, "東京").unwrap();
+    assert_eq!(expected.len(), 1);
+
+    let mut probe = SearchPageCache::default();
+    probe.search(&doc, 0, "東京").unwrap();
+    let limit = probe.retained_bytes();
+    for budget in [0, limit - 1, limit] {
+        let mut cache = SearchPageCache::with_limit(budget);
+        for _ in 0..3 {
+            for index in 0..2 {
+                assert_eq!(cache.search(&doc, index, "東京").unwrap(), expected);
+            }
+            assert_eq!(cache.contains(0), budget == limit);
+            assert!(!cache.contains(1));
+            assert!(cache.retained_bytes() <= budget);
+        }
+    }
+
+    // An oversized first page must not prevent a subsequent small page from fitting.
+    let mut blank = doc.doc.get_dictionary(page).unwrap().clone();
+    blank.remove(b"Contents");
+    doc.pages.push(doc.doc.add_object(blank));
+    let mut blank_only = SearchPageCache::default();
+    assert!(blank_only.search(&doc, 2, "東京").unwrap().is_empty());
+    let mut cache = SearchPageCache::with_limit(blank_only.retained_bytes());
+    assert_eq!(cache.search(&doc, 0, "東京").unwrap(), expected);
+    assert!(!cache.contains(0));
+    assert!(cache.search(&doc, 2, "東京").unwrap().is_empty());
+    assert!(cache.contains(2));
+}

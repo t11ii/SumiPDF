@@ -1,5 +1,100 @@
-use super::{Direction, LIMIT, TextLayout, UnitRect, fonts::Font};
+use super::{Direction, LIMIT, Line, TextDocument, TextLayout, UnitRect, fonts::Font};
 use lopdf::{Dictionary, Document, Encoding, Object, content::Content};
+
+struct CachedPage {
+    index: u32,
+    layout: TextLayout,
+    text: SearchText,
+}
+
+impl CachedPage {
+    fn heap_bytes(&self) -> usize {
+        self.layout.glyphs.capacity() * size_of::<UnitRect>()
+            + self.layout.lines.capacity() * size_of::<Line>()
+            + self.text.text.capacity()
+            + self.text.ends.capacity() * size_of::<usize>()
+            + self.text.decoded.capacity()
+    }
+}
+
+/// Owned by Find for one open document. Keep the first pages that fit: Find
+/// visits pages in order, so a later full scan always benefits from that prefix.
+pub(crate) struct SearchPageCache {
+    pages: Vec<CachedPage>,
+    page_bytes: usize,
+    byte_limit: usize,
+}
+
+impl Default for SearchPageCache {
+    fn default() -> Self {
+        Self::with_limit(8 * 1024 * 1024)
+    }
+}
+
+impl SearchPageCache {
+    pub(super) fn with_limit(byte_limit: usize) -> Self {
+        Self {
+            pages: Vec::new(),
+            page_bytes: 0,
+            byte_limit,
+        }
+    }
+    fn position(&self, index: u32) -> Result<usize, usize> {
+        self.pages.binary_search_by_key(&index, |p| p.index)
+    }
+
+    pub(crate) fn contains(&self, index: u32) -> bool {
+        self.position(index).is_ok()
+    }
+
+    pub(super) fn retained_bytes(&self) -> usize {
+        self.page_bytes + self.pages.capacity() * size_of::<CachedPage>()
+    }
+
+    pub(crate) fn search(
+        &mut self,
+        doc: &TextDocument,
+        index: u32,
+        query: &str,
+    ) -> Result<Vec<Vec<UnitRect>>, String> {
+        let insert_at = match self.position(index) {
+            Ok(slot) => {
+                let entry = &self.pages[slot];
+                return Ok(entry.text.matches(&entry.layout, query));
+            }
+            Err(slot) => slot,
+        };
+        let (layout, text) = doc.scan_page(index, Some(SearchText::default()))?;
+        let text = text.expect("successful search scan returns its text");
+        let hits = text.matches(&layout, query);
+        self.retain(
+            insert_at,
+            CachedPage {
+                index,
+                layout,
+                text,
+            },
+        );
+        Ok(hits)
+    }
+
+    fn retain(&mut self, slot: usize, entry: CachedPage) {
+        let bytes = entry.heap_bytes();
+        let room = self.byte_limit - self.retained_bytes();
+        if bytes > room {
+            return;
+        }
+        if self.pages.len() == self.pages.capacity() {
+            // Grow the lookup table geometrically within the same budget.
+            let slots = ((room - bytes) / size_of::<CachedPage>()).min(self.pages.len().max(1));
+            if slots == 0 || self.pages.try_reserve_exact(slots).is_err() {
+                return;
+            }
+        }
+        self.pages.insert(slot, entry);
+        self.page_bytes += bytes;
+    }
+}
 
 pub(super) enum Decoder<'a> {
     Simple(Encoding<'a>),
