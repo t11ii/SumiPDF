@@ -10,16 +10,19 @@ function Select-TestPfx([Diagnostics.Process]$Viewer, [IntPtr]$Window, $Identity
 
 function Wait-WatermarkButton([IntPtr]$Window, [bool]$Custom) {
     $timer = [Diagnostics.Stopwatch]::StartNew()
-    $label = if ($Custom) { 'Choose watermark (custom image)' } else { 'Choose watermark (default)' }
+    $labels = if ($Custom) {
+        @('Choose watermark (custom image)', 'Signature appearance (custom watermark)')
+    } else {
+        @('Choose watermark (default)', 'Signature appearance (default watermark)')
+    }
     do {
-        if ([SumiSmoke]::IsWindowEnabled($Window) -and [ReadingProbe]::ControlName($Window, 128) -eq $label) { return }
+        if ([SumiSmoke]::IsWindowEnabled($Window) -and [ReadingProbe]::ControlName($Window, 128) -in $labels) { return }
         Start-Sleep -Milliseconds 40
     } while ($timer.ElapsedMilliseconds -lt 10000)
     throw 'The watermark menu did not save the expected choice.'
 }
 
-function Assert-GuiSignature([string]$OutputPdf, [string]$Thumbprint, [string]$Watermark) {
-    # This fixture has one signature and its only image is the optional PNG.
+function Assert-GuiSignature([string]$OutputPdf, [string]$Thumbprint, [string]$Watermark, [string]$SignatureImage) {
     # Verify the actual CMS signature and its signer using the PDF's signed byte ranges.
     $bytes = [IO.File]::ReadAllBytes($OutputPdf)
     $pdf = [Text.Encoding]::Latin1.GetString($bytes)
@@ -35,6 +38,21 @@ function Assert-GuiSignature([string]$OutputPdf, [string]$Thumbprint, [string]$W
         if (($Watermark -eq 'png' -and ($width -ne 17 -or $height -ne 9)) -or
             ($Watermark -eq 'pdf' -and ($height -le 9 -or $width -ne 2 * $height))) {
             throw "Wrong image for the selected $Watermark watermark ($width x $height)."
+        }
+    }
+    $left = [regex]::Match($pdf, '/SignatureImage\s+(\d+)\s+(\d+)\s+R')
+    if ($left.Success -ne ($SignatureImage -ne 'none')) {
+        throw "Unexpected signature image in $OutputPdf."
+    }
+    if ($left.Success) {
+        $objectPattern = "(?ms)^$($left.Groups[1].Value) $($left.Groups[2].Value) obj\s*<<(.*?)>>\s*stream"
+        $dict = [regex]::Match($pdf, $objectPattern).Groups[1].Value
+        $width = [int][regex]::Match($dict, '/Width\s+(\d+)').Groups[1].Value
+        $height = [int][regex]::Match($dict, '/Height\s+(\d+)').Groups[1].Value
+        $alpha = $dict -match '/SMask\b'
+        if (($SignatureImage -eq 'png' -and ($width -ne 19 -or $height -ne 7 -or !$alpha)) -or
+            ($SignatureImage -eq 'jpeg' -and ($width -ne 16 -or $height -ne 8 -or $alpha))) {
+            throw "Wrong signature image in $OutputPdf ($width x $height, alpha $alpha)."
         }
     }
     $range = [regex]::Match($pdf, '/ByteRange\s*\[\s*0\s+(\d+)\s+(\d+)\s+(\d+)\s*\]')
@@ -78,6 +96,14 @@ function Test-SigningPreferences([string]$ExecutablePath, [string]$InputPdf, [st
         $bitmap.SetPixel(5, 4, [Drawing.Color]::Red)
         $bitmap.Save($logo, [Drawing.Imaging.ImageFormat]::Png)
     } finally { $bitmap.Dispose() }
+    $signaturePng = Join-Path $Folder '手書きサイン.png'
+    $signatureJpeg = Join-Path $PSScriptRoot 'fixtures/SignatureImage.jpg'
+    $signatureSetting = Join-Path $profileDir 'SumiPDF/signatureImage.json'
+    $bitmap = [Drawing.Bitmap]::new(19, 7)
+    try {
+        $bitmap.SetPixel(9, 3, [Drawing.Color]::Blue)
+        $bitmap.Save($signaturePng, [Drawing.Imaging.ImageFormat]::Png)
+    } finally { $bitmap.Dispose() }
 
     foreach ($run in 1..4) {
         # Exercise the filename proposed by the viewer in the real Save dialog.
@@ -95,6 +121,26 @@ function Test-SigningPreferences([string]$ExecutablePath, [string]$InputPdf, [st
                 Wait-SignatureState $window "Signer: $($Identity.Name)" $true $true
             }
             Wait-WatermarkButton $window ($run -lt 4)
+            $supportsImage = [ReadingProbe]::ControlName($window, 128).StartsWith('Signature appearance')
+            $expectedImage = 'none'
+            if ($supportsImage) {
+                $expectedImage = @('png', 'png', 'jpeg', 'none')[$run - 1]
+                if ($run -in 1, 3) {
+                    [SumiSmoke]::PickWatermark($window, 4)
+                    $path = if ($run -eq 1) { $signaturePng } else { $signatureJpeg }
+                    $imageDialog = Wait-Dialog $viewer.Id 'Choose a PNG or JPEG signature image'
+                    [SumiSmoke]::SetFileName($imageDialog, $path)
+                    Wait-SignatureState $window "Signer: $($Identity.Name)" $true $true
+                } elseif ($run -eq 4) {
+                    if (!(Test-Path -LiteralPath $signatureSetting)) { throw 'The selected signature image was not remembered.' }
+                    [SumiSmoke]::PickWatermark($window, 3)
+                    $timer = [Diagnostics.Stopwatch]::StartNew()
+                    while ((Test-Path -LiteralPath $signatureSetting) -and $timer.ElapsedMilliseconds -lt 5000) {
+                        Start-Sleep -Milliseconds 40
+                    }
+                    if (Test-Path -LiteralPath $signatureSetting) { throw 'The signature image choice did not clear.' }
+                }
+            }
             [SumiSmoke]::Click($window, 129)
             if ($run -eq 4) {
                 $prompt = Wait-Dialog $viewer.Id 'PFX password'
@@ -113,7 +159,7 @@ function Test-SigningPreferences([string]$ExecutablePath, [string]$InputPdf, [st
                 throw 'The signed copy is offering to edit annotations.'
             }
             $expectedWatermark = @('pdf', 'png', 'pdf', 'builtin')[$run - 1]
-            Assert-GuiSignature $out $Identity.Thumbprint $expectedWatermark
+            Assert-GuiSignature $out $Identity.Thumbprint $expectedWatermark $expectedImage
             if ($run -lt 4) {
                 $original = [IO.Path]::GetFileName($runPdf)
                 [ReadingProbe]::ClickTab($window, $original)

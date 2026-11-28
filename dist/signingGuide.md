@@ -33,6 +33,7 @@ $rect = '0.5,0.75,0.9,0.85'
 & $exe --sign $pdf --page 2 --rect $rect --expect-sha256 $info.sha256 --out '.\契約書-署名済.pdf' | Out-Host
 ```
 
+- `--signature-image '.\signature.jpg'` で、可視署名の左半分に PNG または JPEG を配置できます。右半分には証明書の氏名と、行を分けた **Date** と **Time**（UTC）を表示します。
 - `--watermark` を省略すると、SumiPDF の標準の透かしを使用します。同梱の `watermarkDesigner.html` では、手描きや文字を組み合わせて透過 PNG を作れます。
 - PFX を使うときは `--sign` に `--pfx "C:\署名\自分の証明書.pfx"` を付けます。パスワードは本人が画面で入力します。署名用証明書が複数あれば選択画面が開きます。Windows の個人ストアへの事前登録は不要です。
 - `--certificate` と `--pfx` を両方省略すると 証明書の氏名と Windows ストアの格納先を一覧で確認できます。指定した証明書で処理する場合は `--certificates` の JSON で氏名（`name`）、拇印（`thumbprint`）、格納先（`store`）を確認し、`--certificate <thumbprint>` を付けます。IC カード等の鍵は PIN 入力を要求することがあります。
@@ -42,6 +43,6 @@ $rect = '0.5,0.75,0.9,0.85'
 
 ## 画面で署名するときの初期設定
 
-署名ツールで最後に選んだ透かしのパスと証明書を、Windows ユーザーごとに記憶します。PFX のパスワードも省略する場合は、入力時に **Remember password on this PC** を選びます。Windows の DPAPI で暗号化したデータをローカルに保存します。**Alt + Space → Forget saved signing certificate** で、証明書の選択と記憶したパスワードを消去できます。
+署名ツールで最後に選んだ透かしと署名画像のパス、証明書を Windows ユーザーごとに記憶します。PFX のパスワードも省略する場合は、入力時に **Remember password on this PC** を選びます。Windows の DPAPI で暗号化したデータをローカルに保存します。**Alt + Space → Forget saved signing certificate** で、証明書の選択と記憶したパスワードを消去できます。
 
 Acrobat DC 用のカスタム透かし `%APPDATA%\Adobe\Acrobat\DC\Security\SignatureLogo.pdf` を設定済みなら、初回から背景に使います。別の場所にある1ページの PDF は **Choose Acrobat watermark PDF…** で選択できます。コマンドラインで署名する場合は、上記の `--certificate`、`--pfx`、`--watermark` で署名ごとに指定します。

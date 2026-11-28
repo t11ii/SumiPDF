@@ -5,7 +5,7 @@ $inputPdf = (Resolve-Path -LiteralPath $Pdf).Path
 $folder = Join-Path ([IO.Path]::GetTempPath()) ("SumiPDF CLI " + [guid]::NewGuid())
 [void][IO.Directory]::CreateDirectory($folder)
 
-function Invoke-SignCli([string[]]$Arguments, [switch]$ExpectError) {
+function Invoke-SignCli([string[]]$Arguments, [switch]$ExpectError, [switch]$PlainText) {
     $start = [Diagnostics.ProcessStartInfo]::new($binary)
     $start.UseShellExecute = $false
     $start.RedirectStandardOutput = $true
@@ -23,6 +23,7 @@ function Invoke-SignCli([string[]]$Arguments, [switch]$ExpectError) {
             return
         }
         if ($proc.ExitCode -ne 0) { throw "$($Arguments[0]) failed: $($stderr.Result)" }
+        if ($PlainText) { return $stdout.Result }
         return ($stdout.Result | ConvertFrom-Json)
     } finally { $proc.Dispose() }
 }
@@ -70,11 +71,15 @@ try {
         throw 'The original empty field is unavailable for the second signer'
     }
     $signed = Join-Path $folder '契約書 署名済.pdf'
-    $signArgs = @('--sign',$area,'--out',$signed,'--field',$field[0].id,'--watermark',$logo,'--certificate',$reviewer.Thumbprint,'--expect-sha256')
+    $signArgs = @('--sign',$area,'--out',$signed,'--field',$field[0].id,'--watermark',$logo,'--certificate',$reviewer.Thumbprint)
+    $supportsImage = (Invoke-SignCli @('--help') -PlainText).Contains('--signature-image')
+    if ($supportsImage) { $signArgs += @('--signature-image', (Join-Path $PSScriptRoot 'fixtures/SignatureImage.jpg')) }
+    $signArgs += '--expect-sha256'
     Invoke-SignCli -Arguments ($signArgs + ('0'*64)) -ExpectError
     if (Test-Path $signed) { throw 'Hash mismatch produced a signed file' }
     $result = Invoke-SignCli ($signArgs + $first.sha256)
     if ($result.signer -ne $reviewerName -or $result.page -ne 2 -or $result.sha256 -ne (Get-FileHash $signed).Hash) { throw 'Second signature output mismatch' }
+    if ($supportsImage -and [Text.Encoding]::Latin1.GetString([IO.File]::ReadAllBytes($signed)) -notmatch '/SignatureImage\s+\d+\s+\d+\s+R') { throw 'The CLI signature image is missing.' }
     $signedPng = Join-Path $folder 'signed-page.png'
     $preview = Invoke-SignCli @('--preview',$signed,'--page','2','--out',$signedPng)
     $pageImage = [Drawing.Bitmap]::new($signedPng)

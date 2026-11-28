@@ -144,7 +144,7 @@ public static class SumiSmoke {
                 GetWindowThreadProcessId(menu, out menuPid);
                 if (menuPid != pid || !IsWindowVisible(menu)) continue;
                 // Enter the item's unique mnemonic in the native popup's menu loop.
-                Post(menu, 0x0102, "dpa"[index], new IntPtr(1)); // WM_CHAR
+                Post(menu, 0x0102, "dpani"[index], new IntPtr(1)); // WM_CHAR
                 return;
             }
             System.Threading.Thread.Sleep(25);
@@ -192,8 +192,10 @@ public static class SumiSmoke {
     public static void CheckResize(IntPtr window, int clientWidth, bool signing) {
         var previous = SetThreadDpiAwarenessContext(new IntPtr(-4));
         try {
-            Rect outer, client;
-            if (!GetWindowRect(window, out outer) || !GetClientRect(window, out client))
+            Rect outer, client, iconBefore;
+            // Measure the starting size so the same smoke test covers older release builds.
+            if (!GetWindowRect(window, out outer) || !GetClientRect(window, out client) ||
+                !GetWindowRect(GetDlgItem(window, 101), out iconBefore))
                 throw new Win32Exception(Marshal.GetLastWin32Error());
             int dpi = (int)GetDpiForWindow(window);
             int width = (clientWidth * dpi + 48) / 96;
@@ -217,7 +219,8 @@ public static class SumiSmoke {
                 Rect r;
                 if (!IsWindowVisible(button) || !GetWindowRect(button, out r)) throw new InvalidOperationException("Missing icon " + id);
                 MapWindowPoints(IntPtr.Zero, window, ref r, 2);
-                if (r.Right - r.Left != (36 * dpi + 48) / 96 || r.Bottom - r.Top != (32 * dpi + 48) / 96 ||
+                if (r.Right - r.Left != iconBefore.Right - iconBefore.Left ||
+                    r.Bottom - r.Top != iconBefore.Bottom - iconBefore.Top ||
                     r.Left < 0 || r.Top < 0 || r.Right > width || r.Bottom > client.Bottom)
                     throw new InvalidOperationException("Clipped or resized icon " + id + " at width " + clientWidth);
                 foreach (var other in occupied)
@@ -345,7 +348,7 @@ function Wait-SignatureState([IntPtr]$Window, [string]$StatusText, [bool]$CanSav
 }
 
 function Test-ToolbarResize([IntPtr]$Window, [bool]$Signing) {
-    foreach ($width in @(900,690,689,440,700,480,900)) {
+    foreach ($width in @(900,690,689,524,523,440,700,480,900)) {
         [SumiSmoke]::CheckResize($Window, $width, $Signing)
     }
 }

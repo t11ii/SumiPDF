@@ -135,9 +135,13 @@ fn signs_only_the_selected_nested_field_and_its_separate_widget() {
         locate(&original, &target).unwrap(),
         (2, [0.25, 0.25, 0.75, 0.5])
     );
-    let signed = sign_visible(original.clone(), &target, "Test Signer", None, |_, _| {
-        Ok(vec![0x30])
-    })
+    let signed = sign_visible(
+        original.clone(),
+        &target,
+        "Test Signer",
+        Artwork::default(),
+        |_, _| Ok(vec![0x30]),
+    )
     .unwrap();
     assert!(signed.starts_with(&original));
     let parsed = Document::load_mem(&signed).unwrap();
@@ -206,7 +210,10 @@ fn merged_fields_update_in_place_and_restricted_fields_are_never_offered() {
     let source = serialize(doc.clone(), false);
     let listing = inspect(&source).unwrap();
     let target = Target::Field(listing["fields"][0]["id"].as_str().unwrap().to_owned());
-    let signed = sign_visible(source, &target, "Reviewer", None, |_, _| Ok(vec![1])).unwrap();
+    let signed = sign_visible(source, &target, "Reviewer", Artwork::default(), |_, _| {
+        Ok(vec![1])
+    })
+    .unwrap();
     let parsed = Document::load_mem(&signed).unwrap();
     let merged = parsed.get_dictionary(field).unwrap();
     assert!(merged.has(b"V") && merged.has(b"AP"));
@@ -236,7 +243,16 @@ fn merged_fields_update_in_place_and_restricted_fields_are_never_offered() {
             "{key}"
         );
         assert!(locate(&bytes, &target).is_err());
-        assert!(sign_visible(bytes, &target, "Reviewer", None, |_, _| panic!()).is_err());
+        assert!(
+            sign_visible(
+                bytes,
+                &target,
+                "Reviewer",
+                Artwork::default(),
+                |_, _| panic!()
+            )
+            .is_err()
+        );
     }
 }
 
@@ -283,8 +299,14 @@ fn new_visible_fields_follow_the_rendered_crop_at_all_quarter_turns() {
             rect: unit,
         };
         assert_eq!(locate(&original, &target).unwrap(), (2, unit));
-        let signed =
-            sign_visible(original, &target, "Test Signer", None, |_, _| Ok(vec![1])).unwrap();
+        let signed = sign_visible(
+            original,
+            &target,
+            "Test Signer",
+            Artwork::default(),
+            |_, _| Ok(vec![1]),
+        )
+        .unwrap();
         let parsed = Document::load_mem(&signed).unwrap();
         let annots = array(&parsed, parsed.get_dictionary(page).unwrap(), b"Annots").unwrap();
         assert_eq!(annots.len(), 2);
@@ -344,7 +366,7 @@ fn ambiguous_widgets_and_duplicate_terminal_names_cannot_be_selected() {
             inspect(&bytes).unwrap()["fields"].as_array().unwrap().len(),
             0
         );
-        assert!(sign_visible(bytes, &id, "Test", None, |_, _| panic!()).is_err());
+        assert!(sign_visible(bytes, &id, "Test", Artwork::default(), |_, _| panic!()).is_err());
     }
 }
 
@@ -356,9 +378,13 @@ fn a_transparent_signature_upgrades_an_older_catalog_and_keeps_its_new_form() {
         page: 1,
         rect: [0.0, 0.0, 0.8, 0.3],
     };
-    let bytes = sign_visible(serialize(doc, false), &target, "Test", None, |_, _| {
-        Ok(vec![1])
-    })
+    let bytes = sign_visible(
+        serialize(doc, false),
+        &target,
+        "Test",
+        Artwork::default(),
+        |_, _| Ok(vec![1]),
+    )
     .unwrap();
     let parsed = Document::load_mem(&bytes).unwrap();
     assert_eq!(
@@ -406,7 +432,16 @@ fn refuses_invalid_area_before_calling_the_provider() {
     ] {
         let target = Target::Area { page, rect };
         assert!(locate(&bytes, &target).is_err());
-        assert!(sign_visible(bytes.clone(), &target, "Test", None, |_, _| panic!()).is_err());
+        assert!(
+            sign_visible(
+                bytes.clone(),
+                &target,
+                "Test",
+                Artwork::default(),
+                |_, _| panic!()
+            )
+            .is_err()
+        );
     }
 }
 
@@ -711,7 +746,7 @@ fn verify_with_openssl_and_poppler() {
                 unsigned.clone(),
                 first_target,
                 "SumiPDF Alice",
-                None,
+                Artwork::default(),
                 &alice,
             )
             .unwrap()
@@ -740,13 +775,23 @@ fn verify_with_openssl_and_poppler() {
                 first.clone(),
                 &first_id,
                 "SumiPDF Bob",
-                None,
+                Artwork::default(),
                 |_, _| panic!()
             )
             .is_err()
         );
 
-        let both = sign_visible(first.clone(), second_target, "SumiPDF Bob", None, &bob).unwrap();
+        let both = sign_visible(
+            first.clone(),
+            second_target,
+            "SumiPDF Bob",
+            Artwork {
+                signature_image: Some(include_bytes!("../tests/fixtures/SignatureImage.jpg")),
+                ..Artwork::default()
+            },
+            &bob,
+        )
+        .unwrap();
         assert!(both.starts_with(&first));
         let after = Document::load_mem(&both).unwrap();
         assert!(after.xref_recovery.is_none());
@@ -836,7 +881,7 @@ fn renders_the_same_upright_stamp_at_all_page_rotations() {
             serialize(doc, false),
             &target,
             "Test Signer",
-            None,
+            Artwork::default(),
             |_, _| Ok(vec![1]),
         )
         .unwrap();

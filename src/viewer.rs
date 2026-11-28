@@ -473,7 +473,7 @@ impl Controls {
         let old = (self.font, self.headline, self.icon_font);
         self.font = make("Yu Gothic UI", 14, 400);
         self.headline = make("Yu Gothic UI", 22, 600);
-        self.icon_font = make("Segoe MDL2 Assets", 16, 400);
+        self.icon_font = make("Segoe MDL2 Assets", toolbar::ICON_SIZE, 400);
         self.toolbar.set_font(self.icon_font);
         if let Some(bar) = &self.find {
             bar.font(self.font);
@@ -512,10 +512,30 @@ impl Controls {
         let bounds = rect(hwnd);
         let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96) as i32;
         let s = |n: i32| (n * dpi + 48) / 96;
-        let compact = bounds.right < s(690);
+        let button = toolbar::BUTTON_SIZE;
+        let step = toolbar::BUTTON_STEP;
+        let row_height = toolbar::ROW_HEIGHT;
+        let button_inset = (row_height - button) / 2;
+        let gap = step - button;
+        let margin = 8;
+        let group_gap = 12;
+
+        let prev_x = margin + button + margin;
+        let page_x = prev_x + step;
+        let page_width = 80;
+        let next_x = page_x + page_width + gap;
+        let zoom_x = next_x + button + margin;
+        let find_x = zoom_x + 3 * step;
+
+        let color_x = 2 * step;
+        let color_width = 64;
+        let undo_x = color_x + color_width + gap;
+        let save_x = undo_x + step;
+        let right_group_width = save_x + button + group_gap + button + margin;
+        let wrap = bounds.right < s(find_x + button + group_gap + right_group_width);
         let has_tabs = unsafe { GetWindowLongW(control(TABS), GWL_STYLE) } as u32 & WS_VISIBLE != 0;
         let tab_height = if has_tabs { 33 } else { 0 };
-        let toolbar = tab_height + if compact { 80 } else { 44 };
+        let toolbar_bottom = tab_height + if wrap { 2 * row_height } else { row_height };
         let mut positions = Vec::with_capacity(23);
         let mut place = |w, x, y, width, height| positions.push((w, x, y, width, height));
         if has_tabs {
@@ -527,67 +547,84 @@ impl Controls {
                 s(32),
             );
         }
-        let button = 36;
-        let page_x = 91;
-        let page_width = 80;
+        let row_y = s(tab_height + button_inset);
         for (id, x, width) in [
-            (OPEN, 10, button),
-            (PREV, 52, button),
+            (OPEN, margin, button),
+            (PREV, prev_x, button),
             (PAGE, page_x, page_width),
-            (NEXT, 174, button),
-            (SMALLER, 221, button),
-            (LARGER, 260, button),
-            (FIT, 299, button),
-            (find::OPEN_FIND, 338, button),
+            (NEXT, next_x, button),
+            (SMALLER, zoom_x, button),
+            (LARGER, zoom_x + step, button),
+            (FIT, zoom_x + 2 * step, button),
+            (find::OPEN_FIND, find_x, button),
         ] {
-            place(control(id), s(x), s(tab_height + 6), s(width), s(32));
+            place(control(id), s(x), row_y, s(width), s(button));
         }
         place(
             control(PAGE_INPUT),
             s(page_x),
-            s(tab_height + 9),
+            s(tab_height + 3),
             s(page_width),
             s(26),
         );
-        let left = if compact {
-            s(10)
+        let markup_left = if wrap {
+            s(margin)
         } else {
-            bounds.right - s(300)
+            bounds.right - s(right_group_width)
         };
-        let y = s(tab_height + if compact { 42 } else { 6 });
+        let markup_top = tab_height + if wrap { row_height } else { 0 };
+        let markup_y = s(markup_top + button_inset);
         for (id, x) in [
             (HIGHLIGHT, 0),
-            (UNDERLINE, 39),
-            (UNDO, 168),
-            (SAVE_MARKS, 207),
+            (UNDERLINE, step),
+            (UNDO, undo_x),
+            (SAVE_MARKS, save_x),
         ] {
-            place(control(id), left + s(x), y, s(button), s(32));
+            place(
+                control(id),
+                markup_left + s(x),
+                markup_y,
+                s(button),
+                s(button),
+            );
         }
-        place(control(COLOR), left + s(78), y + s(4), s(82), s(140));
+        place(
+            control(COLOR),
+            markup_left + s(color_x),
+            s(markup_top + 3),
+            s(color_width),
+            s(140),
+        );
         place(
             control(SIGN),
-            bounds.right - s(46),
-            s(tab_height + 6),
+            bounds.right - s(margin + button),
+            row_y,
             s(button),
-            s(32),
+            s(button),
         );
-        let mut top = toolbar;
+        let mut top = toolbar_bottom;
         let position = control(SIGN_POSITION);
         if !position.is_null()
             && unsafe { GetWindowLongW(position, GWL_STYLE) } as u32 & WS_VISIBLE != 0
         {
-            let width = (bounds.right - s(227)).min(s(390));
-            place(position, s(10), s(toolbar + 2), width, s(280));
+            let width = (bounds.right - s(2 * margin + 5 * step)).min(s(390));
+            place(position, s(margin), s(top + 3), width, s(280));
             for (id, x) in [
-                (WATERMARK, 17),
-                (SIGN_CERTIFICATE, 56),
-                (SIGN_PFX, 95),
-                (SIGN_SAVE, 142),
-                (SIGN_CANCEL, 181),
+                (WATERMARK, 0),
+                (SIGN_CERTIFICATE, step),
+                (SIGN_PFX, 2 * step),
+                (SIGN_SAVE, 3 * step),
+                (SIGN_CANCEL, 4 * step),
             ] {
-                place(control(id), width + s(x), s(toolbar), s(button), s(32));
+                place(
+                    control(id),
+                    width + s(margin + gap + x),
+                    s(top + button_inset),
+                    s(button),
+                    s(button),
+                );
             }
-            top += 37;
+            top += row_height;
         }
         top += find::Bar::layout(hwnd, top, &mut place);
         place(
@@ -1376,7 +1413,7 @@ impl App {
             SIGN_POSITION if !self.writing => self.choose_position(),
             SIGN_CERTIFICATE if !self.writing => self.choose_certificate(false)?,
             SIGN_PFX if !self.writing => self.choose_certificate(true)?,
-            WATERMARK if !self.writing => self.choose_watermark()?,
+            WATERMARK if !self.writing => self.choose_appearance()?,
             SIGN_SAVE => self.save_copy(true)?,
             SIGN_CANCEL if !self.writing => self.end_signing(),
             SAVE_MARKS => self.save_copy(false)?,

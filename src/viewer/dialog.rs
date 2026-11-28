@@ -12,6 +12,7 @@ pub enum Purpose<'a> {
     Open,
     Watermark,
     AcrobatWatermark,
+    SignatureImage,
     Pfx,
     SignedCopy(&'a Path),
     HighlightedCopy(&'a Path),
@@ -39,11 +40,17 @@ fn choose_paths(hwnd: HWND, purpose: Purpose<'_>) -> Result<Vec<PathBuf>, String
         Purpose::Open => "Open PDF",
         Purpose::Watermark => "Choose a PNG for the signature background",
         Purpose::AcrobatWatermark => "Choose a single-page Acrobat watermark PDF",
+        Purpose::SignatureImage => "Choose a PNG or JPEG signature image",
     });
     let (filter, ext) = if matches!(purpose, Purpose::Pfx) {
         (wide("PKCS#12 (*.pfx, *.p12)\0*.pfx;*.p12\0"), wide("pfx"))
     } else if matches!(purpose, Purpose::Watermark) {
         (wide("PNG images (*.png)\0*.png\0"), wide("png"))
+    } else if matches!(purpose, Purpose::SignatureImage) {
+        (
+            wide("Signature images (*.png, *.jpg, *.jpeg)\0*.png;*.jpg;*.jpeg\0"),
+            wide("png"),
+        )
     } else {
         (wide("PDF files (*.pdf)\0*.pdf\0"), wide("pdf"))
     };

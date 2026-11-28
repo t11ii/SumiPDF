@@ -58,15 +58,28 @@ fn write_new(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
 
 #[cfg(windows)]
 fn read_watermark(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    read_image_file(path, appearance::validate_watermark)
+}
+
+#[cfg(windows)]
+fn read_signature_image(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    read_image_file(path, appearance::validate_signature_image)
+}
+
+#[cfg(windows)]
+fn read_image_file(
+    path: &std::path::Path,
+    validate: impl FnOnce(&[u8]) -> Result<(), String>,
+) -> Result<Vec<u8>, String> {
     use std::io::Read;
     let mut data = Vec::new();
     std::fs::File::open(path)
         .and_then(|file| {
-            file.take(appearance::MAX_WATERMARK_BYTES as u64 + 1)
+            file.take(appearance::MAX_IMAGE_BYTES as u64 + 1)
                 .read_to_end(&mut data)
         })
-        .map_err(|e| format!("透かし画像を読み込めません。{e}"))?;
-    appearance::validate_watermark(&data)?;
+        .map_err(|e| format!("Could not read the image from {}.\n{e}", path.display()))?;
+    validate(&data)?;
     Ok(data)
 }
 

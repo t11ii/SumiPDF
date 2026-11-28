@@ -15,6 +15,11 @@ use windows_sys::Win32::UI::Controls::{
     TTTOOLINFOW,
 };
 
+pub(super) const ICON_SIZE: i32 = 14;
+pub(super) const BUTTON_SIZE: i32 = 24;
+pub(super) const BUTTON_STEP: i32 = BUTTON_SIZE + 4;
+pub(super) const ROW_HEIGHT: i32 = 32;
+
 #[derive(Clone, Copy)]
 pub(super) struct Icon {
     glyph: &'static str,
@@ -43,8 +48,9 @@ pub(super) const SIGN_PDF: Icon = icon("\u{e76d}", w!("Sign PDF… (Ctrl+S)"));
 pub(super) const PFX: Icon = icon("\u{e8b5}", w!("Load certificate from PFX"));
 pub(super) const CERTIFICATE: Icon =
     icon("\u{e8d7}", w!("Choose from the Windows certificate store"));
-pub(super) const DEFAULT_WATERMARK: Icon = icon("\u{e81e}", w!("Choose watermark (default)"));
-const CUSTOM_WATERMARK: Icon = icon("\u{e8b9}", w!("Choose watermark (custom image)"));
+pub(super) const DEFAULT_WATERMARK: Icon =
+    icon("\u{e81e}", w!("Signature appearance (default watermark)"));
+const CUSTOM_WATERMARK: Icon = icon("\u{e8b9}", w!("Signature appearance (custom watermark)"));
 pub(super) const CONFIRM: Icon = icon("\u{e8fb}", w!("Sign and save… (Ctrl+S)"));
 pub(super) const CANCEL: Icon = icon("\u{e711}", w!("Cancel (Esc)"));
 
@@ -412,9 +418,10 @@ mod tests {
     fn glyph_pixels(button: HWND, dc: HDC) -> Vec<bool> {
         snapshot(button, dc, |image, bounds| {
             let mut ink = Vec::new();
-            let background = unsafe { GetPixel(image, bounds.right / 6, bounds.bottom / 2) };
-            for y in bounds.bottom / 4..bounds.bottom * 3 / 4 {
-                for x in bounds.right / 4..bounds.right * 3 / 4 {
+            let inset = dips(button, 4);
+            let background = unsafe { GetPixel(image, inset, bounds.bottom / 2) };
+            for y in inset..bounds.bottom - inset {
+                for x in inset..bounds.right - inset {
                     let pixel = unsafe { GetPixel(image, x, y) };
                     ink.push([0, 8, 16].into_iter().any(|shift| {
                         ((pixel >> shift) & 0xffu32).abs_diff((background >> shift) & 0xff) > 48
@@ -451,6 +458,16 @@ mod tests {
             assert!(!parent.is_null());
             let mut ui = Controls::new(parent).unwrap();
             ui.fonts(parent);
+            let mut icon_font = LOGFONTW::default();
+            assert_ne!(
+                GetObjectW(
+                    ui.icon_font,
+                    size_of::<LOGFONTW>() as i32,
+                    (&raw mut icon_font).cast(),
+                ),
+                0
+            );
+            assert_eq!(icon_font.lfHeight, -dips(parent, 14));
             let find_edit = ui.ensure_find(parent).unwrap().edit;
             let signing = ui.ensure_signing(parent).unwrap();
             let find_label = GetWindow(find_edit, GW_HWNDPREV);
@@ -504,7 +521,8 @@ mod tests {
             assert_eq!(labels(&ui.toolbar, ui.sign).1, "Sign PDF… (Ctrl+S)");
             ui.toolbar.watermark(signing.watermark, true).unwrap();
             let (tip, name) = labels(&ui.toolbar, signing.watermark);
-            assert!(tip.contains("custom image") && tip == name);
+            assert_eq!(tip, "Signature appearance (custom watermark)");
+            assert_eq!(tip, name);
             SelectObject(dc, old);
             ReleaseDC(parent, dc);
             signing.show(true);
@@ -554,7 +572,14 @@ mod tests {
             }
             let icons = [ui.fit, ui.sign, signing.pfx];
             let reference = icons.map(|button| glyph_pixels(button, dc));
-            for width in [440, 689, 690, 900] {
+            ShowWindow(find_edit, SW_SHOWNOACTIVATE);
+            let side = dips(parent, 24);
+            let top = |button| {
+                let mut bounds = RECT::default();
+                assert_ne!(GetWindowRect(button, &mut bounds), 0);
+                bounds.top
+            };
+            for (width, wraps) in [(440, true), (523, true), (524, false), (900, false)] {
                 SetWindowPos(
                     parent,
                     null_mut(),
@@ -565,6 +590,15 @@ mod tests {
                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
                 );
                 Controls::layout(parent);
+                for &button in &ui.toolbar.buttons {
+                    let bounds = rect(button);
+                    assert_eq!((bounds.right, bounds.bottom), (side, side));
+                }
+                assert_eq!(
+                    top(ui.highlighter) > top(ui.find_button),
+                    wraps,
+                    "width {width}"
+                );
                 assert_eq!(
                     icons.map(|button| glyph_pixels(button, dc)),
                     reference,

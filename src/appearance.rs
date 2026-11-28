@@ -3,12 +3,30 @@ use crate::pdfseal::pdf_error;
 use crate::textselect::HELVETICA_WIDTHS;
 use lopdf::{Document, Object, ObjectId, Stream, dictionary};
 use std::fmt::Write;
+use time::OffsetDateTime;
 
-mod watermark;
+mod images;
 #[cfg(windows)]
 mod windows_text;
 
-pub use watermark::{MAX_WATERMARK_BYTES, validate_watermark};
+#[cfg(windows)]
+pub use images::MAX_IMAGE_BYTES;
+
+#[derive(Clone, Copy, Default)]
+pub struct Artwork<'a> {
+    pub watermark: Option<&'a [u8]>,
+    pub signature_image: Option<&'a [u8]>,
+}
+
+#[cfg(windows)]
+pub fn validate_watermark(bytes: &[u8]) -> Result<(), String> {
+    images::decode_png(bytes).map(|_| ())
+}
+
+#[cfg(windows)]
+pub fn validate_signature_image(bytes: &[u8]) -> Result<(), String> {
+    images::decode_signature_image(bytes).map(|_| ())
+}
 
 struct NameMask {
     width: u32,
@@ -21,8 +39,8 @@ pub fn make(
     width: f32,
     height: f32,
     name: &str,
-    date: &str,
-    watermark: Option<&[u8]>,
+    signed_at: OffsetDateTime,
+    artwork: Artwork<'_>,
 ) -> Result<ObjectId, String> {
     if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
         return Err("署名欄の幅または高さが不正です。".into());
@@ -31,7 +49,6 @@ pub fn make(
     if name.is_empty() || name.encode_utf16().count() > 1024 || name.chars().any(char::is_control) {
         return Err("証明書の表示名が空、長すぎる、または制御文字が含まれています。".into());
     }
-    let date = display_date(date)?;
     let mask = if name.is_ascii() {
         None
     } else {
@@ -44,28 +61,7 @@ pub fn make(
             return Err("証明書の表示名の描画にはWindowsのフォントが必要です。".into());
         }
     };
-    draw(doc, width, height, &name, mask, &date, watermark)
-}
-
-fn display_date(date: &str) -> Result<String, String> {
-    if let Some(digits) = date.strip_prefix("D:").and_then(|s| s.strip_suffix('Z'))
-        && digits.len() == 14
-        && digits.bytes().all(|b| b.is_ascii_digit())
-    {
-        return Ok(format!(
-            "{}-{}-{} {}:{}:{} UTC",
-            &digits[..4],
-            &digits[4..6],
-            &digits[6..8],
-            &digits[8..10],
-            &digits[10..12],
-            &digits[12..14]
-        ));
-    }
-    if date.is_empty() || date.len() > 96 || !date.bytes().all(|b| (32..=126).contains(&b)) {
-        return Err("署名日時の表記が不正です。".into());
-    }
-    Ok(date.to_owned())
+    draw(doc, width, height, &name, mask, signed_at, artwork)
 }
 
 fn draw(
@@ -74,13 +70,17 @@ fn draw(
     height: f32,
     name: &str,
     mask: Option<NameMask>,
-    date: &str,
-    watermark: Option<&[u8]>,
+    signed_at: OffsetDateTime,
+    artwork: Artwork<'_>,
 ) -> Result<ObjectId, String> {
+    let Artwork {
+        watermark,
+        signature_image,
+    } = artwork;
     let mut objects = lopdf::Dictionary::new();
     let mut content = String::from("q /Faint gs\n");
     let graphic_ratio = if let Some(bytes) = watermark {
-        let png = watermark::decode(bytes)?;
+        let png = images::decode_png(bytes)?;
         let ratio = png.width as f32 / png.height as f32;
         objects.set("Watermark", png.embed(doc)?);
         ratio
@@ -116,13 +116,29 @@ fn draw(
     let band = height.min(width / 2.8);
     let mid = height / 2.0;
     let padding = (band * 0.12).min(width * 0.045);
-    let right = width * 0.54;
-    let left_w = right - 2.0 * padding;
+    let half = width / 2.0;
+    let right = half + padding;
+    let left_w = half - 2.0 * padding;
     let right_w = width - right - padding;
-    let positions = [
-        (padding, mid, left_w, band * 0.40),
-        (right, mid, right_w, band * 0.17),
-    ];
+    if let Some(bytes) = signature_image {
+        let picture = images::decode_signature_image(bytes)?;
+        let ratio = picture.width as f32 / picture.height as f32;
+        let h = (height - 2.0 * padding).min(left_w / ratio);
+        let w = h * ratio;
+        let x = (half - w) / 2.0;
+        let y = (height - h) / 2.0;
+        objects.set("SignatureImage", picture.embed(doc)?);
+        writeln!(
+            content,
+            "q {w:.4} 0 0 {h:.4} {x:.4} {y:.4} cm /SignatureImage Do Q"
+        )
+        .unwrap();
+    }
+    let left_name = signature_image
+        .is_none()
+        .then_some((padding, mid, left_w, band * 0.40));
+    let right_name = (right, mid + band * 0.09, right_w, band * 0.17);
+    let positions = left_name.into_iter().chain([right_name]);
     content.push_str("0.09 0.12 0.15 rg\n");
     if let Some(mask) = mask {
         let ratio = mask.width as f32 / mask.height as f32;
@@ -168,17 +184,30 @@ fn draw(
         &mut content,
         "Digitally signed by",
         right,
-        mid + band * 0.215,
+        mid + band * 0.30,
         right_w,
         band * 0.13,
     );
     text_line(
         &mut content,
-        &format!("Date: {date}"),
+        &format!("Date: {}", signed_at.date()),
         right,
-        mid - band * 0.215,
+        mid - band * 0.13,
         right_w,
-        band * 0.115,
+        band * 0.125,
+    );
+    text_line(
+        &mut content,
+        &format!(
+            "Time: {:02}:{:02}:{:02} UTC",
+            signed_at.hour(),
+            signed_at.minute(),
+            signed_at.second(),
+        ),
+        right,
+        mid - band * 0.31,
+        right_w,
+        band * 0.125,
     );
 
     let resources = dictionary! {

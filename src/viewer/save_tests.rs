@@ -265,6 +265,11 @@ fn windows_signs_the_selected_field_with_a_custom_watermark_and_pending_markup()
     let appearance = super::Appearance {
         target: crate::pdfseal::Target::Field(id.to_owned()),
         watermark: Some(image.into()),
+        signature_image: Some(
+            include_bytes!("../../tests/fixtures/SignatureImage.jpg")
+                .as_slice()
+                .into(),
+        ),
     };
     let doc = winpdf::Document::open_file(&source_path).unwrap();
     let source = doc.signing_source().unwrap();
@@ -302,6 +307,28 @@ fn windows_signs_the_selected_field_with_a_custom_watermark_and_pending_markup()
             .has_type(b"Sig")
     );
     assert!(widget.has(b"AP"));
+    let signature_appearance = widget
+        .get(b"AP")
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get_deref(b"N", &pdf)
+        .unwrap()
+        .as_stream()
+        .unwrap();
+    assert!(
+        signature_appearance
+            .dict
+            .get(b"Resources")
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get(b"XObject")
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .has(b"SignatureImage")
+    );
     assert!(
         pdf.get_page_annotations(page).unwrap().iter().any(|ann| ann
             .get(b"Subtype")

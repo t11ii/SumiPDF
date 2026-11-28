@@ -100,12 +100,15 @@ impl Bar {
         let width = rect(hwnd).right;
         let edit_width = ((width - s(220)) / 2).clamp(s(82), s(300));
         let buttons = s(48) + edit_width;
+        let step = toolbar::BUTTON_STEP;
+        let size = s(toolbar::BUTTON_SIZE);
+        let button_y = s(top + (toolbar::ROW_HEIGHT - toolbar::BUTTON_SIZE) / 2);
         place(control(LABEL), s(10), row, s(34), s(26));
         place(edit, s(44), row, edit_width, s(26));
-        place(control(PREVIOUS), buttons, row, s(32), s(26));
-        place(control(NEXT), buttons + s(35), row, s(32), s(26));
-        place(control(CLOSE), buttons + s(70), row, s(32), s(26));
-        let status_x = buttons + s(109);
+        place(control(PREVIOUS), buttons, button_y, size, size);
+        place(control(NEXT), buttons + s(step), button_y, size, size);
+        place(control(CLOSE), buttons + s(2 * step), button_y, size, size);
+        let status_x = buttons + s(3 * step + 4);
         place(
             control(STATUS),
             status_x,
@@ -113,7 +116,7 @@ impl Bar {
             (width - status_x - s(4)).max(1),
             s(26),
         );
-        35
+        toolbar::ROW_HEIGHT
     }
 
     fn query(&self) -> String {

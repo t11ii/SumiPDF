@@ -9,6 +9,7 @@ use std::{
 
 const MAX_RECORD_BYTES: usize = 1024 * 1024;
 const WATERMARK_FILE: &str = "watermark.json";
+const SIGNATURE_IMAGE_FILE: &str = "signatureImage.json";
 const IDENTITY_FILE: &str = "identity.json";
 const RESTORE_TABS_FILE: &str = "restoreTabs.json";
 const TAB_SESSION_FILE: &str = "session.json";
@@ -78,7 +79,11 @@ impl Preferences {
             .map_err(|e| format!("Could not read the settings in {filename}. {e}"))
     }
 
-    fn write<T: Serialize>(&self, filename: &str, record: Option<&T>) -> Result<(), String> {
+    fn write<T: Serialize + ?Sized>(
+        &self,
+        filename: &str,
+        record: Option<&T>,
+    ) -> Result<(), String> {
         let destination = self.0.join(filename);
         let Some(record) = record else {
             return match fs::remove_file(destination) {
@@ -128,6 +133,21 @@ impl Preferences {
                 path: path.map(Path::to_owned),
             }),
         )
+    }
+
+    fn load_signature_image(&self) -> Result<Option<PathBuf>, String> {
+        let path: Option<PathBuf> = self.read(SIGNATURE_IMAGE_FILE)?;
+        if let Some(path) = &path {
+            validate_path(path)?;
+        }
+        Ok(path)
+    }
+
+    fn save_signature_image(&self, path: Option<&Path>) -> Result<(), String> {
+        if let Some(path) = path {
+            validate_path(path)?;
+        }
+        self.write(SIGNATURE_IMAGE_FILE, path)
     }
 
     fn load_identity(&self) -> Result<Option<Identity>, String> {
@@ -230,6 +250,16 @@ pub(crate) fn save_watermark(path: Option<&Path>) -> Result<(), String> {
 }
 
 #[cfg(windows)]
+pub(crate) fn load_signature_image() -> Result<Option<PathBuf>, String> {
+    for_user()?.load_signature_image()
+}
+
+#[cfg(windows)]
+pub(crate) fn save_signature_image(path: Option<&Path>) -> Result<(), String> {
+    for_user()?.save_signature_image(path)
+}
+
+#[cfg(windows)]
 pub(crate) fn load_identity() -> Result<Option<Identity>, String> {
     for_user()?.load_identity()
 }
@@ -316,13 +346,16 @@ mod tests {
         let profile = tempfile::tempdir().unwrap();
         let prefs = settings(profile.path());
         let watermark = profile.path().join("押印 🌸.png");
+        let signature_image = profile.path().join("手書きサイン.jpg");
         let pfx_path = profile.path().join("署名用.pfx");
         assert!(prefs.load_watermark(|| None).unwrap().is_none());
+        assert!(prefs.load_signature_image().unwrap().is_none());
         assert!(prefs.load_identity().unwrap().is_none());
         prefs.save_identity(None).unwrap();
         assert!(!prefs.0.exists());
 
         prefs.save_watermark(Some(&watermark)).unwrap();
+        prefs.save_signature_image(Some(&signature_image)).unwrap();
         let pfx = PfxIdentity {
             path: pfx_path.clone(),
             name: "署名者".to_owned(),
@@ -362,7 +395,13 @@ mod tests {
         };
         assert_eq!(name, "新しい署名者");
         assert_eq!(thumbprint, [124; 20]);
+        assert_eq!(
+            restored.load_signature_image().unwrap(),
+            Some(signature_image)
+        );
         prefs.save_watermark(Some(&watermark)).unwrap();
+        prefs.save_signature_image(None).unwrap();
+        assert!(restored.load_signature_image().unwrap().is_none());
         prefs.save_identity(None).unwrap();
         assert!(restored.load_identity().unwrap().is_none());
         assert_eq!(restored.load_watermark(|| None).unwrap(), Some(watermark));

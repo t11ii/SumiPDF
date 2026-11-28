@@ -640,9 +640,13 @@ mod tests {
             Target::Field("field-7-0".into()),
         ] {
             assert!(
-                sign_visible(bytes.clone(), &target, "Reviewer", None, |_, _| panic!(
-                    "forbidden target reached signer"
-                ))
+                sign_visible(
+                    bytes.clone(),
+                    &target,
+                    "Reviewer",
+                    Default::default(),
+                    |_, _| panic!("forbidden target reached signer")
+                )
                 .is_err()
             );
         }
@@ -653,8 +657,14 @@ mod tests {
             .is_err()
         );
         let target = Target::Field(rows[0]["id"].as_str().unwrap().into());
-        let signed =
-            sign_visible(bytes.clone(), &target, "Reviewer", None, |_, _| Ok(vec![1])).unwrap();
+        let signed = sign_visible(
+            bytes.clone(),
+            &target,
+            "Reviewer",
+            Default::default(),
+            |_, _| Ok(vec![1]),
+        )
+        .unwrap();
         assert!(signed.starts_with(&bytes));
     }
 

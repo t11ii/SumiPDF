@@ -3,6 +3,7 @@
 mod fields;
 mod permissions;
 
+use crate::appearance::{self, Artwork};
 use lopdf::{Dictionary, Document, IncrementalDocument, Object, ObjectId, StringFormat, Writer};
 use lopdf::{decode_text_string, dictionary};
 use memchr::memmem;
@@ -53,14 +54,14 @@ pub fn sign_pdf(
 struct Visible<'a> {
     target: &'a Target,
     name: &'a str,
-    watermark: Option<&'a [u8]>,
+    artwork: Artwork<'a>,
 }
 
 pub fn sign_visible(
     input: Vec<u8>,
     target: &Target,
     name: &str,
-    watermark: Option<&[u8]>,
+    artwork: Artwork<'_>,
     signer: impl FnOnce(&[u8], &[u8]) -> Result<Vec<u8>, String>,
 ) -> Result<Vec<u8>, String> {
     sign(
@@ -68,7 +69,7 @@ pub fn sign_visible(
         Some(Visible {
             target,
             name,
-            watermark,
+            artwork,
         }),
         signer,
     )
@@ -413,23 +414,7 @@ fn visible_appearance(
     } else {
         (h, w)
     };
-    let date = format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
-        now.year(),
-        now.month() as u8,
-        now.day(),
-        now.hour(),
-        now.minute(),
-        now.second()
-    );
-    let id = crate::appearance::make(
-        update,
-        width,
-        height,
-        visible.name,
-        &date,
-        visible.watermark,
-    )?;
+    let id = appearance::make(update, width, height, visible.name, now, visible.artwork)?;
     // The viewer rotates the whole page clockwise. Rotate local appearance
     // coordinates back to default user space so the stamp stays upright.
     let matrix = match p.rotation {

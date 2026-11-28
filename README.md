@@ -33,12 +33,14 @@ PDF を指定せずに SumiPDF を起動すると、前回終了時のタブ、�
 ### 電子署名する
 
 1. **Sign PDF…** を押し、署名位置の一覧で記入先を選びます。PDF に空の署名フィールドがあれば、ページ番号と名前が表示されます。印刷された署名欄やスキャンには **Draw signature box** を選び、欄を囲みます。青枠が署名の表示位置です。従来の不可視署名も選べます。
-2. **Choose watermark** で標準模様、自分の PNG、または **Choose Acrobat watermark PDF…** から1ページの透かし PDF を選びます。次に署名するときも、選んだファイルを使います。**Create watermark…** で同梱のデザイナーが開きます。文字・書体・外枠・色・手描きを組み合わせ、**Save PNG** したら、署名画面の **Choose PNG…** で読み込みます。編集用の SVG も書き出せます。[透かしデザイナー](dist/watermarkDesigner.html)
+2. **Signature appearance** を開き、**Choose signature image…** で署名欄の左半分に置く PNG または JPEG を選びます。画像は縦横比と PNG の透明部分を保って配置します。**Show certificate name on the left** で氏名表示に戻せます。署名画像と透かしの選択は次回の署名に引き継ぎます。
+
+   同じメニューで背景に標準模様、自分の PNG、または **Choose Acrobat watermark PDF…** から1ページの PDF を指定できます。**Create watermark…** で文字・書体・外枠・色・手描きを組み合わせた透過 PNG を作り、**Choose PNG…** から背景に読み込めます。作成した PNG は署名画像にも使えます。編集用の SVG も書き出せます。[透かしデザイナー](dist/watermarkDesigner.html)
 3. 鍵アイコンの **Choose from the Windows certificate store** を押します。「現在のユーザー」と「ローカル コンピューター」の両方の「個人」ストアから、秘密鍵付きで有効な署名用証明書を探します。同じ氏名の候補があるときは、**View details** で発行者や有効期限を確認できます。自分の証明書を選ぶと画面下部に署名者名が表示されます。
 
    **PFX ファイルをお持ちの場合**は、鍵アイコンの右隣にある **Load certificate from PFX** を押します。`.pfx` または `.p12` を開き、パスワードを入力してください。ファイルに署名用証明書が複数あれば、使用する証明書を選べます。証明書のファイルと署名者を記憶するので、次回は **Sign and save…** に進めます。パスワードの入力も省略するには、最初の入力時に **Remember password on this PC** にチェックを入れます。パスワードは Windows の DPAPI で現在のユーザー向けに暗号化します。ファイルを交換した場合は再度選択してください。
 
-4. **Sign and save…** を押して新しいファイルに保存します。証明書をここで初めて選ぶこともできます。証明書の氏名を左に、署名者情報と UTC 日時を右に配置し、透かしを背景に重ねます。画面で付けた注釈と署名の外観を含む PDF 全体が署名対象です。[参考にした Acrobat の署名表示](https://www.adobe.com/devnet-docs/acrobatetk/tools/DigSigDC/appearances.html)
+4. **Sign and save…** を押して新しいファイルに保存します。証明書をここで初めて選ぶこともできます。可視署名の右半分には証明書の氏名、**Date**、**Time** を別々の行で表示します。時刻は UTC です。画面で付けた注釈と署名の外観を含む PDF 全体が署名対象です。[参考にした Acrobat の署名表示](https://www.adobe.com/devnet-docs/acrobatetk/tools/DigSigDC/appearances.html)
 5. 保存すると、署名済みのコピーが同じウィンドウの新しいタブで開きます。表示署名なら署名のあるページ、不可視署名なら保存前に表示していたページから確認できます。元の PDF には元のタブで戻れます。証明書や署名後の変更は、Acrobat Reader などの署名パネルで確認できます。信頼判定は受け手の証明書と検証環境によって決まります。
 
 Windows ストアで選んだ証明書も、次回の署名時に呼び出せます。記憶した証明書と PFX の保存パスワードは、ウィンドウ左上のシステムメニュー（Alt + Space）の **Forget saved signing certificate** で消去できます。

@@ -7,12 +7,14 @@ SumiPDF.exe --inspect FILE.pdf
 SumiPDF.exe --preview FILE.pdf --out PAGE.png (--page N [--rect L,T,R,B] | --field ID)
 SumiPDF.exe --certificates
 SumiPDF.exe --sign FILE.pdf --out SIGNED.pdf (--field ID | --page N --rect L,T,R,B)
-            [--watermark LOGO.png] [--certificate THUMBPRINT | --pfx FILE.pfx] [--expect-sha256 HASH]
+            [--watermark LOGO.png] [--signature-image IMAGE]
+            [--certificate THUMBPRINT | --pfx FILE.pfx] [--expect-sha256 HASH]
 
 Pages start at 1. Rectangles use fractions of the visible page (top-left 0,0).
 --inspect returns JSON with page count, writable signature fields and input SHA-256.
 For signed PDFs, alreadySigned and allowsNewField describe placement options.
 --preview saves a page PNG with an optional target outline. --sign creates a new PDF.
+--signature-image places a PNG or JPEG in the left half of the visible signature.
 With --pfx, enter the password in the Windows dialog. With neither identity option, SumiPDF opens its Windows certificate store picker. Use --certificates
 to list eligible identities in CurrentUser/My and LocalMachine/My. A key provider may request a PIN.
 Existing output files are preserved. Commands return JSON except --help."#;
@@ -38,6 +40,7 @@ enum Command {
         output: PathBuf,
         target: Target,
         watermark: Option<PathBuf>,
+        signature_image: Option<PathBuf>,
         certificate: Option<Identity>,
         expected: Option<[u8; 32]>,
     },
@@ -173,6 +176,7 @@ fn parse(args: Vec<OsString>) -> Result<Command, String> {
                 output,
                 target: target.ok_or("署名欄が必要です。")?,
                 watermark: flags.path("--watermark"),
+                signature_image: flags.path("--signature-image"),
                 certificate,
                 expected: flags
                     .text("--expect-sha256")?
@@ -240,6 +244,7 @@ pub fn run(args: Vec<OsString>) -> Result<(), String> {
             output,
             target,
             watermark,
+            signature_image,
             certificate,
             expected,
         } => {
@@ -253,6 +258,9 @@ pub fn run(args: Vec<OsString>) -> Result<(), String> {
             }
             let (page, rect) = pdfseal::locate(&bytes, &target)?;
             let watermark = watermark.map(|p| crate::read_watermark(&p)).transpose()?;
+            let signature_image = signature_image
+                .map(|p| crate::read_signature_image(&p))
+                .transpose()?;
             let cert = match certificate {
                 Some(Identity::Store(hash)) => {
                     SigningCertificate::by_thumbprint(hash, std::ptr::null_mut())?
@@ -267,10 +275,13 @@ pub fn run(args: Vec<OsString>) -> Result<(), String> {
             }
             .ok_or("証明書の選択をキャンセルしました。")?;
             let name = cert.display_name()?;
-            let signed =
-                pdfseal::sign_visible(bytes, &target, &name, watermark.as_deref(), |a, b| {
-                    cert.sign_detached(a, b)
-                })?;
+            let artwork = crate::appearance::Artwork {
+                watermark: watermark.as_deref(),
+                signature_image: signature_image.as_deref(),
+            };
+            let signed = pdfseal::sign_visible(bytes, &target, &name, artwork, |a, b| {
+                cert.sign_detached(a, b)
+            })?;
             write_new(&output, &signed)?;
             json!({"file":output.to_string_lossy(),"signer":name,"page":page,"rect":rect,"sha256":sha256_hex(&signed)})
         }
@@ -363,6 +374,7 @@ mod tests {
         assert!(is_command(Some(&"--inspect".into())));
         assert!(!is_command(Some(&"契約書.pdf".into())));
         assert!(HELP.contains("--watermark"));
+        assert!(HELP.contains("--signature-image"));
         assert!(matches!(command(&["--help"]), Ok(Command::Help)));
         assert!(matches!(
             command(&["--certificates"]),
@@ -382,6 +394,8 @@ mod tests {
             "a.pdf",
             "--watermark",
             "my.png",
+            "--signature-image",
+            "サイン photo.jpeg",
             "--field",
             "existing",
             "--certificate",
@@ -396,6 +410,7 @@ mod tests {
             output,
             target: Target::Field(field),
             watermark,
+            signature_image,
             certificate,
             expected,
         } = command(&args).unwrap()
@@ -411,6 +426,7 @@ mod tests {
             )
         );
         assert_eq!(watermark, Some(PathBuf::from("my.png")));
+        assert_eq!(signature_image, Some(PathBuf::from("サイン photo.jpeg")));
         assert_eq!(certificate, Some(Identity::Store([0xab; 20])));
         assert!(
             matches!(command(&["--sign","a","--field","one","--out","b","--pfx","自分の鍵.p12"]), Ok(Command::Sign { certificate: Some(Identity::Pfx(p)), .. }) if p==Path::new("自分の鍵.p12"))

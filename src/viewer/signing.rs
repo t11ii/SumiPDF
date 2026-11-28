@@ -183,9 +183,25 @@ impl Choices {
     }
 }
 
-struct Watermark {
+struct ArtworkFile {
     path: PathBuf,
     bytes: Option<Arc<[u8]>>,
+}
+
+impl ArtworkFile {
+    fn from_path(path: PathBuf) -> Self {
+        Self { path, bytes: None }
+    }
+
+    fn read(
+        &self,
+        load: impl FnOnce(&Path) -> Result<Arc<[u8]>, String>,
+    ) -> Result<Arc<[u8]>, String> {
+        match &self.bytes {
+            Some(bytes) => Ok(bytes.clone()),
+            None => load(&self.path),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -193,7 +209,8 @@ pub(super) struct Session {
     choices: Option<Choices>,
     selected: Option<usize>,
     pub drawn: Option<(u32, UnitRect)>,
-    watermark: Option<Watermark>,
+    watermark: Option<ArtworkFile>,
+    signature_image: Option<ArtworkFile>,
     certificate: Option<CertificateSelection>,
     remembered_pfx: Option<PfxIdentity>,
 }
@@ -202,7 +219,11 @@ impl Session {
     fn restore(hwnd: HWND) -> Self {
         let mut session = Self::default();
         match preferences::load_watermark() {
-            Ok(path) => session.watermark = path.map(|path| Watermark { path, bytes: None }),
+            Ok(path) => session.watermark = path.map(ArtworkFile::from_path),
+            Err(e) => notice(hwnd, &e, true),
+        }
+        match preferences::load_signature_image() {
+            Ok(path) => session.signature_image = path.map(ArtworkFile::from_path),
             Err(e) => notice(hwnd, &e, true),
         }
         match preferences::load_identity() {
@@ -281,7 +302,7 @@ impl Session {
         matches!(self.position(), Some(Position::Draw))
     }
 
-    pub fn can_pick_watermark(&self) -> bool {
+    pub fn can_choose_appearance(&self) -> bool {
         matches!(self.position(), Some(Position::Draw | Position::Field(_)))
     }
 
@@ -312,10 +333,12 @@ impl Session {
             watermark: self
                 .watermark
                 .as_ref()
-                .map(|w| match &w.bytes {
-                    Some(bytes) => Ok(bytes.clone()),
-                    None => watermark_bytes(&w.path),
-                })
+                .map(|w| w.read(watermark_bytes))
+                .transpose()?,
+            signature_image: self
+                .signature_image
+                .as_ref()
+                .map(|file| file.read(signature_image_bytes))
                 .transpose()?,
         }))
     }
@@ -386,7 +409,7 @@ impl App {
             (bar.pfx, ready),
             (
                 bar.watermark,
-                !self.writing && session.is_some_and(Session::can_pick_watermark),
+                !self.writing && session.is_some_and(Session::can_choose_appearance),
             ),
             (bar.save, !self.writing && self.can_sign_here()),
             (bar.cancel, !self.writing),
@@ -553,15 +576,19 @@ impl App {
         Ok(())
     }
 
-    pub(super) fn choose_watermark(&mut self) -> Result<(), String> {
+    pub(super) fn choose_appearance(&mut self) -> Result<(), String> {
         let (Some(session), Some(bar)) = (&mut self.signing, self.ui.signing) else {
             return Ok(());
         };
-        if !session.can_pick_watermark() {
+        if !session.can_choose_appearance() {
             return Ok(());
         }
-        let path = session.watermark.as_ref().map(|w| w.path.as_path());
-        match watermark_menu(self.hwnd, bar.watermark, path)? {
+        let watermark = session.watermark.as_ref().map(|w| w.path.as_path());
+        let signature_image = session
+            .signature_image
+            .as_ref()
+            .map(|image| image.path.as_path());
+        match appearance_menu(self.hwnd, bar.watermark, watermark, signature_image)? {
             1 => session.watermark = None,
             choice @ (2 | 4) => {
                 let purpose = if choice == 4 {
@@ -572,12 +599,35 @@ impl App {
                 let Some(path) = dialog::choose(self.hwnd, purpose)? else {
                     return Ok(());
                 };
-                session.watermark = Some(Watermark {
+                session.watermark = Some(ArtworkFile {
                     bytes: Some(watermark_bytes(&path)?),
                     path,
                 });
             }
             3 => return open_designer(self.hwnd),
+            choice @ (5 | 6) => {
+                session.signature_image = if choice == 6 {
+                    let Some(path) = dialog::choose(self.hwnd, dialog::Purpose::SignatureImage)?
+                    else {
+                        return Ok(());
+                    };
+                    Some(ArtworkFile {
+                        bytes: Some(signature_image_bytes(&path)?),
+                        path,
+                    })
+                } else {
+                    None
+                };
+                if let Err(e) = preferences::save_signature_image(
+                    session
+                        .signature_image
+                        .as_ref()
+                        .map(|image| image.path.as_path()),
+                ) {
+                    notice(self.hwnd, &e, true);
+                }
+                return Ok(());
+            }
             _ => return Ok(()),
         }
         if let Err(e) =
@@ -601,6 +651,17 @@ fn remember_choice(hwnd: HWND, identity: &Identity) {
 fn pdf_path(path: &Path) -> bool {
     path.extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
+}
+
+fn signature_image_bytes(path: &Path) -> Result<Arc<[u8]>, String> {
+    crate::read_signature_image(path)
+        .map(Into::into)
+        .map_err(|e| {
+            format!(
+                "Could not use the signature image at {}.\n{e}",
+                path.display()
+            )
+        })
 }
 
 fn watermark_bytes(path: &Path) -> Result<Arc<[u8]>, String> {
@@ -628,7 +689,12 @@ fn watermark_bytes(path: &Path) -> Result<Arc<[u8]>, String> {
     result.map(Into::into).map_err(|e| format!("Could not load the watermark from {}. Choose another watermark in the signature toolbar.\n{e}", path.display()))
 }
 
-fn watermark_menu(owner: HWND, button: HWND, path: Option<&Path>) -> Result<i32, String> {
+fn appearance_menu(
+    owner: HWND,
+    button: HWND,
+    watermark: Option<&Path>,
+    signature_image: Option<&Path>,
+) -> Result<i32, String> {
     let menu = unsafe { CreatePopupMenu() };
     if menu.is_null() {
         return Err(std::io::Error::last_os_error().to_string());
@@ -637,14 +703,14 @@ fn watermark_menu(owner: HWND, button: HWND, path: Option<&Path>) -> Result<i32,
         Some(filename) => format!("{base} ({})", filename.to_string_lossy().replace('&', "&&")),
         None => base.to_owned(),
     };
-    let png = path.filter(|p| !pdf_path(p));
-    let pdf = path.filter(|p| pdf_path(p));
+    let png = watermark.filter(|p| !pdf_path(p));
+    let pdf = watermark.filter(|p| pdf_path(p));
     let check = |value: bool| if value { MF_CHECKED } else { MF_UNCHECKED };
     let mut bounds = RECT::default();
     let result = unsafe {
         AppendMenuW(
             menu,
-            MF_STRING | check(path.is_none()),
+            MF_STRING | check(watermark.is_none()),
             1,
             wide("&Default watermark (paper pattern)").as_ptr(),
         );
@@ -660,8 +726,20 @@ fn watermark_menu(owner: HWND, button: HWND, path: Option<&Path>) -> Result<i32,
             4,
             wide(&label("Choose &Acrobat watermark PDF…", pdf)).as_ptr(),
         );
-        AppendMenuW(menu, MF_SEPARATOR, 0, null());
         AppendMenuW(menu, MF_STRING, 3, wide("Create watermark…").as_ptr());
+        AppendMenuW(menu, MF_SEPARATOR, 0, null());
+        AppendMenuW(
+            menu,
+            MF_STRING | check(signature_image.is_none()),
+            5,
+            wide("Show certificate &name on the left").as_ptr(),
+        );
+        AppendMenuW(
+            menu,
+            MF_STRING | check(signature_image.is_some()),
+            6,
+            wide(&label("Choose signature &image…", signature_image)).as_ptr(),
+        );
         GetWindowRect(button, &mut bounds);
         let choice = TrackPopupMenu(
             menu,
@@ -738,7 +816,7 @@ mod tests {
 
         session.selected = Some(1);
         assert!(session.appearance().is_err());
-        assert!(!session.can_pick_watermark());
+        assert!(!session.can_choose_appearance());
     }
 
     #[test]
