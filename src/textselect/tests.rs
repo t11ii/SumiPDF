@@ -1,12 +1,12 @@
 use super::*;
-use lopdf::{Stream, dictionary};
+use lopdf::{Document as Pdf, Object, Stream, dictionary};
 
 fn sample(rotate: i64) -> Vec<u8> {
-    let mut d = Document::with_version("1.7");
+    let mut d = Pdf::with_version("1.7");
     let pages = d.new_object_id();
     let latin =
         d.add_object(dictionary! { "Type"=>"Font", "Subtype"=>"Type1", "BaseFont"=>"Helvetica" });
-    let cid=d.add_object(dictionary! { "Type"=>"Font", "Subtype"=>"CIDFontType2", "DW"=>1000, "W"=>vec![1.into(), Object::Array(vec![800.into(),900.into()])] });
+    let cid=d.add_object(dictionary! { "Type"=>"Font", "Subtype"=>"CIDFontType0", "BaseFont"=>"HeiseiMin-W3", "CIDSystemInfo"=>dictionary! { "Registry"=>Object::string_literal("Adobe"), "Ordering"=>Object::string_literal("Japan1"), "Supplement"=>5 }, "DW"=>1000, "W"=>vec![1.into(), Object::Array(vec![800.into(),900.into()])] });
     let to_unicode = d.add_object(Stream::new(
         dictionary! {},
         b"/CIDInit /ProcSet findresource begin
@@ -17,10 +17,10 @@ fn sample(rotate: i64) -> Vec<u8> {
 endcmap CMapName currentdict /CMap defineresource pop end end"
             .to_vec(),
     ));
-    let japanese=d.add_object(dictionary! { "Type"=>"Font","Subtype"=>"Type0","Encoding"=>"Identity-H","DescendantFonts"=>vec![Object::Reference(cid)],"ToUnicode"=>to_unicode });
+    let japanese=d.add_object(dictionary! { "Type"=>"Font","Subtype"=>"Type0","BaseFont"=>"HeiseiMin-W3","Encoding"=>"Identity-H","DescendantFonts"=>vec![Object::Reference(cid)],"ToUnicode"=>to_unicode });
     let nested = d.add_object(Stream::new(
         dictionary! {
-            "Subtype"=>"Form", "BBox"=>vec![0.into(),0.into(),70.into(),70.into()],
+            "Subtype"=>"Form", "BBox"=>vec![(-5).into(),(-20).into(),70.into(),70.into()],
             "Matrix"=>vec![1.into(),0.into(),0.into(),1.into(),35.into(),65.into()],
             "Resources"=>dictionary! { "Font"=>dictionary! { "JP"=>japanese } }
         },
@@ -51,7 +51,7 @@ fn midpoint(r: UnitRect) -> (f32, f32) {
 
 #[test]
 fn pdf_glyphs_snap_to_forward_and_reverse_lines_and_cid_widths() {
-    let doc = TextDocument::load(&sample(0)).unwrap();
+    let doc = TextDocument::load_for_search(&sample(0)).unwrap();
     let text = doc.page(0).unwrap();
     assert!(!text.is_empty());
     assert_eq!(text.glyphs.len(), 6);
@@ -76,7 +76,10 @@ fn pdf_glyphs_snap_to_forward_and_reverse_lines_and_cid_widths() {
 }
 #[test]
 fn rotated_pages_select_the_same_cropped_glyphs() {
-    let normal = TextDocument::load(&sample(0)).unwrap().page(0).unwrap();
+    let normal = TextDocument::load_for_search(&sample(0))
+        .unwrap()
+        .page(0)
+        .unwrap();
     let original = normal.glyphs[0];
     for (angle, direction, want) in [
         (90, Direction::Down, (1. - original.bottom, original.left)),
@@ -87,7 +90,10 @@ fn rotated_pages_select_the_same_cropped_glyphs() {
         ),
         (270, Direction::Up, (original.top, 1. - original.right)),
     ] {
-        let text = TextDocument::load(&sample(angle)).unwrap().page(0).unwrap();
+        let text = TextDocument::load_for_search(&sample(angle))
+            .unwrap()
+            .page(0)
+            .unwrap();
         let first = text.glyphs[0];
         near(first.left, want.0);
         near(first.top, want.1);
@@ -104,30 +110,60 @@ fn rotated_pages_select_the_same_cropped_glyphs() {
 }
 #[test]
 fn image_only_page_has_no_text_hit() {
-    let mut d = Document::load_mem(&sample(0)).unwrap();
+    let mut d = Pdf::load_mem(&sample(0)).unwrap();
     let id = d.page_iter().next().unwrap();
     d.change_page_content(id, b"0.3 g 30 45 28 22 re f".to_vec())
         .unwrap();
     let mut bytes = Vec::new();
     d.save_to(&mut bytes).unwrap();
-    let layout = TextDocument::load(&bytes).unwrap().page(0).unwrap();
+    let layout = TextDocument::load_for_search(&bytes)
+        .unwrap()
+        .page(0)
+        .unwrap();
     assert!(layout.is_empty());
     assert!(layout.hit(0.1, 0.4).is_none());
 }
 
 #[test]
-fn unsupported_page_content_falls_back_but_a_bad_page_number_is_reported() {
-    let mut d = Document::load_mem(&sample(0)).unwrap();
-    let id = d.page_iter().next().unwrap();
-    let mut bytes = b"BT /F 10 Tf 1 0 0 1 36 90 Tm (A) Tj ET ".to_vec();
-    bytes.extend(b"q ".repeat(257));
-    d.change_page_content(id, bytes).unwrap();
-    let mut source = Vec::new();
-    d.save_to(&mut source).unwrap();
-    let doc = TextDocument::load(&source).unwrap();
-    assert!(doc.page(0).unwrap().is_empty());
-    assert!(doc.search_page(0, "A").is_err());
-    assert!(doc.page(1).is_err());
+fn bad_page_numbers_are_reported_without_overflow() {
+    let doc = TextDocument::load_for_search(&sample(0)).unwrap();
+    for index in [1, u32::MAX] {
+        assert!(doc.page(index).is_err());
+        assert!(doc.search_page(index, "A").is_err());
+    }
+}
+
+#[test]
+fn predefined_japanese_cmap_without_tounicode_supports_selection_and_find() {
+    for angle in [0, 90, 180, 270] {
+        let mut pdf = Pdf::load_mem(&sample(angle)).unwrap();
+        let font = pdf
+            .objects
+            .values_mut()
+            .filter_map(|o| o.as_dict_mut().ok())
+            .find(|f| f.get(b"Subtype").and_then(Object::as_name).ok() == Some(b"Type0"))
+            .unwrap();
+        font.set("Encoding", "UniJIS-UCS2-H");
+        font.remove(b"ToUnicode");
+        let form = pdf
+            .objects
+            .values_mut()
+            .filter_map(|o| o.as_stream_mut().ok())
+            .find(|s| s.dict.get(b"Subtype").and_then(Object::as_name).ok() == Some(b"Form"))
+            .unwrap();
+        form.set_plain_content(b"BT /JP 10 Tf <67714eac> Tj ET".to_vec());
+        let mut bytes = Vec::new();
+        pdf.save_to(&mut bytes).unwrap();
+
+        let doc = TextDocument::load_for_search(&bytes).unwrap();
+        let first = doc.search_page(0, "東").unwrap()[0][0];
+        let last = doc.search_page(0, "京").unwrap()[0][0];
+        let word = doc.search_page(0, "東京").unwrap()[0][0];
+        let text = doc.page(0).unwrap();
+        let (x, y) = midpoint(first);
+        let (u, v) = midpoint(last);
+        assert_eq!(text.range(text.hit(x, y).unwrap(), u, v)[0].bounds, word);
+    }
 }
 
 #[test]
@@ -174,7 +210,7 @@ fn signed_pdf_still_has_selectable_embedded_text() {
 
 #[test]
 fn search_finds_repeated_words_joined_by_glyph_positioning_in_signed_pdfs() {
-    let mut doc = Document::load_mem(&sample(0)).unwrap();
+    let mut doc = Pdf::load_mem(&sample(0)).unwrap();
     let page = doc.page_iter().next().unwrap();
     doc.change_page_content(
         page,
@@ -184,18 +220,18 @@ fn search_finds_repeated_words_joined_by_glyph_positioning_in_signed_pdfs() {
     let mut original = Vec::new();
     doc.save_to(&mut original).unwrap();
     let signed = crate::pdfseal::sign_pdf(original, |_, _| Ok(vec![1; 64])).unwrap();
-    assert!(TextDocument::load(&signed).is_err());
+    assert!(crate::pdfseal::editable_document(&signed).is_err());
     let doc = TextDocument::load_for_search(&signed).unwrap();
     let found = doc.search_page(0, "search one").unwrap();
     assert_eq!(found.len(), 2);
     assert_eq!(found[0].len(), 1);
     assert_eq!(found[1].len(), 1);
-    assert!(found[0][0].bottom < found[1][0].top);
+    assert!(midpoint(found[0][0]).1 < midpoint(found[1][0]).1);
 }
 
 #[test]
 fn simple_font_tounicode_takes_precedence_and_preserves_ligatures_surrogate_pairs_and_wrap() {
-    let mut doc = Document::load_mem(&sample(0)).unwrap();
+    let mut doc = Pdf::load_mem(&sample(0)).unwrap();
     let cmap = doc.add_object(Stream::new(
         dictionary! {},
         b"begincmap
@@ -217,7 +253,9 @@ fn simple_font_tounicode_takes_precedence_and_preserves_ligatures_surrogate_pair
         b"BT /F 10 Tf 36 90 Td 12 TL (@A) Tj (BCD) Tj (E) ' ET".to_vec(),
     )
     .unwrap();
-    let doc = TextDocument::from_document(doc);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    let doc = TextDocument::load_for_search(&bytes).unwrap();
     assert_eq!(doc.search_page(0, "ABfi𠀀東京").unwrap()[0].len(), 2);
     assert_eq!(
         doc.search_page(0, "FI").unwrap(),
@@ -228,7 +266,7 @@ fn simple_font_tounicode_takes_precedence_and_preserves_ligatures_surrogate_pair
 
 #[test]
 fn winansi_text_and_following_glyphs_remain_searchable() {
-    let mut doc = Document::load_mem(&sample(0)).unwrap();
+    let mut doc = Pdf::load_mem(&sample(0)).unwrap();
     let font = doc
         .objects
         .values_mut()
@@ -242,7 +280,9 @@ fn winansi_text_and_following_glyphs_remain_searchable() {
         b"BT /F 10 Tf 36 90 Td <436166E92053747261DF65> Tj ET".to_vec(),
     )
     .unwrap();
-    let doc = TextDocument::from_document(doc);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    let doc = TextDocument::load_for_search(&bytes).unwrap();
     assert_eq!(doc.search_page(0, "CAFÉ STRASSE").unwrap().len(), 1);
 }
 
@@ -268,9 +308,23 @@ fn rereading_cached_text_preserves_the_original_match_rectangles() {
 
 #[test]
 fn repeated_full_scans_keep_the_pages_that_fit_and_search_the_rest() {
-    let mut doc = TextDocument::load_for_search(&sample(0)).unwrap();
-    let page = doc.pages[0];
-    doc.pages.push(page);
+    let mut pdf = Pdf::load_mem(&sample(0)).unwrap();
+    let page = pdf.page_iter().next().unwrap();
+    let original = pdf.get_dictionary(page).unwrap().clone();
+    let parents = original
+        .get(b"Parent")
+        .and_then(Object::as_reference)
+        .unwrap();
+    let duplicate = pdf.add_object(original.clone());
+    let mut blank = original;
+    blank.remove(b"Contents");
+    let blank = pdf.add_object(blank);
+    let tree = pdf.get_object_mut(parents).unwrap().as_dict_mut().unwrap();
+    tree.set("Count", 3);
+    tree.set("Kids", vec![page.into(), duplicate.into(), blank.into()]);
+    let mut bytes = Vec::new();
+    pdf.save_to(&mut bytes).unwrap();
+    let doc = TextDocument::load_for_search(&bytes).unwrap();
     let expected = doc.search_page(0, "東京").unwrap();
     assert_eq!(expected.len(), 1);
 
@@ -290,9 +344,6 @@ fn repeated_full_scans_keep_the_pages_that_fit_and_search_the_rest() {
     }
 
     // An oversized first page must not prevent a subsequent small page from fitting.
-    let mut blank = doc.doc.get_dictionary(page).unwrap().clone();
-    blank.remove(b"Contents");
-    doc.pages.push(doc.doc.add_object(blank));
     let mut blank_only = SearchPageCache::default();
     assert!(blank_only.search(&doc, 2, "東京").unwrap().is_empty());
     let mut cache = SearchPageCache::with_limit(blank_only.retained_bytes());

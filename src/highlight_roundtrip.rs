@@ -79,7 +79,7 @@ fn dragging_across_two_lines_highlights_only_the_selected_words() {
     let last = word(&xml, "CHARLIE");
     let start = ((first[0] + 1.0) / 300.0, (first[1] + first[3]) / 440.0);
     let end = ((last[2] - 1.0) / 300.0, (last[1] + last[3]) / 440.0);
-    let layout = TextDocument::load(&source).unwrap().page(0).unwrap();
+    let layout = TextDocument::selection(&source, 0).unwrap();
     let selection = layout.range(layout.hit(start.0, start.1).unwrap(), end.0, end.1);
     assert_eq!(selection.len(), 2);
     assert_eq!(

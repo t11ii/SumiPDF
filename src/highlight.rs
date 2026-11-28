@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
 pub struct UnitRect {
     pub left: f32,
     pub top: f32,

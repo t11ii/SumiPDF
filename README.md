@@ -84,7 +84,7 @@ Windows ストアで選んだ証明書も、次回の署名時に呼び出せま
 
 ## 軽量化と署名の仕様
 
-- 閲覧には Windows 標準の PDF エンジンを使います。元ファイルをストリームで開き、画面に入るページを優先してバックグラウンドで描画します。ページ全体表示や縮小表示では、まず表示サイズで描画します。表示が落ち着いたら、閲覧位置のページを画素数の上限内で縦横最大2倍の解像度で描いてから縮小し、文字の輪郭を滑らかにします。画面の前後を1ページずつ先読みし、遠くのページ画像は解放します。連続表示のページ画像キャッシュは100%以下で最大 48 MiB、拡大時は最大 144 MiB です。拡大時は閲覧位置のページに約3,355万画素まで割り当てます。タブを切り替えると、元のタブには閲覧位置・編集内容と開いていたファイルのストリームを保持し、ページ画像を解放します。プロセス全体の使用量は文書や表示サイズによって変わります。[Microsoft の PDF 描画 API](https://learn.microsoft.com/en-us/uwp/api/windows.data.pdf.pdfdocument?view=winrt-19041)
+- 閲覧・文字選択・検索には MuPDF 1.28.7 を使います。開いた PDF をストリームで読み、画面に入るページを優先して背景で描画します。ページを表示するサイズに直接描画し、MuPDF のアンチエイリアスで文字の輪郭を整えます。連続表示のページ画像キャッシュは100%以下で最大 48 MiB、拡大時は最大 144 MiB です。拡大時は閲覧位置のページに約3,355万画素まで割り当てます。タブを切り替えると、元のタブには閲覧位置・編集内容と最初に開いた PDF のハンドルを保持し、ページ画像を解放します。選択と検索は PDF に含まれる文字やフォントの対応表を使います。画像だけのページから文字を認識する OCR は搭載していません。[MuPDF](https://mupdf.com/)
 - 本文を選択したり蛍光ペンや下線を使ったりするときに、描画とは別のスレッドでページの文字位置を求めます。閲覧中のテキスト選択では1ページ分の文字位置を保持します。新しい注釈は原文の末尾に追記します。
 - 署名用の全文解析は署名操作時に行います。表示に使ったファイルストリームから原文を取り出し、PDF の末尾に署名フィールドと署名辞書を追記します。元ファイルは閲覧中、読み取り共有で開きます。大きな PDF に署名する際は、元データ・解析結果・出力に応じて追加のメモリーを使います。
 - Windows の暗号プロバイダーが秘密鍵で SHA-256 の分離 CMS 署名を作成します。PDF の署名形式は `adbe.pkcs7.detached` です。署名日時には PC の時計を使います。認定タイムスタンプや長期検証情報の付与は未対応です。[Microsoft の署名 API](https://learn.microsoft.com/en-us/windows/win32/api/wincrypt/nf-wincrypt-cryptsignmessage)
@@ -92,23 +92,25 @@ Windows ストアで選んだ証明書も、次回の署名時に呼び出せま
 
 ## ビルドと検証
 
-Windows x64 の Rust stable と Visual C++ Build Tools でビルドできます。
+Windows x64 の Rust stable、PowerShell 7、Visual Studio 2022 Build Tools の C++ デスクトップ開発ワークロードでビルドできます。
 
 ```powershell
 cargo test --locked
 $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = "-C target-feature=+crt-static"
+./scripts/prepareMupdf.ps1
 cargo build --release --locked --target x86_64-pc-windows-msvc
 ./tests/smoke.ps1 -Executable ./target/x86_64-pc-windows-msvc/release/SumiPDF.exe
 ```
 
 Windows 用のテストは一時証明書を使う署名、改ざん検出、実際の PDF のレンダリングを扱います。PowerShell 7 のスモークテストは、複数の PDF を開き、タブ切り替え、未保存の注釈の復元、署名位置の選択を検査します。240 ページのテスト文書では、ページをまたぐスクロールや連続操作後の表示位置を調べ、操作時間とワーキングセットを記録します。CLI テストは現在のユーザーの個人ストアに一時証明書を作り、管理者権限のある Windows CI ではローカル コンピューターの個人ストアに追加署名用の一時証明書も作ります。PNG を指定した署名と原本のハッシュを検査した後、証明書とテスト鍵を削除します。同じ検査を実行する [Windows CI](.github/workflows/windows.yml) も付属しています。
 
-Windows CI の手動実行で `compare_startup` を選ぶと、同じ Windows ランナーで配布 EXE と v0.9.4 を、保存済みタブのない状態から交互に起動します。ウィンドウが見えるまでと、PDF の最初のページが見えるまでを計測し、中央値と95パーセンタイルを記録します。
+Windows CI の手動実行で `compare_startup` を選ぶと、同じ Windows ランナーで今回ビルドした EXE と v0.9.8 を、保存済みタブのない状態から交互に起動します。ウィンドウが見えるまでと、PDF の最初のページが見えるまでを計測し、中央値と95パーセンタイルを記録します。
 
-macOS からは Rust の `x86_64-pc-windows-gnu` ターゲットと MinGW-w64 の GCC・windres を使います。
+macOS では MuPDF の公式ソースを展開し、同梱ライブラリと一緒にビルドすると描画と文字選択もテストできます。
 
 ```sh
-cargo build --release --locked --target x86_64-pc-windows-gnu
+make -C /path/to/mupdf-1.28.7-source -j 8 build=release USE_SYSTEM_LIBS=no HAVE_GLUT=no HAVE_X11=no HAVE_TESSERACT=no HAVE_LIBARCHIVE=no HAVE_CURL=no HAVE_ZINT=no HAVE_LEPTONICA=no libs
+export SUMIPDF_MUPDF_DIR=/path/to/mupdf-1.28.7-source
 ```
 
 OpenSSL、NSS の certutil・pk12util、Poppler の pdfsig、pdftotext、pdftoppm が使える環境では、以下で外部検証テストも実行できます。保存した PDF を画像に描画し、蛍光ペンと下線の4色、複数行の選択範囲、回転・トリミング後の位置を確認します。追加署名では別々のテスト証明書を使い、2 件の署名の有効性、署名後に変更された版の検出、両方の署名欄の描画を検査します。
@@ -116,3 +118,9 @@ OpenSSL、NSS の certutil・pk12util、Poppler の pdfsig、pdftotext、pdftopp
 ```sh
 cargo test --locked -- --include-ignored
 ```
+
+## ライセンスと対応するソース
+
+SumiPDF は GNU Affero General Public License version 3（AGPL-3.0-only）で配布します。ライセンス本文と依存コンポーネントの表示は、Windows ZIP に同梱します。[LICENSE](LICENSE) · [第三者ライセンス](THIRD-PARTY-NOTICES.md)
+
+配布する Windows ZIP と同じ場所に `SumiPDFSource.zip` を置きます。アプリ本体、MuPDF 1.28.7 のソース、固定された Rust 依存関係とビルド手順を含みます。ソース ZIP を展開した場合は、`./scripts/prepareMupdf.ps1` に続いて `cargo build --release --locked --offline --target x86_64-pc-windows-msvc` でビルドできます。

@@ -76,7 +76,6 @@ const RESTORE_TABS: usize = 0x1fd0;
 const FORGET_CERTIFICATE: usize = 0x1fe0;
 const RENDER_TIMER: usize = 1;
 const SCROLL_TIMER: usize = 2;
-const SMOOTH_TIMER: usize = 3;
 const ACTION: u32 = WM_APP + 1;
 const READY: u32 = WM_APP + 2;
 const DROPPED: u32 = WM_APP + 3;
@@ -732,7 +731,6 @@ struct App {
     wheel_motion: Option<WheelMotion>,
     requested: Option<(u64, u32, (i32, i32), u64)>,
     first_frame_pending: bool,
-    smoothing_in_progress: bool,
     marks: Vec<Mark>,
     saved_marks: Vec<Mark>,
     tool: Option<MarkKind>,
@@ -779,7 +777,6 @@ impl App {
             wheel_motion: None,
             requested: None,
             first_frame_pending: false,
-            smoothing_in_progress: false,
             marks: Vec::new(),
             saved_marks: Vec::new(),
             tool: None,
@@ -1116,11 +1113,6 @@ impl App {
         }
         let Some((page, cache_pixels)) = VIEW.with_borrow_mut(|v| v.next_render(self.page, area))
         else {
-            if let Some(quality) = self.smoothing_quality()
-                && VIEW.with_borrow(|v| v.has_smoothing(self.page, quality))
-            {
-                unsafe { SetTimer(self.hwnd, SMOOTH_TIMER, 200, None) };
-            }
             return;
         };
         self.requested = Some((self.revision, page, area, self.zoom.to_bits()));
@@ -1133,40 +1125,6 @@ impl App {
             zoom: self.zoom,
             cache_pixels,
         });
-    }
-
-    fn smoothing_quality(&self) -> Option<canvas::Quality> {
-        if self.smoothing_in_progress
-            || self.requested.is_some()
-            || self.wheel_motion.is_some()
-            || self.writing
-            || self.tool.is_some()
-            || self.signing.is_some()
-            || self.resume_source.is_none()
-        {
-            return None;
-        }
-        Some((canvas::area(self.ui.canvas), self.zoom.to_bits()))
-    }
-
-    fn smooth_visible_page(&mut self) {
-        if let Some(quality) = self.smoothing_quality()
-            && let Some(source) = self.resume_source.clone()
-            && let Some(smoothing) = VIEW.with_borrow_mut(|v| v.take_smoothing(self.page, quality))
-        {
-            self.smoothing_in_progress = worker::smooth(
-                self.hwnd as usize,
-                self.events.clone(),
-                source,
-                worker::SmoothingRequest {
-                    revision: self.revision,
-                    page: self.page,
-                    quality,
-                    smoothing,
-                },
-            )
-            .is_ok();
-        }
     }
 
     fn page_to(&mut self, page: u32) {
@@ -1372,19 +1330,6 @@ impl App {
                         }
                     }
                 }
-            }
-            Event::Smoothed(request, image) => {
-                self.smoothing_in_progress = false;
-                if request.revision == self.revision
-                    && request.quality == (canvas::area(self.ui.canvas), self.zoom.to_bits())
-                    && let Some(image) = image
-                    && VIEW.with_borrow_mut(|v| {
-                        v.finish_smoothing(request.page, request.quality, image)
-                    })
-                {
-                    canvas::redraw(self.ui.canvas);
-                }
-                self.render();
             }
             Event::Layout {
                 revision,
@@ -1921,10 +1866,6 @@ impl App {
                         KillTimer(self.hwnd, RENDER_TIMER);
                     }
                     self.render();
-                }
-                WM_TIMER if msg.hwnd == self.hwnd && msg.wParam == SMOOTH_TIMER => {
-                    unsafe { KillTimer(self.hwnd, SMOOTH_TIMER) };
-                    self.smooth_visible_page();
                 }
                 _ => unsafe {
                     TranslateMessage(&msg);

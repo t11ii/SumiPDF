@@ -7,7 +7,7 @@ use crate::highlight::{
 };
 use crate::raster_size::{FIT_PIXELS, fitted_page_size, view_pixel_limit};
 use crate::textselect::TextLayout;
-use crate::winpdf::{Bitmap, Frame, Smoothing};
+use crate::winpdf::{Bitmap, Frame};
 use std::{
     cell::RefCell,
     collections::{BTreeMap, VecDeque},
@@ -81,7 +81,6 @@ pub(super) type Quality = ((i32, i32), u64);
 struct CachedPage {
     quality: Quality,
     limited_to: Option<u64>,
-    smoothing: Option<Smoothing>,
     image: Result<Bitmap, String>,
 }
 
@@ -272,7 +271,6 @@ impl Canvas {
                     CachedPage {
                         quality,
                         limited_to: None,
-                        smoothing: None,
                         image: Ok(image),
                     },
                 );
@@ -490,14 +488,12 @@ impl Canvas {
                 r.layout.measured(page, frame.ratio);
             }
             let limited_to = result.as_ref().ok().and_then(|f| f.limited_to);
-            let smoothing = result.as_ref().ok().and_then(|f| f.smoothing);
             let image = result.map(|frame| frame.bitmap);
             r.frames.insert(
                 page,
                 CachedPage {
                     quality,
                     limited_to,
-                    smoothing,
                     image,
                 },
             );
@@ -517,68 +513,6 @@ impl Canvas {
             return true;
         }
         false
-    }
-
-    pub(super) fn has_smoothing(&self, page: u32, quality: Quality) -> bool {
-        self.reading
-            .as_ref()
-            .and_then(|r| r.frames.get(&page))
-            .is_some_and(|frame| frame.quality == quality && frame.smoothing.is_some())
-    }
-
-    pub(super) fn take_smoothing(&mut self, page: u32, quality: Quality) -> Option<Smoothing> {
-        let frame = self.reading.as_mut()?.frames.get_mut(&page)?;
-        if frame.quality != quality {
-            return None;
-        }
-        frame.smoothing.take()
-    }
-
-    pub(super) fn finish_smoothing(&mut self, page: u32, quality: Quality, bitmap: Bitmap) -> bool {
-        let Some(frame) = self.reading.as_mut().and_then(|r| r.frames.get_mut(&page)) else {
-            return false;
-        };
-        if frame.quality != quality
-            || !frame.image.as_ref().is_ok_and(|current| {
-                (current.width, current.height) == (bitmap.width, bitmap.height)
-            })
-        {
-            return false;
-        }
-        frame.image = Ok(bitmap);
-        true
-    }
-
-    pub fn set_tool(&mut self, tool: Option<MarkStyle>) {
-        if self.tool != tool {
-            self.cancel_drag();
-            self.tool = tool;
-        }
-    }
-
-    pub fn set_signature(&mut self, draw: bool, area: Option<UnitRect>) {
-        if self.draw_signature != draw || self.signature != area {
-            self.cancel_drag();
-            self.draw_signature = draw;
-            self.signature = area;
-        }
-    }
-
-    pub fn take_signature(&mut self) -> Option<(u32, UnitRect)> {
-        self.placed_signature.take()
-    }
-
-    pub fn set_marks(&mut self, marks: &[Mark], page: u32) {
-        self.page = page;
-        self.marks.clear();
-        self.marks.extend_from_slice(marks);
-    }
-
-    pub fn set_text_layout(&mut self, layout: Option<TextLayout>) {
-        if matches!(self.drag, Some(Drag::Highlight { glyph: Some(_), .. })) {
-            self.cancel_drag();
-        }
-        self.text_layout = layout;
     }
 
     pub(super) fn enable_text_selection(&mut self, hwnd: HWND, enabled: bool) {
@@ -1386,11 +1320,10 @@ mod tests {
             CachedPage {
                 quality: (area, view.zoom.to_bits()),
                 limited_to: None,
-                smoothing: None,
                 image: Ok(Bitmap {
                     width: 1,
                     height: 1,
-                    pixels: windows::core::Array::from_slice(&[255; 4]),
+                    pixels: vec![255; 4],
                 }),
             },
         );
@@ -1435,11 +1368,10 @@ mod tests {
                     CachedPage {
                         quality: ((600, 440), 1.0_f64.to_bits()),
                         limited_to: None,
-                        smoothing: None,
                         image: Ok(Bitmap {
                             width: 1,
                             height: 1,
-                            pixels: windows::core::Array::from_slice(&[255; 4]),
+                            pixels: vec![255; 4],
                         }),
                     },
                 )]),
@@ -1484,11 +1416,10 @@ mod tests {
         let surface = |bgra: [u8; 4]| CachedPage {
             quality: ((64, 80), 1.0f64.to_bits()),
             limited_to: None,
-            smoothing: None,
             image: Ok(Bitmap {
                 width: 1,
                 height: 1,
-                pixels: windows::core::Array::from_slice(&bgra),
+                pixels: bgra.to_vec(),
             }),
         };
         let reading = Reading {

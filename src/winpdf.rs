@@ -1,203 +1,152 @@
-//! Native PDF rendering and source access on background MTA threads.
-
-use std::{marker::PhantomData, path::Path, rc::Rc};
-
-use windows::{
-    Data::Pdf::{PdfDocument, PdfPage, PdfPageRenderOptions},
-    Foundation::Size,
-    Graphics::Imaging::{
-        BitmapAlphaMode, BitmapDecoder, BitmapEncoder, BitmapInterpolationMode, BitmapPixelFormat,
-        BitmapTransform, ColorManagementMode, ExifOrientationMode,
-    },
-    Storage::{
-        FileAccessMode, StorageOpenOptions,
-        Streams::{
-            FileOpenDisposition, FileRandomAccessStream, IRandomAccessStream,
-            InMemoryRandomAccessStream,
-        },
-    },
-    Win32::{
-        Foundation::{E_INVALIDARG, E_OUTOFMEMORY, E_UNEXPECTED},
-        System::{
-            Com::IStream,
-            WinRT::{
-                CreateStreamOverRandomAccessStream, RO_INIT_MULTITHREADED, RoInitialize,
-                RoUninitialize,
-            },
-        },
-    },
-    core::{AgileReference, Array, Error, HSTRING, Result as WinResult},
+//! MuPDF on background workers. Each document instance is confined to its worker.
+use std::{
+    ffi::{CStr, c_char, c_int, c_void},
+    fs::{File, OpenOptions},
+    io::{Read, Seek, SeekFrom},
+    path::Path,
+    ptr::NonNull,
+    sync::{Arc, Mutex},
 };
 
-use crate::raster_size::{
-    FIT_PIXELS, bounded_bitmap_size, bounded_decoded_size, fitted_page_size, supersampled_size,
-    view_pixel_limit,
+#[cfg(windows)]
+use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+
+use crate::{
+    highlight::UnitRect,
+    raster_size::{FIT_PIXELS, bounded_bitmap_size, fitted_page_size, view_pixel_limit},
 };
 
-/// WinRT initialization and shutdown must occur on the same thread.
-pub struct Apartment(PhantomData<Rc<()>>);
+type ErrorBuffer = [c_char; 512];
+type Glyph = unsafe extern "C" fn(*mut c_void, UnitRect, c_int, c_int, c_int) -> c_int;
 
-pub fn initialize() -> Result<Apartment, String> {
-    unsafe { RoInitialize(RO_INIT_MULTITHREADED) }
-        .map_err(|e| format!("Windows の PDF 描画を初期化できませんでした。\n{e}"))?;
-    Ok(Apartment(PhantomData))
+unsafe extern "C" {
+    #[cfg(windows)]
+    fn sumi_pdf_open_handle(
+        file: *mut c_void,
+        count: *mut c_int,
+        error: *mut c_char,
+    ) -> *mut c_void;
+    #[cfg(not(windows))]
+    fn sumi_pdf_open_path(
+        path: *const c_char,
+        count: *mut c_int,
+        error: *mut c_char,
+    ) -> *mut c_void;
+    fn sumi_pdf_drop(doc: *mut c_void);
+    fn sumi_pdf_ratio(doc: *mut c_void, page: c_int, ratio: *mut f64, error: *mut c_char) -> c_int;
+    fn sumi_pdf_render(
+        doc: *mut c_void,
+        page: c_int,
+        width: c_int,
+        height: c_int,
+        bgra: *mut u8,
+        error: *mut c_char,
+    ) -> c_int;
+    fn sumi_pdf_text(
+        doc: *mut c_void,
+        page: c_int,
+        output: *mut c_void,
+        glyph: Glyph,
+        error: *mut c_char,
+    ) -> c_int;
 }
 
-impl Drop for Apartment {
-    fn drop(&mut self) {
-        unsafe { RoUninitialize() }
-    }
+fn message(error: &ErrorBuffer) -> String {
+    // The bridge writes a NUL-terminated message into the zero-initialized buffer.
+    unsafe { CStr::from_ptr(error.as_ptr()) }
+        .to_string_lossy()
+        .into_owned()
 }
 
 pub struct Bitmap {
     pub width: u32,
     pub height: u32,
     /// Tightly packed BGRA, starting at the top left.
-    pub pixels: Array<u8>,
+    pub pixels: Vec<u8>,
 }
 
 pub struct Frame {
     pub bitmap: Bitmap,
     pub ratio: f64,
     pub limited_to: Option<u64>,
-    pub smoothing: Option<Smoothing>,
 }
 
-#[derive(Clone, Copy)]
-pub struct Smoothing {
-    output: (u32, u32),
-    samples: (u32, u32),
-}
-
-// DetachPixelData returns owned CoTaskMem containing just bytes. No COM object or
-// apartment-bound state moves with it; CoTaskMemFree may run on the UI thread.
-unsafe impl Send for Bitmap {}
-
-pub struct Document {
-    pdf: PdfDocument,
-    // Keep the backing stream available for pages that Windows reads on demand.
-    stream: IRandomAccessStream,
-    count: u32,
-}
-
-/// Share the renderer's exact backing stream; reopening a pathname for signing could
-/// resolve to a different file. Acquire document bytes only when asked to sign.
+/// Pins the exact open file. On Windows the handle denies writes and deletion, and
+/// render/search workers reopen the file object by handle without re-resolving the path.
 #[derive(Clone)]
-pub struct SigningSource(AgileReference<IRandomAccessStream>);
+pub struct SigningSource {
+    file: Arc<Mutex<File>>,
+    #[cfg(not(windows))]
+    test_path: std::path::PathBuf,
+}
 
 impl SigningSource {
+    fn open(path: &Path) -> Result<Self, String> {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(windows)]
+        options.share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ);
+        let file = options
+            .open(path)
+            .map_err(|e| format!("PDF を開けませんでした。\n{e}"))?;
+        Ok(Self {
+            file: Arc::new(Mutex::new(file)),
+            #[cfg(not(windows))]
+            test_path: path.to_path_buf(),
+        })
+    }
+
     pub fn read_bytes(&self) -> Result<Vec<u8>, String> {
-        let _apartment = initialize()?;
-        self.read_stream(None)
-            .map_err(|e| format!("編集中の PDF を読み込めません。\n{e}"))
-    }
-
-    pub fn read_for_search(&self) -> Result<Vec<u8>, String> {
-        let _apartment = initialize()?;
-        self.read_stream(Some(256 * 1024 * 1024))
-            .map_err(|e| e.message().to_string())
-    }
-
-    fn read_stream(&self, search_limit: Option<u64>) -> WinResult<Vec<u8>> {
-        let stream = self.0.resolve()?.CloneStream()?;
-        stream.Seek(0)?;
-        let size = stream.Size()?;
-        if search_limit.is_some_and(|limit| size > limit) {
-            return Err(Error::new(
-                E_INVALIDARG,
-                "Find supports PDFs up to 256 MiB.",
-            ));
-        }
-        let length = u32::try_from(size)
-            .map_err(|_| Error::new(E_INVALIDARG, "4 GiB 以上の PDF は編集できません。"))?
-            as usize;
-        let reader: IStream = unsafe { CreateStreamOverRandomAccessStream(&stream)? };
-        let mut bytes = Vec::<u8>::new();
-        bytes
-            .try_reserve_exact(length)
-            .map_err(|_| Error::new(E_OUTOFMEMORY, "PDF の編集に必要なメモリを確保できません。"))?;
-
-        while bytes.len() < length {
-            let requested = (length - bytes.len()).min(1024 * 1024) as u32;
-            let mut read = 0;
-            // SAFETY: capacity covers the complete source. Read initializes at most
-            // requested bytes in the spare area and reports how many were written.
-            unsafe {
-                reader
-                    .Read(
-                        bytes.spare_capacity_mut().as_mut_ptr().cast(),
-                        requested,
-                        Some(&mut read),
-                    )
-                    .ok()?;
-                if read == 0 || read > requested {
-                    return Err(Error::new(E_UNEXPECTED, "PDF の読み込みが中断されました。"));
-                }
-                bytes.set_len(bytes.len() + read as usize);
-            }
-        }
-        if stream.Size()? != length as u64 {
-            return Err(Error::new(
-                E_UNEXPECTED,
-                "読み込み中に PDF のサイズが変わりました。",
-            ));
-        }
+        let mut file = self.file.lock().map_err(|e| e.to_string())?;
+        let mut bytes = Vec::new();
+        file.seek(SeekFrom::Start(0))
+            .and_then(|_| file.read_to_end(&mut bytes))
+            .map_err(|e| format!("編集中の PDF を読み込めません。\n{e}"))?;
         Ok(bytes)
     }
 }
 
+pub struct Document {
+    inner: NonNull<c_void>,
+    source: SigningSource,
+    count: u32,
+}
+
 impl Document {
     pub fn open_file(path: &Path) -> Result<Self, String> {
-        Self::open_stream(path).map_err(|e| {
-            if e.code().0 as u32 == 0x8007052B {
-                "この PDF を開くにはパスワードが必要です。".to_owned()
-            } else {
-                format!("PDF を開けませんでした。\n{e}")
-            }
-        })
-    }
-
-    fn open_stream(path: &Path) -> WinResult<Self> {
-        let stream = FileRandomAccessStream::OpenWithOptionsAsync(
-            &HSTRING::from(path),
-            FileAccessMode::Read,
-            StorageOpenOptions::AllowOnlyReaders,
-            FileOpenDisposition::OpenExisting,
-        )?
-        .join()?;
-        Self::load_stream(stream)
+        let source = SigningSource::open(path)?;
+        Self::from_source(&source).map_err(|e| format!("PDF を開けませんでした。\n{e}"))
     }
 
     pub fn from_source(source: &SigningSource) -> Result<Self, String> {
-        let stream = source
-            .0
-            .resolve()
-            .and_then(|s| s.CloneStream())
-            .map_err(|e| e.to_string())?;
-        stream.Seek(0).map_err(|e| e.to_string())?;
-        Self::load_stream(stream).map_err(|e| e.to_string())
-    }
-
-    fn load_stream(stream: IRandomAccessStream) -> WinResult<Self> {
-        let pdf = PdfDocument::LoadFromStreamAsync(&stream)?.join()?;
-        let count = pdf.PageCount()?;
-        if count == 0 {
-            return Err(Error::new(
-                E_UNEXPECTED,
-                "この PDF にはページがありません。",
-            ));
-        }
-        Ok(Self { pdf, stream, count })
+        let mut count = 0;
+        let mut error: ErrorBuffer = [0; 512];
+        #[cfg(windows)]
+        let ptr = {
+            let file = source.file.lock().map_err(|e| e.to_string())?;
+            // The bridge makes its own independently positioned stream from this file object.
+            unsafe { sumi_pdf_open_handle(file.as_raw_handle(), &mut count, error.as_mut_ptr()) }
+        };
+        #[cfg(not(windows))]
+        let ptr = {
+            use std::{ffi::CString, os::unix::ffi::OsStrExt};
+            let path =
+                CString::new(source.test_path.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+            unsafe { sumi_pdf_open_path(path.as_ptr(), &mut count, error.as_mut_ptr()) }
+        };
+        Ok(Self {
+            inner: NonNull::new(ptr).ok_or_else(|| message(&error))?,
+            source: source.clone(),
+            count: count as u32,
+        })
     }
 
     pub fn page_count(&self) -> u32 {
         self.count
     }
 
-    pub fn signing_source(&self) -> Result<SigningSource, String> {
-        AgileReference::new(&self.stream)
-            .map(SigningSource)
-            .map_err(|e| format!("署名用に PDF を保持できません。\n{e}"))
+    pub fn signing_source(&self) -> SigningSource {
+        self.source.clone()
     }
 
     pub fn render_fit(&self, index: u32, area: (i32, i32), zoom: f64) -> Result<Bitmap, String> {
@@ -212,170 +161,120 @@ impl Document {
         zoom: f64,
         cache_pixels: Option<u64>,
     ) -> Result<Frame, String> {
-        let page = Page(self.pdf.GetPage(index).map_err(|e| e.to_string())?);
-        let size = checked_size(&page.0)?;
-        let ratio = f64::from(size.Width) / f64::from(size.Height);
+        let page = self.page_index(index)?;
+        let mut ratio = 0.0;
+        self.call(|doc, error| unsafe { sumi_pdf_ratio(doc, page, &mut ratio, error) })?;
         let (width, height) = fitted_page_size(area, ratio, zoom);
         let requested = (width as u32, height as u32);
         let limit = view_pixel_limit(zoom);
         let budget = cache_pixels.unwrap_or(limit).clamp(1, limit);
-        let dimensions = |cap| bounded_bitmap_size(requested, cap);
-        let output = dimensions(budget);
-        let limited_to = (budget < limit && output != dimensions(limit)).then_some(budget);
-        let bitmap = rasterize(&page.0, output, None, budget)
-            .or_else(|error| {
-                let standard = budget.min(FIT_PIXELS);
-                let fallback = dimensions(standard);
-                if fallback == output {
-                    return Err(error);
-                }
-                rasterize(&page.0, fallback, None, standard)
-            })
-            .map_err(|e| format!("{} ページを表示できませんでした。 {e}", index + 1))?;
-        // The first usable frame is complete. Smoothing can replace it at the same size later.
-        let smoothing = if zoom <= 1.0
-            && output == requested
-            && output.0.abs_diff(bitmap.width) <= 1
-            && output.1.abs_diff(bitmap.height) <= 1
-        {
-            let output = (bitmap.width, bitmap.height);
-            supersampled_size(output).map(|samples| Smoothing { output, samples })
-        } else {
-            None
-        };
+        let output = bounded_bitmap_size(requested, budget);
+        let fallback = bounded_bitmap_size(requested, budget.min(FIT_PIXELS));
+        let bitmap = match self.rasterize(page, output) {
+            Err(_) if fallback != output => self.rasterize(page, fallback),
+            rendered => rendered,
+        }
+        .map_err(|e| format!("{} ページを表示できませんでした。 {e}", index + 1))?;
+        let full_size = bounded_bitmap_size(requested, limit);
+        let limited_to = (output != full_size).then_some(budget);
         Ok(Frame {
             bitmap,
             ratio,
             limited_to,
-            smoothing,
         })
     }
 
-    pub fn smooth_page(&self, index: u32, smoothing: Smoothing) -> WinResult<Bitmap> {
-        let page = Page(self.pdf.GetPage(index)?);
-        let (width, height) = smoothing.output;
-        rasterize(
-            &page.0,
-            smoothing.samples,
-            Some(smoothing.output),
-            u64::from(width) * u64::from(height),
-        )
-    }
-}
-
-// PdfPage is IClosable. Close it promptly when page navigation or decoding fails.
-struct Page(PdfPage);
-impl Drop for Page {
-    fn drop(&mut self) {
-        let _ = self.0.Close();
-    }
-}
-
-fn checked_size(page: &PdfPage) -> Result<Size, String> {
-    let size = page.Size().map_err(|e| e.to_string())?;
-    if !size.Width.is_finite()
-        || !size.Height.is_finite()
-        || size.Width <= 0.0
-        || size.Height <= 0.0
-    {
-        return Err("ページの寸法を読み取れませんでした。".into());
-    }
-    Ok(size)
-}
-
-fn rasterize(
-    page: &PdfPage,
-    size: (u32, u32),
-    downsample_to: Option<(u32, u32)>,
-    budget: u64,
-) -> WinResult<Bitmap> {
-    let stream = InMemoryRandomAccessStream::new()?;
-    let options = PdfPageRenderOptions::new()?;
-    options.SetDestinationWidth(size.0)?;
-    options.SetDestinationHeight(size.1)?;
-    options.SetBitmapEncoderId(BitmapEncoder::BmpEncoderId()?)?;
-    page.RenderWithOptionsToStreamAsync(&stream, &options)?
-        .join()?;
-    decode_page_bitmap(&stream, size, downsample_to, budget)
-}
-
-fn decode_page_bitmap(
-    stream: &InMemoryRandomAccessStream,
-    requested: (u32, u32),
-    downsample_to: Option<(u32, u32)>,
-    budget: u64,
-) -> WinResult<Bitmap> {
-    stream.Seek(0)?;
-    let decoder = BitmapDecoder::CreateAsync(stream)?.join()?;
-    let actual = (decoder.PixelWidth()?, decoder.PixelHeight()?);
-    let dimensions = || {
-        format!(
-            "要求 {}×{}、実画像 {}×{} px",
-            requested.0, requested.1, actual.0, actual.1
-        )
-    };
-    let (width, height) = if let Some(output) = downsample_to {
-        if actual.0.abs_diff(requested.0) > 1 || actual.1.abs_diff(requested.1) > 1 {
-            return Err(Error::new(
-                E_UNEXPECTED,
-                format!(
-                    "高解像度のページ画像の寸法が一致しません（{}）。",
-                    dimensions()
-                ),
-            ));
-        }
-        output
-    } else {
-        bounded_decoded_size(requested, actual, budget).ok_or_else(|| {
-            Error::new(
-                E_UNEXPECTED,
-                format!("ページ画像の寸法がゼロです（{}）。", dimensions()),
+    fn rasterize(&self, page: c_int, (width, height): (u32, u32)) -> Result<Bitmap, String> {
+        let size = width as usize * height as usize * 4;
+        let mut pixels = Vec::new();
+        pixels.try_reserve_exact(size).map_err(|e| e.to_string())?;
+        pixels.resize(size, 255);
+        // The bridge renders into the requested-sized, opaque buffer and releases
+        // its view of it before returning.
+        self.call(|doc, error| unsafe {
+            sumi_pdf_render(
+                doc,
+                page,
+                width as c_int,
+                height as c_int,
+                pixels.as_mut_ptr(),
+                error,
             )
-        })?
-    };
-    let decode = || -> WinResult<Array<u8>> {
-        let transform = BitmapTransform::new()?;
-        if (width, height) != actual {
-            transform.SetScaledWidth(width)?;
-            transform.SetScaledHeight(height)?;
-            transform.SetInterpolationMode(BitmapInterpolationMode::Fant)?;
-        }
-        decoder
-            .GetPixelDataTransformedAsync(
-                BitmapPixelFormat::Bgra8,
-                BitmapAlphaMode::Ignore,
-                &transform,
-                ExifOrientationMode::IgnoreExifOrientation,
-                ColorManagementMode::DoNotColorManage,
-            )?
-            .join()?
-            .DetachPixelData()
-    };
-    let data = decode().map_err(|error| {
-        Error::new(
-            error.code(),
-            format!(
-                "ページ画像を展開できません（{}）。 {}",
-                dimensions(),
-                error.message()
-            ),
-        )
-    })?;
-    if data.len() != (u64::from(width) * u64::from(height) * 4) as usize {
-        return Err(Error::new(
-            E_UNEXPECTED,
-            format!(
-                "ページ画像のデータ長が一致しません（{}、出力 {width}×{height} px、{} バイト）。",
-                dimensions(),
-                data.len()
-            ),
-        ));
+        })?;
+        Ok(Bitmap {
+            width,
+            height,
+            pixels,
+        })
     }
-    Ok(Bitmap {
-        width,
-        height,
-        pixels: data,
-    })
+
+    pub fn glyphs(
+        &self,
+        index: u32,
+        mut visit: impl FnMut(UnitRect, Option<char>, c_int, crate::highlight::Direction) -> bool,
+    ) -> Result<(), String> {
+        use crate::highlight::Direction;
+
+        unsafe extern "C" fn glyph<F: FnMut(UnitRect, Option<char>, c_int, Direction) -> bool>(
+            visitor: *mut c_void,
+            rect: UnitRect,
+            unicode: c_int,
+            line: c_int,
+            direction: c_int,
+        ) -> c_int {
+            let direction = match direction {
+                1 => Direction::Down,
+                2 => Direction::Left,
+                3 => Direction::Up,
+                _ => Direction::Right,
+            };
+            let ch = char::from_u32(unicode as u32).filter(|&ch| ch != '\0' && ch != '\u{fffd}');
+            i32::from(unsafe { &mut *visitor.cast::<F>() }(
+                rect, ch, line, direction,
+            ))
+        }
+
+        fn run<F: FnMut(UnitRect, Option<char>, c_int, Direction) -> bool>(
+            doc: &Document,
+            index: c_int,
+            visitor: &mut F,
+        ) -> Result<(), String> {
+            // The bridge calls this visitor synchronously and contains MuPDF's
+            // exception handling on the C side.
+            doc.call(|doc, error| unsafe {
+                sumi_pdf_text(
+                    doc,
+                    index,
+                    std::ptr::from_mut(visitor).cast(),
+                    glyph::<F>,
+                    error,
+                )
+            })
+        }
+
+        run(self, self.page_index(index)?, &mut visit)
+    }
+
+    fn page_index(&self, index: u32) -> Result<c_int, String> {
+        if index >= self.count {
+            return Err("ページ番号が範囲外です。".into());
+        }
+        Ok(index as c_int)
+    }
+
+    fn call(&self, f: impl FnOnce(*mut c_void, *mut c_char) -> c_int) -> Result<(), String> {
+        let mut error: ErrorBuffer = [0; 512];
+        if f(self.inner.as_ptr(), error.as_mut_ptr()) == 0 {
+            return Err(message(&error));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Document {
+    fn drop(&mut self) {
+        unsafe { sumi_pdf_drop(self.inner.as_ptr()) };
+    }
 }
 
 #[cfg(test)]
@@ -384,51 +283,7 @@ mod tests {
     use std::io::Write;
 
     #[test]
-    fn reads_the_real_bmp_rows_when_windows_returns_a_different_size() {
-        let _apartment = initialize().unwrap();
-        // The second BMP exceeds the edge limit but requires only 128 KiB of test pixels.
-        for (w, h, requested, downsample_to, expected) in [
-            (201, 100, (200, 100), None, (201, 100)),
-            (8193, 4, (4096, 3000), None, (4096, 1)),
-            (201, 101, (200, 100), Some((100, 50)), (100, 50)),
-        ] {
-            let mut pixels = vec![255; (w * h * 4) as usize];
-            for row in pixels.chunks_exact_mut(w as usize * 4) {
-                row.as_chunks_mut::<4>().0[..w as usize / 2].fill([0, 0, 255, 255]);
-            }
-            let stream = InMemoryRandomAccessStream::new().unwrap();
-            let encoder =
-                BitmapEncoder::CreateAsync(BitmapEncoder::BmpEncoderId().unwrap(), &stream)
-                    .unwrap()
-                    .join()
-                    .unwrap();
-            encoder
-                .SetPixelData(
-                    BitmapPixelFormat::Bgra8,
-                    BitmapAlphaMode::Ignore,
-                    w,
-                    h,
-                    96.0,
-                    96.0,
-                    &pixels,
-                )
-                .unwrap();
-            encoder.FlushAsync().unwrap().join().unwrap();
-            drop(encoder);
-            let image = decode_page_bitmap(&stream, requested, downsample_to, FIT_PIXELS).unwrap();
-            assert_eq!((image.width, image.height), expected);
-            let stride = image.width as usize * 4;
-            assert_eq!(image.pixels.len(), stride * image.height as usize);
-            for row in image.pixels.chunks_exact(stride) {
-                assert_eq!(&row[..3], &[0, 0, 255]);
-                assert_eq!(&row[stride - 4..stride - 1], &[255, 255, 255]);
-            }
-        }
-    }
-
-    #[test]
-    fn windows_renders_unsigned_graphics_and_text_only_a4_pages_at_fit_and_zoom() {
-        let _apartment = initialize().unwrap();
+    fn renders_graphics_and_antialiased_text_at_fit_and_zoom() {
         let content = "1 0 0 rg 0 0 297.64 420.945 re f\n";
         let text = "BT /F1 36 Tf 64 700 Td (Text-only PDF) Tj ET\n";
         let objects = [
@@ -453,7 +308,8 @@ mod tests {
             "{xref}trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{offset}\n%%EOF"
         )
         .unwrap();
-        let path = std::env::temp_dir().join(format!("winPdfTest-文書-{}.pdf", std::process::id()));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("文書.pdf");
         std::fs::write(&path, &pdf).unwrap();
         let document = Document::open_file(&path).unwrap();
         assert_eq!(document.page_count(), 2);
@@ -477,14 +333,6 @@ mod tests {
                     > 50
             );
         }
-        let first = document.render_page(1, (900, 1000), 1.0, None).unwrap();
-        let smoothing = first.smoothing.expect("fit frame can be smoothed later");
-        let smoothed = document.smooth_page(1, smoothing).unwrap();
-        assert_eq!(
-            (smoothed.width, smoothed.height),
-            (first.bitmap.width, first.bitmap.height)
-        );
-        assert_eq!(smoothed.pixels.len(), first.bitmap.pixels.len());
         let zoom = 4.0;
         let limit = view_pixel_limit(zoom);
         let detailed = document
@@ -504,13 +352,12 @@ mod tests {
                 .iter()
                 .any(|p| p[..3] == [0, 0, 0])
         );
-        let source = document.signing_source().unwrap();
+        let source = document.signing_source();
         drop(document);
         let read = std::thread::spawn(move || source.read_bytes())
             .join()
             .unwrap()
             .unwrap();
         assert_eq!(read, pdf);
-        std::fs::remove_file(path).unwrap();
     }
 }

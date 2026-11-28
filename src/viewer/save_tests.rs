@@ -76,7 +76,6 @@ fn check_saved_signature(bytes: &[u8]) {
 
 #[test]
 fn windows_signs_the_viewed_pdf_and_preserves_existing_files() {
-    let _apartment = winpdf::initialize().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let source_path = dir.path().join("原本.pdf");
     let target = dir.path().join("署名済み.pdf");
@@ -87,7 +86,7 @@ fn windows_signs_the_viewed_pdf_and_preserves_existing_files() {
 
     let viewed = winpdf::Document::open_file(&source_path).unwrap();
     let first_page = viewed.render_fit(0, (128, 128), 1.0).unwrap();
-    let source = viewed.signing_source().unwrap();
+    let source = viewed.signing_source();
     wincrypto::tests::with_test_certificate(|cert| {
         // As in the GUI, the rendering apartment keeps its document open while
         // another thread acquires the stream and creates the signed file.
@@ -117,7 +116,6 @@ fn windows_signs_the_viewed_pdf_and_preserves_existing_files() {
 
 #[test]
 fn windows_reopens_visible_highlights_in_unsigned_and_signed_copies() {
-    let _apartment = winpdf::initialize().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let original = source_pdf();
     let input = dir.path().join("元の文書.pdf");
@@ -125,7 +123,7 @@ fn windows_reopens_visible_highlights_in_unsigned_and_signed_copies() {
     let signed = dir.path().join("蛍光ペンと署名.pdf");
     fs::write(&input, &original).unwrap();
     let doc = winpdf::Document::open_file(&input).unwrap();
-    let source = doc.signing_source().unwrap();
+    let source = doc.signing_source();
     let marks = [
         Mark {
             page: 0,
@@ -230,7 +228,6 @@ fn windows_reopens_visible_highlights_in_unsigned_and_signed_copies() {
 
 #[test]
 fn windows_signs_the_selected_field_with_a_custom_watermark_and_pending_markup() {
-    let _apartment = winpdf::initialize().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let source_path = dir.path().join("form.pdf");
     let destination = dir.path().join("signed-form.pdf");
@@ -272,7 +269,7 @@ fn windows_signs_the_selected_field_with_a_custom_watermark_and_pending_markup()
         ),
     };
     let doc = winpdf::Document::open_file(&source_path).unwrap();
-    let source = doc.signing_source().unwrap();
+    let source = doc.signing_source();
     let mark = Mark {
         page: 0,
         style: MarkStyle::default(),

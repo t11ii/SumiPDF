@@ -622,8 +622,9 @@ dependencies = [
 
 [[package]]
 name = "sumi-pdf"
-version = "0.9.8"
+version = "0.10.0"
 dependencies = [
+ "cc",
  "embed-resource",
  "lopdf",
  "memchr",

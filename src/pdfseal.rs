@@ -165,10 +165,6 @@ pub(crate) fn editable_document(input: &[u8]) -> Result<Document, String> {
     Ok(doc)
 }
 
-pub(crate) fn allows_annotations(input: &[u8], doc: &Document) -> bool {
-    check_editable_source(input, doc).is_ok() && check_unsigned_for_annotations(doc).is_ok()
-}
-
 fn check_unsigned_for_annotations(doc: &Document) -> Result<(), String> {
     if doc.catalog().map_err(pdf_error)?.has(b"Perms")
         || doc.objects.values().any(|o| contains_signature(doc, o))

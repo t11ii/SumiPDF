@@ -8,7 +8,7 @@ mod cli;
 mod continuous;
 #[cfg(any(windows, test))]
 mod highlight;
-#[cfg(test)]
+#[cfg(all(test, mupdf_backend))]
 mod highlight_roundtrip;
 #[cfg(any(windows, test))]
 mod pdfseal;
@@ -22,7 +22,7 @@ mod textselect;
 mod viewer;
 #[cfg(windows)]
 mod wincrypto;
-#[cfg(windows)]
+#[cfg(any(windows, all(test, mupdf_backend)))]
 mod winpdf;
 
 #[cfg(windows)]

@@ -325,10 +325,7 @@ fn run(hwnd: usize, mailbox: &Mailbox, events: Sender<Event>) {
                     if mailbox.superseded(Some(cold_after)) {
                         continue;
                     }
-                    match source
-                        .read_for_search()
-                        .and_then(|bytes| TextDocument::load_for_search(&bytes))
-                    {
+                    match TextDocument::from_source(&source) {
                         Ok(doc) => {
                             cache = Some(SearchDocument {
                                 revision,

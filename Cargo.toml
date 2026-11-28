@@ -1,7 +1,8 @@
 [package]
 name = "sumi-pdf"
-version = "0.9.8"
+version = "0.10.0"
 edition = "2024"
+license = "AGPL-3.0-only"
 publish = false
 
 [[bin]]
@@ -9,6 +10,7 @@ name = "SumiPDF"
 path = "src/main.rs"
 
 [build-dependencies]
+cc = "1"
 embed-resource = "3.0"
 
 [dependencies]
@@ -24,10 +26,11 @@ zune-jpeg = { version = "0.5.15", default-features = false, features = ["std"] }
 [target.'cfg(windows)'.dependencies]
 zeroize = "1.8"
 tempfile = "3"
-windows = { version = "0.62.2", features = ["Data_Pdf", "Foundation", "Storage_Streams", "Graphics_Imaging", "Win32_System_WinRT", "Win32_System_Com", "Win32_UI_Accessibility"] }
+windows = { version = "0.62.2", features = ["Win32_System_Com", "Win32_UI_Accessibility"] }
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Graphics_GdiPlus", "Win32_System_LibraryLoader", "Win32_System_Com",
     "Win32_Security_Cryptography", "Win32_Security_Cryptography_UI", "Win32_System_SystemInformation", "Win32_System_Console",
+    "Win32_Storage_FileSystem",
     "Win32_UI_Controls_Dialogs", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_UI_Accessibility", "Win32_Graphics_Dwm",
 ] }

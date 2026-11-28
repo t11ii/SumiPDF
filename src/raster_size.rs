@@ -37,57 +37,9 @@ pub fn bounded_bitmap_size(size: (u32, u32), pixels: u64) -> (u32, u32) {
     )
 }
 
-pub fn supersampled_size((width, height): (u32, u32)) -> Option<(u32, u32)> {
-    // Keep the temporary raster bounded even when the page cache has room for more.
-    const SAMPLE_PIXELS: u64 = 4 * 1024 * 1024;
-    let samples = bounded_bitmap_size(
-        (width.saturating_mul(2), height.saturating_mul(2)),
-        SAMPLE_PIXELS,
-    );
-    // Skip the extra render work if the budget only allows a marginal increase.
-    (samples.0 >= width.saturating_add(width.div_ceil(4))
-        && samples.1 >= height.saturating_add(height.div_ceil(4)))
-    .then_some(samples)
-}
-
-#[cfg(test)]
-pub fn decoded_size(requested: (u32, u32), actual: (u32, u32)) -> Option<(u32, u32)> {
-    bounded_decoded_size(requested, actual, FIT_PIXELS)
-}
-
-pub fn bounded_decoded_size(
-    requested: (u32, u32),
-    actual: (u32, u32),
-    pixels: u64,
-) -> Option<(u32, u32)> {
-    let (w, h) = actual;
-    if w == 0 || h == 0 {
-        return None;
-    }
-    if w.max(h) <= edge_limit(pixels) && u64::from(w) * u64::from(h) <= pixels {
-        return Some(actual);
-    }
-    // The requested box was bounded before rendering. Fit the actual frame
-    // inside it, retaining its aspect ratio even if Windows swapped the axes.
-    let scale = (f64::from(requested.0) / f64::from(w)).min(f64::from(requested.1) / f64::from(h));
-    Some((
-        (f64::from(w) * scale).floor().max(1.0) as u32,
-        (f64::from(h) * scale).floor().max(1.0) as u32,
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn smoothing_samples_small_pages_and_bounds_the_intermediate_image() {
-        assert_eq!(supersampled_size((707, 1000)), Some((1414, 2000)));
-        let (width, height) = supersampled_size((990, 1400)).unwrap();
-        assert!(width > 990 && height > 1400);
-        assert!(u64::from(width) * u64::from(height) <= 4 * 1024 * 1024);
-        assert_eq!(supersampled_size((1600, 2400)), None);
-    }
 
     #[test]
     fn fit_bitmap_matches_the_display_box() {
@@ -105,10 +57,6 @@ mod tests {
         let budget = view_pixel_limit(4.0);
         let requested = (1000, 12000);
         assert_eq!(bounded_bitmap_size(requested, budget), requested);
-        assert_eq!(
-            bounded_decoded_size(requested, requested, budget),
-            Some(requested)
-        );
     }
 
     #[test]
@@ -130,21 +78,5 @@ mod tests {
             assert!((1..=FIT_EDGE).contains(&w) && (1..=FIT_EDGE).contains(&h));
             assert!(u64::from(w) * u64::from(h) <= FIT_PIXELS);
         }
-    }
-
-    #[test]
-    fn uses_the_returned_bitmap_dimensions_for_page_pixels() {
-        for actual in [(596, 842), (1190, 1684), (842, 595), (298, 421)] {
-            assert_eq!(decoded_size((595, 842), actual), Some(actual));
-        }
-    }
-
-    #[test]
-    fn oversized_frames_are_scaled_proportionally_and_empty_frames_are_rejected() {
-        assert_eq!(decoded_size((640, 480), (16000, 8000)), Some((640, 320)));
-        assert_eq!(decoded_size((640, 480), (4000, 4000)), Some((480, 480)));
-        assert_eq!(decoded_size((640, 480), (1, u32::MAX)), Some((1, 480)));
-        assert_eq!(decoded_size((640, 480), (0, 100)), None);
-        assert_eq!(decoded_size((640, 480), (100, 0)), None);
     }
 }

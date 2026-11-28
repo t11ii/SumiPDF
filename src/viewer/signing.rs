@@ -672,7 +672,6 @@ fn watermark_bytes(path: &Path) -> Result<Arc<[u8]>, String> {
                     if path.metadata().map_err(|e| e.to_string())?.len() > 32 * 1024 * 1024 {
                         return Err("Choose a watermark PDF no larger than 32 MiB.".into());
                     }
-                    let _apartment = crate::winpdf::initialize()?;
                     let pdf = crate::winpdf::Document::open_file(path)?;
                     if pdf.page_count() != 1 {
                         return Err("Choose a single-page watermark PDF.".into());

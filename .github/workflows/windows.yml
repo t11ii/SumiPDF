@@ -10,7 +10,7 @@ on:
         type: boolean
         default: false
       compare_startup:
-        description: Compare startup with v0.9.4 on the same Windows runner
+        description: Compare startup with v0.9.8 on the same Windows runner
         type: boolean
         default: false
 
@@ -19,8 +19,8 @@ permissions:
 
 jobs:
   viewer:
-    runs-on: windows-latest
-    timeout-minutes: 20
+    runs-on: windows-2025
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v6
         with:
@@ -33,40 +33,45 @@ jobs:
           path: find-baseline
           sparse-checkout: dist
           persist-credentials: false
-      - name: Get the v0.9.4 startup baseline
+      - name: Get the v0.9.8 startup baseline
         if: inputs.compare_startup
         uses: actions/checkout@v6
         with:
-          ref: 27d4046fdb1ee2fb7ec75aa23d9f141e84d61b92
+          ref: 4f35cc619b121337118f9e250285b4bedb104ef3
           path: startup-baseline
           sparse-checkout: dist
           persist-credentials: false
-      - name: Compare startup with v0.9.4
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update
+      - name: Build MuPDF
+        shell: pwsh
+        run: ./scripts/prepareMupdf.ps1
+      - name: Test PDF signing and native rendering
+        run: cargo +stable test --locked --target x86_64-pc-windows-msvc
+      - name: Build portable viewer
+        run: cargo +stable build --release --locked --target x86_64-pc-windows-msvc
+      - name: Assemble Windows and corresponding source ZIPs
+        shell: pwsh
+        run: ./scripts/packageWindows.ps1 -Executable ./target/x86_64-pc-windows-msvc/release/SumiPDF.exe
+      - name: Check the executable in the Windows ZIP
+        shell: pwsh
+        env:
+          SUMIPDF_FIND_BASELINE_EXE: ${{ inputs.compare_find && 'find-baseline/dist/SumiPDF.exe' || '' }}
+        run: |
+          New-Item -ItemType Directory -Force ./target/zip-check | Out-Null
+          tar.exe -xf ./target/distribution/SumiPDFWindowsX64.zip -C ./target/zip-check
+          if ($LASTEXITCODE) { throw 'Could not unpack the Windows ZIP.' }
+          ./tests/smoke.ps1 -Executable ./target/zip-check/SumiPDF.exe -ScreenshotPath ./SumiPDF-reading.png
+      - name: Compare startup with v0.9.8
         if: inputs.compare_startup
         shell: pwsh
-        run: ./tests/startup.ps1 -Executable ./dist/SumiPDF.exe -BaselineExecutable ./startup-baseline/dist/SumiPDF.exe -CsvPath ./SumiPDF-startup.csv
+        run: ./tests/startup.ps1 -Executable ./target/zip-check/SumiPDF.exe -BaselineExecutable ./startup-baseline/dist/SumiPDF.exe -CsvPath ./SumiPDF-startup.csv
       - uses: actions/upload-artifact@v7
         if: inputs.compare_startup
         with:
           name: SumiPDF-startup
           path: SumiPDF-startup.csv
           if-no-files-found: error
-      - name: Check the executable distributed in the release ZIP
-        shell: pwsh
-        env:
-          SUMIPDF_FIND_BASELINE_EXE: ${{ inputs.compare_find && 'find-baseline/dist/SumiPDF.exe' || '' }}
-        run: ./tests/smoke.ps1 -Executable ./dist/SumiPDF.exe -ScreenshotPath ./SumiPDF-reading.png
-      - name: Install stable Rust
-        run: rustup toolchain install stable --profile minimal --no-self-update
-      - name: Test PDF signing and native rendering
-        run: cargo +stable test --locked
-      - name: Build portable viewer
-        env:
-          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
-        run: cargo +stable build --release --locked --target x86_64-pc-windows-msvc
-      - name: Open a PDF and navigate in the release viewer
-        shell: pwsh
-        run: ./tests/smoke.ps1 -Executable ./target/x86_64-pc-windows-msvc/release/SumiPDF.exe
       - uses: actions/upload-artifact@v7
         with:
           name: SumiPDF-reading-preview
@@ -75,5 +80,5 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: SumiPDF-Windows-x64
-          path: target/x86_64-pc-windows-msvc/release/SumiPDF.exe
+          path: target/distribution/*.zip
           if-no-files-found: error

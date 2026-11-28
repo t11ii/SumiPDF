@@ -298,10 +298,9 @@ fn preview(
     target: Option<Target>,
 ) -> Result<serde_json::Value, String> {
     use crate::{pdfseal, winpdf};
-    let _apartment = winpdf::initialize()?;
     let input = std::path::absolute(input).map_err(|e| e.to_string())?;
     let doc = winpdf::Document::open_file(&input)?;
-    let bytes = doc.signing_source()?.read_bytes()?;
+    let bytes = doc.signing_source().read_bytes()?;
     let (page, rect) = match target {
         Some(target) => {
             let (n, r) = pdfseal::locate(&bytes, &target)?;
