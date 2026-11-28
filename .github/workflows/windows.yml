@@ -1,84 +1,39 @@
-name: Windows
+name: Windows startup capture diagnostic
 
 on:
-  push:
-  pull_request:
   workflow_dispatch:
-    inputs:
-      compare_find:
-        description: Compare repeated Find latency with v0.9.0 on the same Windows runner
-        type: boolean
-        default: false
-      compare_startup:
-        description: Compare startup with v0.9.8 on the same Windows runner
-        type: boolean
-        default: false
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
-  viewer:
+  startup:
     runs-on: windows-2025
-    timeout-minutes: 25
+    timeout-minutes: 7
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-      - name: Get the v0.9.0 Find baseline
-        if: inputs.compare_find
-        uses: actions/checkout@v6
-        with:
-          ref: b34b33e22e666d0fbbcec382c11ed0c3d9fa2522
-          path: find-baseline
-          sparse-checkout: dist
-          persist-credentials: false
-      - name: Get the v0.9.8 startup baseline
-        if: inputs.compare_startup
+      - name: Get previous release
         uses: actions/checkout@v6
         with:
           ref: 4f35cc619b121337118f9e250285b4bedb104ef3
           path: startup-baseline
           sparse-checkout: dist
           persist-credentials: false
-      - name: Install stable Rust
-        run: rustup toolchain install stable --profile minimal --no-self-update
-      - name: Build MuPDF
-        shell: pwsh
-        run: ./scripts/prepareMupdf.ps1
-      - name: Test PDF signing and native rendering
-        run: cargo +stable test --locked --target x86_64-pc-windows-msvc
-      - name: Build portable viewer
-        run: cargo +stable build --release --locked --target x86_64-pc-windows-msvc
-      - name: Assemble Windows and corresponding source ZIPs
-        shell: pwsh
-        run: ./scripts/packageWindows.ps1 -Executable ./target/x86_64-pc-windows-msvc/release/SumiPDF.exe
-      - name: Check the executable in the Windows ZIP
+      - name: Compare the exact tested Windows artifact
         shell: pwsh
         env:
-          SUMIPDF_FIND_BASELINE_EXE: ${{ inputs.compare_find && 'find-baseline/dist/SumiPDF.exe' || '' }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          New-Item -ItemType Directory -Force ./target/zip-check | Out-Null
-          tar.exe -xf ./target/distribution/SumiPDFWindowsX64.zip -C ./target/zip-check
-          if ($LASTEXITCODE) { throw 'Could not unpack the Windows ZIP.' }
-          ./tests/smoke.ps1 -Executable ./target/zip-check/SumiPDF.exe -ScreenshotPath ./SumiPDF-reading.png
-      - name: Compare startup with v0.9.8
-        if: inputs.compare_startup
-        shell: pwsh
-        run: ./tests/startup.ps1 -Executable ./target/zip-check/SumiPDF.exe -BaselineExecutable ./startup-baseline/dist/SumiPDF.exe -CsvPath ./SumiPDF-startup.csv
+          gh run download 46135080737 --name SumiPDF-Windows-x64 --dir ./candidate
+          if ($LASTEXITCODE) { throw 'Could not download the checked build.' }
+          tar.exe -xf ./candidate/SumiPDFWindowsX64.zip -C ./candidate
+          if ($LASTEXITCODE) { throw 'Could not unpack the checked build.' }
+          ./tests/startup.ps1 -Executable ./candidate/SumiPDF.exe -BaselineExecutable ./startup-baseline/dist/SumiPDF.exe -CsvPath ./SumiPDF-startup.csv
       - uses: actions/upload-artifact@v7
-        if: inputs.compare_startup
         with:
-          name: SumiPDF-startup
+          name: SumiPDF-startup-diagnostic
           path: SumiPDF-startup.csv
-          if-no-files-found: error
-      - uses: actions/upload-artifact@v7
-        with:
-          name: SumiPDF-reading-preview
-          path: SumiPDF-reading.png
-          if-no-files-found: ignore
-      - uses: actions/upload-artifact@v7
-        with:
-          name: SumiPDF-Windows-x64
-          path: target/distribution/*.zip
           if-no-files-found: error

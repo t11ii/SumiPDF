@@ -268,9 +268,14 @@ public static class ReadingProbe {
             if (dc == IntPtr.Zero) return false;
             try {
                 int blue = 0;
-                for (int row = 1; row <= 3; row++)
-                    if (PageColor(GetPixel(dc, size.Right / 2, size.Bottom * row / 4)) == 'B') blue++;
-                return blue >= 2;
+                for (int row = 2; row <= 8; row++) {
+                    for (int col = 3; col <= 7; col++) {
+                        if (PageColor(GetPixel(dc, size.Right * col / 10, size.Bottom * row / 10)) == 'B')
+                            blue++;
+                        if (blue >= 6) return true;
+                    }
+                }
+                return false;
             } finally { ReleaseDC(canvas, dc); }
         } finally { if (previous != IntPtr.Zero) SetThreadDpiAwarenessContext(previous); }
     }
