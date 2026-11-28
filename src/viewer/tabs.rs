@@ -620,6 +620,7 @@ impl App {
         self.ticket += 1;
         self.document = None;
         self.requested = None;
+        self.first_frame_pending = index.is_some();
         self.checking_fields = None;
         self.wheel_delta = 0;
         self.text_ready = false;

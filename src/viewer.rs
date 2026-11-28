@@ -731,6 +731,7 @@ struct App {
     wheel_delta: i32,
     wheel_motion: Option<WheelMotion>,
     requested: Option<(u64, u32, (i32, i32), u64)>,
+    first_frame_pending: bool,
     smoothing_in_progress: bool,
     marks: Vec<Mark>,
     saved_marks: Vec<Mark>,
@@ -777,6 +778,7 @@ impl App {
             wheel_delta: 0,
             wheel_motion: None,
             requested: None,
+            first_frame_pending: false,
             smoothing_in_progress: false,
             marks: Vec::new(),
             saved_marks: Vec::new(),
@@ -1344,12 +1346,19 @@ impl App {
                 if let Some((revision, page, area, zoom)) = self.requested.take()
                     && revision == self.revision
                 {
+                    let first_frame =
+                        self.first_frame_pending && page == self.page && result.is_ok();
                     let repaint = VIEW.with_borrow_mut(|v| {
                         let repaint = v.finish_render(page, (area, zoom), reading, result);
                         v.reveal_find(self.ui.canvas) || repaint
                     });
                     if repaint {
                         canvas::redraw(self.ui.canvas);
+                        if first_frame {
+                            self.first_frame_pending = false;
+                            // Present the first page before queuing the next render.
+                            unsafe { UpdateWindow(self.ui.canvas) };
+                        }
                     }
                     self.render();
                     let visible = VIEW.with_borrow(|v| {
