@@ -96,8 +96,11 @@ function Test-SigningPreferences([string]$ExecutablePath, [string]$InputPdf, [st
         $bitmap.SetPixel(5, 4, [Drawing.Color]::Red)
         $bitmap.Save($logo, [Drawing.Imaging.ImageFormat]::Png)
     } finally { $bitmap.Dispose() }
-    $signaturePng = Join-Path $Folder '手書きサイン.png'
-    $signatureJpeg = Join-Path $PSScriptRoot 'fixtures/SignatureImage.jpg'
+    $artworkFolder = Join-Path $Folder 'Signature artwork'
+    [void][IO.Directory]::CreateDirectory($artworkFolder)
+    $signaturePng = Join-Path $artworkFolder '手書きサイン.png'
+    $signatureJpeg = Join-Path $artworkFolder 'SignatureImage.jpg'
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'fixtures/SignatureImage.jpg') -Destination $signatureJpeg
     $signatureSetting = Join-Path $profileDir 'SumiPDF/signatureImage.json'
     $bitmap = [Drawing.Bitmap]::new(19, 7)
     try {
@@ -106,8 +109,8 @@ function Test-SigningPreferences([string]$ExecutablePath, [string]$InputPdf, [st
     } finally { $bitmap.Dispose() }
 
     foreach ($run in 1..4) {
-        # Exercise the filename proposed by the viewer in the real Save dialog.
-        # Give each launch its own input so the proposed output is always new.
+        # Accept the proposed name after picking artwork in a different folder.
+        # Each launch uses a new input in the PDF folder.
         $runPdf = Join-Path $Folder "Preference test $run.pdf"
         Copy-Item -LiteralPath $InputPdf -Destination $runPdf
         $viewer = Start-SmokeViewer $ExecutablePath $profileDir @($runPdf)

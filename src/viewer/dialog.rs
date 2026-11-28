@@ -71,12 +71,12 @@ fn choose_paths(hwnd: HWND, purpose: Purpose<'_>) -> Result<Vec<PathBuf>, String
         } else {
             "-highlighted.pdf"
         });
-        let proposed = name.encode_wide().collect::<Vec<_>>();
+        // A recently used folder can override lpstrInitialDir. Supply the full
+        // proposal so accepting the default saves beside the source PDF.
+        let proposed = path.with_file_name(name);
+        let proposed = proposed.as_os_str().encode_wide().collect::<Vec<_>>();
         if proposed.len() < buffer.len() {
             buffer[..proposed.len()].copy_from_slice(&proposed);
-        }
-        if let Some(parent) = path.parent() {
-            directory.extend(parent.as_os_str().encode_wide().chain([0]));
         }
     }
     let mut ofn = OPENFILENAMEW {
