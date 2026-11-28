@@ -86,15 +86,8 @@ static sumi_pdf *open_pdf(FILE *file, int *count, char *error)
 }
 
 #ifdef _WIN32
-sumi_pdf *sumi_pdf_open_handle(void *source, int *count, char *error)
+sumi_pdf *sumi_pdf_open_handle(void *handle, int *count, char *error)
 {
-    /* A separate file pointer for each worker, on the existing file object. */
-    HANDLE handle = ReOpenFile(source, GENERIC_READ, FILE_SHARE_READ, 0);
-    if (handle == INVALID_HANDLE_VALUE) {
-        snprintf(error, ERROR_SIZE, "Could not reopen the open PDF (Windows error %lu).",
-            (unsigned long)GetLastError());
-        return NULL;
-    }
     int fd = _open_osfhandle((intptr_t)handle, _O_RDONLY | _O_BINARY);
     if (fd == -1) {
         CloseHandle(handle);

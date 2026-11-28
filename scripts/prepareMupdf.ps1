@@ -67,7 +67,9 @@ if (!(Test-Path -LiteralPath $library)) {
 }
 
 $env:SUMIPDF_MUPDF_DIR = $source
+$env:SUMIPDF_MUPDF_SOURCE_ARCHIVE = (Resolve-Path -LiteralPath $SourceArchive).Path
 if ($env:GITHUB_ENV) {
     Add-Content -LiteralPath $env:GITHUB_ENV -Value "SUMIPDF_MUPDF_DIR=$source" -Encoding utf8
+    Add-Content -LiteralPath $env:GITHUB_ENV -Value "SUMIPDF_MUPDF_SOURCE_ARCHIVE=$env:SUMIPDF_MUPDF_SOURCE_ARCHIVE" -Encoding utf8
 }
 Write-Host "MuPDF $version ready at $source"

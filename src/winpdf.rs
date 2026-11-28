@@ -2,14 +2,23 @@
 use std::{
     ffi::{CStr, c_char, c_int, c_void},
     fs::{File, OpenOptions},
-    io::{Read, Seek, SeekFrom},
+    io::{self, Read},
     path::Path,
     ptr::NonNull,
-    sync::{Arc, Mutex},
 };
 
 #[cfg(windows)]
-use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+use std::os::windows::{
+    fs::OpenOptionsExt,
+    io::{AsRawHandle, FromRawHandle, IntoRawHandle},
+};
+#[cfg(windows)]
+use std::sync::Arc;
+#[cfg(windows)]
+use windows_sys::Win32::{
+    Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE},
+    Storage::FileSystem::{FILE_SHARE_READ, ReOpenFile},
+};
 
 use crate::{
     highlight::UnitRect,
@@ -75,7 +84,8 @@ pub struct Frame {
 /// render/search workers reopen the file object by handle without re-resolving the path.
 #[derive(Clone)]
 pub struct SigningSource {
-    file: Arc<Mutex<File>>,
+    #[cfg(windows)]
+    file: Arc<File>,
     #[cfg(not(windows))]
     test_path: std::path::PathBuf,
 }
@@ -85,22 +95,37 @@ impl SigningSource {
         let mut options = OpenOptions::new();
         options.read(true);
         #[cfg(windows)]
-        options.share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ);
-        let file = options
+        options.share_mode(FILE_SHARE_READ);
+        let _file = options
             .open(path)
             .map_err(|e| format!("PDF を開けませんでした。\n{e}"))?;
         Ok(Self {
-            file: Arc::new(Mutex::new(file)),
+            #[cfg(windows)]
+            file: Arc::new(_file),
             #[cfg(not(windows))]
             test_path: path.to_path_buf(),
         })
     }
 
+    fn reader(&self) -> io::Result<File> {
+        #[cfg(windows)]
+        {
+            // ReOpenFile keeps the file identity and gives each reader its own cursor.
+            let handle =
+                unsafe { ReOpenFile(self.file.as_raw_handle(), GENERIC_READ, FILE_SHARE_READ, 0) };
+            if handle == INVALID_HANDLE_VALUE {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(unsafe { File::from_raw_handle(handle) })
+        }
+        #[cfg(not(windows))]
+        File::open(&self.test_path)
+    }
+
     pub fn read_bytes(&self) -> Result<Vec<u8>, String> {
-        let mut file = self.file.lock().map_err(|e| e.to_string())?;
         let mut bytes = Vec::new();
-        file.seek(SeekFrom::Start(0))
-            .and_then(|_| file.read_to_end(&mut bytes))
+        self.reader()
+            .and_then(|mut file| file.read_to_end(&mut bytes))
             .map_err(|e| format!("編集中の PDF を読み込めません。\n{e}"))?;
         Ok(bytes)
     }
@@ -123,9 +148,9 @@ impl Document {
         let mut error: ErrorBuffer = [0; 512];
         #[cfg(windows)]
         let ptr = {
-            let file = source.file.lock().map_err(|e| e.to_string())?;
-            // The bridge makes its own independently positioned stream from this file object.
-            unsafe { sumi_pdf_open_handle(file.as_raw_handle(), &mut count, error.as_mut_ptr()) }
+            let file = source.reader().map_err(|e| e.to_string())?;
+            // The bridge takes ownership of the reopened handle, including on error.
+            unsafe { sumi_pdf_open_handle(file.into_raw_handle(), &mut count, error.as_mut_ptr()) }
         };
         #[cfg(not(windows))]
         let ptr = {
@@ -338,6 +363,8 @@ mod tests {
         let detailed = document
             .render_page(1, (900, 1000), zoom, Some(limit))
             .unwrap();
+        assert!((detailed.ratio - 595.28 / 841.89).abs() < 0.001);
+        assert!(detailed.limited_to.is_none());
         let pixels = u64::from(detailed.bitmap.width) * u64::from(detailed.bitmap.height);
         assert!(
             (FIT_PIXELS + 1..=limit).contains(&pixels),

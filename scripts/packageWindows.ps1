@@ -10,11 +10,8 @@ Push-Location $root
 try {
     $exe = (Resolve-Path -LiteralPath $Executable).Path
     $mupdf = (Resolve-Path -LiteralPath $env:SUMIPDF_MUPDF_DIR).Path
-    $archiveName = 'mupdf-1.28.7-source.tar.gz'
-    $archive = Join-Path $root "vendor/$archiveName"
-    if (!(Test-Path -LiteralPath $archive)) {
-        $archive = Join-Path (Split-Path -Parent $mupdf) $archiveName
-    }
+    $archiveName = "$(Split-Path -Leaf $mupdf).tar.gz"
+    $archive = (Resolve-Path -LiteralPath $env:SUMIPDF_MUPDF_SOURCE_ARCHIVE).Path
     $out = (New-Item -ItemType Directory -Force $OutputDirectory).FullName
     $stage = New-Item -ItemType Directory (Join-Path $env:TEMP ("SumiPDF-" + [Guid]::NewGuid()))
     try {
@@ -27,7 +24,7 @@ try {
         if ($LASTEXITCODE) { throw 'Could not stage the SumiPDF source.' }
         Remove-Item -LiteralPath (Join-Path $source 'dist/SumiPDF.exe') -ErrorAction SilentlyContinue
         $vendor = (New-Item -ItemType Directory (Join-Path $source 'vendor')).FullName
-        Copy-Item -LiteralPath $archive -Destination $vendor
+        Copy-Item -LiteralPath $archive -Destination (Join-Path $vendor $archiveName)
         Push-Location $source
         try {
             $config = cargo vendor --locked --versioned-dirs vendor/rust

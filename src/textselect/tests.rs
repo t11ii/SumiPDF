@@ -6,7 +6,19 @@ fn sample(rotate: i64) -> Vec<u8> {
     let pages = d.new_object_id();
     let latin =
         d.add_object(dictionary! { "Type"=>"Font", "Subtype"=>"Type1", "BaseFont"=>"Helvetica" });
-    let cid=d.add_object(dictionary! { "Type"=>"Font", "Subtype"=>"CIDFontType0", "BaseFont"=>"HeiseiMin-W3", "CIDSystemInfo"=>dictionary! { "Registry"=>Object::string_literal("Adobe"), "Ordering"=>Object::string_literal("Japan1"), "Supplement"=>5 }, "DW"=>1000, "W"=>vec![1.into(), Object::Array(vec![800.into(),900.into()])] });
+    let descriptor = d.add_object(dictionary! {
+        "Type"=>"FontDescriptor", "FontName"=>"HeiseiMin-W3", "Flags"=>6, "ItalicAngle"=>0,
+        "FontBBox"=>vec![(-123).into(),(-257).into(),1001.into(),910.into()],
+        "Ascent"=>880, "Descent"=>-120, "CapHeight"=>700, "StemV"=>80,
+    });
+    let cid = d.add_object(dictionary! {
+        "Type"=>"Font", "Subtype"=>"CIDFontType0", "BaseFont"=>"HeiseiMin-W3",
+        "FontDescriptor"=>descriptor,
+        "CIDSystemInfo"=>dictionary! {
+            "Registry"=>Object::string_literal("Adobe"), "Ordering"=>Object::string_literal("Japan1"), "Supplement"=>5,
+        },
+        "DW"=>1000, "W"=>vec![1.into(), Object::Array(vec![800.into(),900.into()])],
+    });
     let to_unicode = d.add_object(Stream::new(
         dictionary! {},
         b"/CIDInit /ProcSet findresource begin
@@ -112,7 +124,18 @@ fn rotated_pages_select_the_same_cropped_glyphs() {
 fn image_only_page_has_no_text_hit() {
     let mut d = Pdf::load_mem(&sample(0)).unwrap();
     let id = d.page_iter().next().unwrap();
-    d.change_page_content(id, b"0.3 g 30 45 28 22 re f".to_vec())
+    let image = d.add_object(Stream::new(
+        dictionary! {
+            "Type"=>"XObject", "Subtype"=>"Image", "Width"=>1, "Height"=>1,
+            "BitsPerComponent"=>8, "ColorSpace"=>"DeviceGray",
+        },
+        vec![77],
+    ));
+    d.get_object_mut(id).unwrap().as_dict_mut().unwrap().set(
+        "Resources",
+        dictionary! { "XObject"=>dictionary! { "Scan"=>image } },
+    );
+    d.change_page_content(id, b"q 100 0 0 70 30 45 cm /Scan Do Q".to_vec())
         .unwrap();
     let mut bytes = Vec::new();
     d.save_to(&mut bytes).unwrap();

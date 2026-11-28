@@ -88,8 +88,8 @@ fn windows_signs_the_viewed_pdf_and_preserves_existing_files() {
     let first_page = viewed.render_fit(0, (128, 128), 1.0).unwrap();
     let source = viewed.signing_source();
     wincrypto::tests::with_test_certificate(|cert| {
-        // As in the GUI, the rendering apartment keeps its document open while
-        // another thread acquires the stream and creates the signed file.
+        // The renderer keeps its document open while another worker reads the
+        // same file object and creates the signed copy.
         std::thread::scope(|scope| {
             let (source_path, target, taken) = (&source_path, &target, &taken);
             scope

@@ -515,6 +515,38 @@ impl Canvas {
         false
     }
 
+    pub fn set_tool(&mut self, tool: Option<MarkStyle>) {
+        if self.tool != tool {
+            self.cancel_drag();
+            self.tool = tool;
+        }
+    }
+
+    pub fn set_signature(&mut self, draw: bool, area: Option<UnitRect>) {
+        if self.draw_signature != draw || self.signature != area {
+            self.cancel_drag();
+            self.draw_signature = draw;
+            self.signature = area;
+        }
+    }
+
+    pub fn take_signature(&mut self) -> Option<(u32, UnitRect)> {
+        self.placed_signature.take()
+    }
+
+    pub fn set_marks(&mut self, marks: &[Mark], page: u32) {
+        self.page = page;
+        self.marks.clear();
+        self.marks.extend_from_slice(marks);
+    }
+
+    pub fn set_text_layout(&mut self, layout: Option<TextLayout>) {
+        if matches!(self.drag, Some(Drag::Highlight { glyph: Some(_), .. })) {
+            self.cancel_drag();
+        }
+        self.text_layout = layout;
+    }
+
     pub(super) fn enable_text_selection(&mut self, hwnd: HWND, enabled: bool) {
         if self.text_selection_enabled && !enabled {
             self.clear_text_selection(hwnd);
