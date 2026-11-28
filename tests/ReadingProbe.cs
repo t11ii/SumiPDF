@@ -27,6 +27,9 @@ public static class ReadingProbe {
     [StructLayout(LayoutKind.Sequential)] struct Point { public int X, Y; }
     [StructLayout(LayoutKind.Sequential)] struct Rect { public int Left, Top, Right, Bottom; }
     [DllImport("user32.dll")] static extern bool ScreenToClient(IntPtr window, ref Point point);
+    [DllImport("user32.dll")] static extern bool ClientToScreen(IntPtr window, ref Point point);
+    [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(Point point);
+    [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr window, uint flags);
     [DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
     [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr window, out Rect rect);
     [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr window, uint command);
@@ -263,21 +266,36 @@ public static class ReadingProbe {
         try {
             Rect size;
             if (!GetClientRect(canvas, out size) || size.Right <= 0 || size.Bottom <= 0) return false;
-            // Sample the displayed client surface without asking the viewer to paint.
-            var dc = GetDC(canvas);
+            var origin = new Point();
+            if (!ClientToScreen(canvas, ref origin)) return false;
+            var dc = GetDC(IntPtr.Zero);
             if (dc == IntPtr.Zero) return false;
             try {
                 int blue = 0;
                 for (int row = 2; row <= 8; row++) {
                     for (int col = 3; col <= 7; col++) {
-                        if (PageColor(GetPixel(dc, size.Right * col / 10, size.Bottom * row / 10)) == 'B')
-                            blue++;
-                        if (blue >= 6) return true;
+                        var where = new Point { X = origin.X + size.Right * col / 10, Y = origin.Y + size.Bottom * row / 10 };
+                        if (PageColor(GetPixel(dc, where.X, where.Y)) == 'B' &&
+                            GetAncestor(WindowFromPoint(where), 2) == parent && ++blue >= 6)
+                            return true;
                     }
                 }
                 return false;
-            } finally { ReleaseDC(canvas, dc); }
+            } finally { ReleaseDC(IntPtr.Zero, dc); }
         } finally { if (previous != IntPtr.Zero) SetThreadDpiAwarenessContext(previous); }
+    }
+    public static string ScreenDiagnostic(IntPtr parent) {
+        var canvas = GetDlgItem(parent, 110);
+        Rect size;
+        if (!GetClientRect(canvas, out size)) return "No canvas";
+        var point = new Point { X = size.Right / 2, Y = size.Bottom / 2 };
+        if (!ClientToScreen(canvas, ref point)) return "Could not find screen coordinates";
+        var dc = GetDC(IntPtr.Zero);
+        if (dc == IntPtr.Zero) return "No desktop device context";
+        try {
+            var owner = GetAncestor(WindowFromPoint(point), 2);
+            return "desktop pixel " + GetPixel(dc, point.X, point.Y).ToString("X8") + ", viewer owns sample " + (owner == parent);
+        } finally { ReleaseDC(IntPtr.Zero, dc); }
     }
     static string Stripe(IntPtr dc, int width, int height) {
         var stripe = new char[(height + 3) / 4];

@@ -40,8 +40,10 @@ function Measure-Startup([Diagnostics.ProcessStartInfo]$Start, [bool]$WithPdf) {
         if ($null -eq $windowMs) { throw 'Timed out waiting for a visible SumiPDF window.' }
         if ($WithPdf -and $null -eq $statusMs) { throw 'Timed out waiting for the first PDF page-ready status.' }
         if ($WithPdf -and $null -eq $pixelsMs) {
+            $screen = [ReadingProbe]::ScreenDiagnostic($window)
             $stripe = [ReadingProbe]::Viewport($window)
-            Write-Host "Passive screen sample missing at $([Math]::Round($clock.Elapsed.TotalMilliseconds)) ms. Native client surface contains $(($stripe -replace '[^B]', '').Length) blue rows."
+            $newScreen = [ReadingProbe]::ScreenDiagnostic($window)
+            Write-Host "Passive screen sample missing at $([Math]::Round($clock.Elapsed.TotalMilliseconds)) ms. Native client surface contains $(($stripe -replace '[^B]', '').Length) blue rows. Before capture: $screen. After capture: $newScreen."
         }
         [pscustomobject]@{ WindowMs = $windowMs; PageReadyMs = $statusMs; FirstPagePixelsMs = $pixelsMs }
     } finally {
