@@ -7,7 +7,7 @@ use crate::highlight::{
 };
 use crate::raster_size::{FIT_PIXELS, fitted_page_size, view_pixel_limit};
 use crate::textselect::TextLayout;
-use crate::winpdf::{Bitmap, Frame};
+use crate::winpdf::{Bitmap, Frame, Smoothing};
 use std::{
     cell::RefCell,
     collections::{BTreeMap, VecDeque},
@@ -76,11 +76,12 @@ struct PageArea {
     h: i32,
 }
 
-type Quality = ((i32, i32), u64);
+pub(super) type Quality = ((i32, i32), u64);
 
 struct CachedPage {
     quality: Quality,
     limited_to: Option<u64>,
+    smoothing: Option<Smoothing>,
     image: Result<Bitmap, String>,
 }
 
@@ -271,6 +272,7 @@ impl Canvas {
                     CachedPage {
                         quality,
                         limited_to: None,
+                        smoothing: None,
                         image: Ok(image),
                     },
                 );
@@ -488,12 +490,14 @@ impl Canvas {
                 r.layout.measured(page, frame.ratio);
             }
             let limited_to = result.as_ref().ok().and_then(|f| f.limited_to);
+            let smoothing = result.as_ref().ok().and_then(|f| f.smoothing);
             let image = result.map(|frame| frame.bitmap);
             r.frames.insert(
                 page,
                 CachedPage {
                     quality,
                     limited_to,
+                    smoothing,
                     image,
                 },
             );
@@ -513,6 +517,36 @@ impl Canvas {
             return true;
         }
         false
+    }
+
+    pub(super) fn has_smoothing(&self, page: u32, quality: Quality) -> bool {
+        self.reading
+            .as_ref()
+            .and_then(|r| r.frames.get(&page))
+            .is_some_and(|frame| frame.quality == quality && frame.smoothing.is_some())
+    }
+
+    pub(super) fn take_smoothing(&mut self, page: u32, quality: Quality) -> Option<Smoothing> {
+        let frame = self.reading.as_mut()?.frames.get_mut(&page)?;
+        if frame.quality != quality {
+            return None;
+        }
+        frame.smoothing.take()
+    }
+
+    pub(super) fn finish_smoothing(&mut self, page: u32, quality: Quality, bitmap: Bitmap) -> bool {
+        let Some(frame) = self.reading.as_mut().and_then(|r| r.frames.get_mut(&page)) else {
+            return false;
+        };
+        if frame.quality != quality
+            || !frame.image.as_ref().is_ok_and(|current| {
+                (current.width, current.height) == (bitmap.width, bitmap.height)
+            })
+        {
+            return false;
+        }
+        frame.image = Ok(bitmap);
+        true
     }
 
     pub fn set_tool(&mut self, tool: Option<MarkStyle>) {
@@ -572,8 +606,16 @@ impl Canvas {
         self.selection.is_some() || matches!(self.drag, Some(Drag::Text(_)))
     }
 
+    pub(super) fn selection_allows_annotations(&self) -> bool {
+        self.selection.as_ref().is_some_and(|selection| {
+            self.selection_layout
+                .as_ref()
+                .is_some_and(|(page, layout)| *page == selection.page && layout.allows_annotations)
+        })
+    }
+
     pub(super) fn take_selection(&mut self, style: MarkStyle) -> Option<Mark> {
-        if !self.has_selection() {
+        if !self.has_selection() || !self.selection_allows_annotations() {
             return None;
         }
         let Selection { page, runs } = self.selection.take()?;
@@ -1344,6 +1386,7 @@ mod tests {
             CachedPage {
                 quality: (area, view.zoom.to_bits()),
                 limited_to: None,
+                smoothing: None,
                 image: Ok(Bitmap {
                     width: 1,
                     height: 1,
@@ -1392,6 +1435,7 @@ mod tests {
                     CachedPage {
                         quality: ((600, 440), 1.0_f64.to_bits()),
                         limited_to: None,
+                        smoothing: None,
                         image: Ok(Bitmap {
                             width: 1,
                             height: 1,
@@ -1403,10 +1447,9 @@ mod tests {
             text_selection_enabled: true,
             ..Default::default()
         };
-        let text = crate::textselect::TextDocument::load(&crate::highlight_roundtrip::fixture())
-            .unwrap()
-            .page(0)
-            .unwrap();
+        let text =
+            crate::textselect::TextDocument::selection(&crate::highlight_roundtrip::fixture(), 0)
+                .unwrap();
         assert!(state.start_drag(hwnd, (page.x + 172, page.y + 122)));
         assert!(!state.finish_drag(hwnd, (page.x + 182, page.y + 182)));
         assert!(!state.has_selection());
@@ -1441,6 +1484,7 @@ mod tests {
         let surface = |bgra: [u8; 4]| CachedPage {
             quality: ((64, 80), 1.0f64.to_bits()),
             limited_to: None,
+            smoothing: None,
             image: Ok(Bitmap {
                 width: 1,
                 height: 1,

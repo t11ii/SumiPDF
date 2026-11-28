@@ -144,24 +144,38 @@ fn load_document(input: &[u8]) -> Result<Document, String> {
         }
         _ => pdf_error(e),
     })?;
+    check_editable_source(input, &doc)?;
+    Ok(doc)
+}
+
+fn check_editable_source(input: &[u8], doc: &Document) -> Result<(), String> {
     if doc.was_encrypted() || doc.trailer.has(b"Encrypt") {
         return Err(ENCRYPTED.into());
     }
     if !input.starts_with(b"%PDF-") || doc.xref_recovery.is_some() || doc.xref_start == 0 {
         return Err("PDFの相互参照が不完全なため、元の内容を保って編集できません。".into());
     }
-    Ok(doc)
+    Ok(())
 }
 
 /// Annotation changes are still limited to unsigned documents.
 pub(crate) fn editable_document(input: &[u8]) -> Result<Document, String> {
     let doc = load_document(input)?;
+    check_unsigned_for_annotations(&doc)?;
+    Ok(doc)
+}
+
+pub(crate) fn allows_annotations(input: &[u8], doc: &Document) -> bool {
+    check_editable_source(input, doc).is_ok() && check_unsigned_for_annotations(doc).is_ok()
+}
+
+fn check_unsigned_for_annotations(doc: &Document) -> Result<(), String> {
     if doc.catalog().map_err(pdf_error)?.has(b"Perms")
-        || doc.objects.values().any(|o| contains_signature(&doc, o))
+        || doc.objects.values().any(|o| contains_signature(doc, o))
     {
         return Err(ALREADY_SIGNED.into());
     }
-    Ok(doc)
+    Ok(())
 }
 
 fn signing_document(input: &[u8]) -> Result<(Document, Permissions), String> {

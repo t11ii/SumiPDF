@@ -2,6 +2,7 @@ param(
     [string]$Executable = "$PSScriptRoot/../dist/SumiPDF.exe",
     [Parameter(Mandatory = $true)][string]$BaselineExecutable,
     [ValidateRange(1, 100)][int]$Repeats = 20,
+    [ValidateRange(0, 20000)][int]$ExtraShapes = 0,
     [string]$CsvPath
 )
 $ErrorActionPreference = 'Stop'
@@ -76,7 +77,7 @@ $dir = Join-Path ([IO.Path]::GetTempPath()) ('SumiPDF-startup-' + [Guid]::NewGui
 try {
     [void][IO.Directory]::CreateDirectory($dir)
     $fixture = Join-Path $dir 'Reading notes.pdf'
-    Write-ReadingPdf $fixture 2
+    Write-ReadingPdf $fixture 2 $ExtraShapes
     $trials = @(for ($trial = 0; $trial -le $Repeats; $trial++) {
         $order = @(0, 1)
         if ($trial % 2 -ne 0) { $order = @(1, 0) }
@@ -110,6 +111,7 @@ $summary = @(
     ''
     "Each build and scenario has one first sample and $Repeats repeated samples. The build order reverses each round. All launches share a Windows host and its existing system caches, with a fresh viewer profile for each launch."
     'Times start immediately before process launch and include polling (5 ms requested interval) and scheduling. The PDF is the shared synthetic two-page reading fixture.'
+    "The first page contains $ExtraShapes additional vector marks."
     'The page-ready milestone uses the page counter and fit-size status. The first-page pixel milestone samples the displayed canvas and is unavailable if the blue page is absent from the captured surface within 750 ms after observing page-ready status.'
     'Each median and nearest-rank p95 requires all repeated samples for that milestone.'
     ''

@@ -13,7 +13,7 @@ function Write-PdfObjects([string]$Path, [string[]]$Objects) {
     [IO.File]::WriteAllText($Path, $pdf.ToString(), [Text.Encoding]::ASCII)
 }
 
-function Write-ReadingPdf([string]$Path, [int]$Count) {
+function Write-ReadingPdf([string]$Path, [int]$Count, [int]$ExtraShapes = 0) {
     $objects = [Collections.Generic.List[string]]::new()
     $kids = (0..($Count - 1) | ForEach-Object { "$(4 + 2 * $_) 0 R" }) -join ' '
     $objects.Add('<< /Type /Catalog /Pages 2 0 R >>')
@@ -29,6 +29,15 @@ function Write-ReadingPdf([string]$Path, [int]$Count) {
         if ($page -in @(1, 2, 37)) {
             $punctuation = if ($page -eq 2) { '!' } else { '?' }
             $drawing += "BT /F1 24 Tf 122 445 Td (Which section$punctuation) Tj ET`n"
+        }
+        if ($page -eq 1 -and $ExtraShapes -gt 0) {
+            $busy = [Text.StringBuilder]::new("0.24 0.30 0.40 rg`n")
+            for ($i = 0; $i -lt $ExtraShapes; $i++) {
+                $x = 24 + 3 * ($i % 80)
+                $y = 70 + 5 * [int][Math]::Floor($i / 80)
+                [void]$busy.AppendFormat("{0} {1} 2 2 re f`n", $x, $y)
+            }
+            $drawing += $busy.ToString()
         }
         $objects.Add("<< /Length $($drawing.Length) >>`nstream`n${drawing}endstream")
     }

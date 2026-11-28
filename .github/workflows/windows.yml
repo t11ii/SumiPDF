@@ -10,7 +10,7 @@ on:
         type: boolean
         default: false
       compare_startup:
-        description: Compare startup with v0.9.4 on the same Windows runner
+        description: Compare first page pixels with v0.9.7 on the same Windows runner
         type: boolean
         default: false
 
@@ -33,23 +33,29 @@ jobs:
           path: find-baseline
           sparse-checkout: dist
           persist-credentials: false
-      - name: Get the v0.9.4 startup baseline
-        if: inputs.compare_startup
+      - name: Get the v0.9.7 startup baseline
+        if: inputs.compare_startup || github.event_name == 'push'
         uses: actions/checkout@v6
         with:
-          ref: 27d4046fdb1ee2fb7ec75aa23d9f141e84d61b92
+          ref: 0af6b8fef8c3efe7914e77abce9336554e5b9c42
           path: startup-baseline
           sparse-checkout: dist
           persist-credentials: false
-      - name: Compare startup with v0.9.4
-        if: inputs.compare_startup
+      - name: Compare startup with v0.9.7
+        if: inputs.compare_startup || github.event_name == 'push'
         shell: pwsh
         run: ./tests/startup.ps1 -Executable ./dist/SumiPDF.exe -BaselineExecutable ./startup-baseline/dist/SumiPDF.exe -CsvPath ./SumiPDF-startup.csv
+      - name: Compare dense PDF startup with v0.9.7
+        if: inputs.compare_startup || github.event_name == 'push'
+        shell: pwsh
+        run: ./tests/startup.ps1 -Executable ./dist/SumiPDF.exe -BaselineExecutable ./startup-baseline/dist/SumiPDF.exe -Repeats 12 -ExtraShapes 8192 -CsvPath ./SumiPDF-dense-startup.csv
       - uses: actions/upload-artifact@v7
-        if: inputs.compare_startup
+        if: inputs.compare_startup || github.event_name == 'push'
         with:
           name: SumiPDF-startup
-          path: SumiPDF-startup.csv
+          path: |
+            SumiPDF-startup.csv
+            SumiPDF-dense-startup.csv
           if-no-files-found: error
       - name: Check the executable distributed in the release ZIP
         shell: pwsh

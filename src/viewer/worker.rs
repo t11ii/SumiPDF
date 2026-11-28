@@ -1,6 +1,6 @@
 use crate::preferences::TabSession;
 use crate::textselect::{TextDocument, TextLayout};
-use crate::winpdf::{self, Document, Frame, SigningSource};
+use crate::winpdf::{self, Bitmap, Document, Frame, SigningSource, Smoothing};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
@@ -32,11 +32,19 @@ pub struct OpenedDocument {
     pub source: Result<SigningSource, String>,
 }
 
+pub(super) struct SmoothingRequest {
+    pub revision: u64,
+    pub page: u32,
+    pub quality: super::canvas::Quality,
+    pub smoothing: Smoothing,
+}
+
 pub enum Event {
     PreviousTabs(Result<TabSession, String>),
     Find(u64, Result<super::find::Page, String>),
     Opened(u64, Result<OpenedDocument, String>),
     Painted(u64, bool, Result<Frame, String>),
+    Smoothed(SmoothingRequest, Option<Bitmap>),
     SignatureFields {
         revision: u64,
         result: Result<super::signing::Choices, String>,
@@ -84,17 +92,21 @@ pub fn text_pages(hwnd: usize, jobs: Receiver<TextJob>, events: Sender<Event>) {
             cache = None;
             continue;
         };
-        let result = (|| {
-            if cache.as_ref().is_none_or(|(id, _)| *id != revision) {
-                cache = None;
-                let document = TextDocument::load(&source.read_bytes()?)?;
-                cache = Some((revision, document));
-            }
-            cache.as_ref().unwrap().1.page(page)
-        })();
-        if matches!(purpose, TextPurpose::Selection) {
+        let result = if matches!(purpose, TextPurpose::Selection) {
             cache = None;
-        }
+            source
+                .read_bytes()
+                .and_then(|bytes| TextDocument::selection(&bytes, page))
+        } else {
+            (|| {
+                if cache.as_ref().is_none_or(|(id, _)| *id != revision) {
+                    cache = None;
+                    let document = TextDocument::load(&source.read_bytes()?)?;
+                    cache = Some((revision, document));
+                }
+                cache.as_ref().unwrap().1.page(page)
+            })()
+        };
         report(
             hwnd,
             &events,
@@ -121,6 +133,26 @@ pub(super) fn spawn(hwnd: usize, events: Sender<Event>) -> Result<Sender<Job>, S
         .spawn(move || run(hwnd, rx, events))
         .map_err(|e| e.to_string())?;
     Ok(tx)
+}
+
+pub(super) fn smooth(
+    hwnd: usize,
+    events: Sender<Event>,
+    source: SigningSource,
+    request: SmoothingRequest,
+) -> std::io::Result<()> {
+    // Use an independent page stream so optional work cannot hold up the open/render queue.
+    std::thread::Builder::new()
+        .name("pdf-smooth".into())
+        .spawn(move || {
+            let image = (|| {
+                let _apartment = winpdf::initialize().ok()?;
+                let doc = Document::from_source(&source).ok()?;
+                doc.smooth_page(request.page, request.smoothing).ok()
+            })();
+            report(hwnd, &events, Event::Smoothed(request, image));
+        })?;
+    Ok(())
 }
 
 fn run(hwnd: usize, jobs: Receiver<Job>, events: Sender<Event>) {
