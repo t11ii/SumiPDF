@@ -1,15 +1,3 @@
-function Start-SmokeViewer([string]$ExecutablePath, [string]$ProfileDirectory, [string[]]$Documents) {
-    [void][IO.Directory]::CreateDirectory($ProfileDirectory)
-    $start = [Diagnostics.ProcessStartInfo]::new($ExecutablePath)
-    $start.UseShellExecute = $false
-    $start.Environment['LOCALAPPDATA'] = $ProfileDirectory
-    $roaming = Join-Path $ProfileDirectory 'Roaming'
-    [void][IO.Directory]::CreateDirectory($roaming)
-    $start.Environment['APPDATA'] = $roaming
-    foreach ($document in $Documents) { $start.ArgumentList.Add($document) }
-    [Diagnostics.Process]::Start($start)
-}
-
 function Select-TestPfx([Diagnostics.Process]$Viewer, [IntPtr]$Window, $Identity, [bool]$Remember) {
     [SumiSmoke]::Click($Window, 132)
     $filePicker = Wait-Dialog $Viewer.Id 'Open a PFX file for signing'

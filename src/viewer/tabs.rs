@@ -367,14 +367,7 @@ fn paint(hwnd: HWND, dc: HDC) {
 impl App {
     fn ensure_worker(&mut self) -> Result<(), String> {
         if self.worker.is_none() {
-            let (tx, rx) = mpsc::channel();
-            let events = self.events.clone();
-            let hwnd = self.hwnd as usize;
-            std::thread::Builder::new()
-                .name("pdf-render".into())
-                .spawn(move || worker::run(hwnd, rx, events))
-                .map_err(|e| e.to_string())?;
-            self.worker = Some(tx);
+            self.worker = Some(worker::spawn(self.hwnd as usize, self.events.clone())?);
         }
         Ok(())
     }
@@ -546,7 +539,6 @@ impl App {
         self.signing = state.signing;
         self.marks = state.marks;
         self.saved_marks = state.saved_marks;
-        self.ui.show_signing(self.signing.is_some());
         self.restore_signing_controls()?;
         let show = if index.is_some() { SW_SHOW } else { SW_HIDE };
         unsafe {

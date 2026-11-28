@@ -274,12 +274,22 @@ fn register(name: &str, procedure: WNDPROC, background: HBRUSH) -> bool {
 }
 
 fn child(parent: HWND, class: &str, caption: &str, id: usize, style: u32) -> Result<HWND, String> {
+    create_child(parent, class, caption, id, style | WS_VISIBLE)
+}
+
+fn create_child(
+    parent: HWND,
+    class: &str,
+    caption: &str,
+    id: usize,
+    style: u32,
+) -> Result<HWND, String> {
     let hwnd = unsafe {
         CreateWindowExW(
             0,
             wide(class).as_ptr(),
             wide(caption).as_ptr(),
-            WS_VISIBLE | WS_CHILD | WS_CLIPSIBLINGS | style,
+            WS_CHILD | WS_CLIPSIBLINGS | style,
             0,
             0,
             1,
@@ -298,7 +308,8 @@ fn child(parent: HWND, class: &str, caption: &str, id: usize, style: u32) -> Res
 }
 
 struct Controls {
-    find: find::Bar,
+    find_button: HWND,
+    find: Option<find::Bar>,
     tab_bar: HWND,
     canvas: HWND,
     open: HWND,
@@ -315,12 +326,7 @@ struct Controls {
     undo: HWND,
     save: HWND,
     sign: HWND,
-    position: HWND,
-    watermark: HWND,
-    certificate: HWND,
-    pfx: HWND,
-    sign_save: HWND,
-    sign_cancel: HWND,
+    signing: Option<signing::Bar>,
     status: HWND,
     font: HFONT,
     headline: HFONT,
@@ -372,7 +378,8 @@ impl Controls {
         }
         let mut toolbar = toolbar::Toolbar::new(hwnd)?;
         let mut ui = Self {
-            find: find::Bar::new(hwnd, &mut toolbar)?,
+            find_button: toolbar.button(find::OPEN_FIND, toolbar::FIND)?,
+            find: None,
             tab_bar: tabs::create(hwnd)?,
             open: toolbar.button(OPEN, toolbar::OPEN_FILE)?,
             prev: toolbar.button(PREV, toolbar::PREVIOUS)?,
@@ -388,18 +395,7 @@ impl Controls {
             undo: toolbar.button(UNDO, toolbar::UNDO_MARK)?,
             save: toolbar.button(SAVE_MARKS, toolbar::SAVE_ANNOTATIONS)?,
             sign: toolbar.button(SIGN, toolbar::SIGN_PDF)?,
-            position: child(
-                hwnd,
-                "COMBOBOX",
-                "",
-                SIGN_POSITION,
-                WS_TABSTOP | CBS_DROPDOWNLIST as u32,
-            )?,
-            watermark: toolbar.button(WATERMARK, toolbar::DEFAULT_WATERMARK)?,
-            certificate: toolbar.button(SIGN_CERTIFICATE, toolbar::CERTIFICATE)?,
-            pfx: toolbar.button(SIGN_PFX, toolbar::PFX)?,
-            sign_save: toolbar.button(SIGN_SAVE, toolbar::CONFIRM)?,
-            sign_cancel: toolbar.button(SIGN_CANCEL, toolbar::CANCEL)?,
+            signing: None,
             canvas: child(hwnd, CANVAS, "", CANVAS_ID, 0)?,
             status: child(
                 hwnd,
@@ -416,27 +412,32 @@ impl Controls {
         };
         ui.toolbar.page_tip(ui.page)?;
         ui.toolbar.color_tip(ui.color)?;
-        for control in [ui.page, ui.page_input, ui.color, ui.position] {
+        for control in [ui.page, ui.page_input, ui.color] {
             theme::style_control(control)?;
         }
-        ui.show_signing(false);
         unsafe {
             ShowWindow(ui.tab_bar, SW_HIDE);
         }
         Ok(ui)
     }
 
-    fn show_signing(&self, show: bool) {
-        for control in [
-            self.position,
-            self.watermark,
-            self.certificate,
-            self.pfx,
-            self.sign_save,
-            self.sign_cancel,
-        ] {
-            unsafe { ShowWindow(control, if show { SW_SHOW } else { SW_HIDE }) };
+    fn ensure_find(&mut self, hwnd: HWND) -> Result<&find::Bar, String> {
+        if self.find.is_none() {
+            let bar = find::Bar::new(hwnd, self.find_button, &mut self.toolbar)?;
+            bar.font(self.font);
+            self.find = Some(bar);
         }
+        Ok(self.find.as_ref().unwrap())
+    }
+
+    fn ensure_signing(&mut self, hwnd: HWND) -> Result<signing::Bar, String> {
+        if let Some(bar) = self.signing {
+            return Ok(bar);
+        }
+        let bar = signing::Bar::new(hwnd, self.sign, &mut self.toolbar)?;
+        bar.font(self.font);
+        self.signing = Some(bar);
+        Ok(bar)
     }
 
     fn fonts(&mut self, hwnd: HWND) {
@@ -468,7 +469,12 @@ impl Controls {
         self.headline = make("Yu Gothic UI", 22, 600);
         self.icon_font = make("Segoe MDL2 Assets", 16, 400);
         self.toolbar.set_font(self.icon_font);
-        self.find.font(self.font);
+        if let Some(bar) = &self.find {
+            bar.font(self.font);
+        }
+        if let Some(bar) = self.signing {
+            bar.font(self.font);
+        }
         VIEW.with_borrow_mut(|v| {
             v.font = self.font;
             v.headline = self.headline;
@@ -478,7 +484,6 @@ impl Controls {
             self.page_input,
             self.tab_bar,
             self.color,
-            self.position,
             self.status,
         ] {
             unsafe {
@@ -561,9 +566,12 @@ impl Controls {
             s(32),
         );
         let mut top = toolbar;
-        if unsafe { GetWindowLongW(control(SIGN_POSITION), GWL_STYLE) } as u32 & WS_VISIBLE != 0 {
+        let position = control(SIGN_POSITION);
+        if !position.is_null()
+            && unsafe { GetWindowLongW(position, GWL_STYLE) } as u32 & WS_VISIBLE != 0
+        {
             let width = (bounds.right - s(227)).min(s(390));
-            place(control(SIGN_POSITION), s(10), s(toolbar + 2), width, s(280));
+            place(position, s(10), s(toolbar + 2), width, s(280));
             for (id, x) in [
                 (WATERMARK, 17),
                 (SIGN_CERTIFICATE, 56),
@@ -687,19 +695,25 @@ struct App {
 }
 
 impl App {
-    fn new(hwnd: HWND) -> Result<Self, String> {
+    fn new(hwnd: HWND, opening_pdf: bool) -> Result<Self, String> {
         let (events, receiver) = mpsc::channel();
+        // On a file launch, let the renderer initialize WinRT while the UI
+        // constructs its controls. Opening the tab retries a failed spawn.
+        let worker = if opening_pdf {
+            worker::spawn(hwnd as usize, events.clone()).ok()
+        } else {
+            None
+        };
         let mut ui = Controls::new(hwnd)?;
         ui.fonts(hwnd);
-        Controls::layout(hwnd);
-        let app = Self {
+        Ok(Self {
             find: find::State::default(),
             tabs: Vec::new(),
             active_tab: None,
             resume_source: None,
             hwnd,
             ui,
-            worker: None,
+            worker,
             events,
             receiver,
             path: PathBuf::new(),
@@ -722,9 +736,7 @@ impl App {
             signing: None,
             checking_fields: None,
             known_signed: false,
-        };
-        app.controls();
-        Ok(app)
+        })
     }
     fn page_count(&self) -> u32 {
         self.document.as_ref().map_or(0, |d| d.pages)
@@ -748,28 +760,7 @@ impl App {
                 self.page_count() > 0 && self.zoom < MAX_ZOOM,
             ),
             (self.ui.sign, self.page_count() > 0 && editing),
-            (self.ui.find.button, self.page_count() > 0),
-            (
-                self.ui.position,
-                self.signing.as_ref().is_some_and(|s| s.has_positions()) && !self.writing,
-            ),
-            (
-                self.ui.watermark,
-                self.signing
-                    .as_ref()
-                    .is_some_and(|s| s.can_pick_watermark())
-                    && !self.writing,
-            ),
-            (
-                self.ui.certificate,
-                self.signing.as_ref().is_some_and(|s| s.has_positions()) && !self.writing,
-            ),
-            (
-                self.ui.pfx,
-                self.signing.as_ref().is_some_and(|s| s.has_positions()) && !self.writing,
-            ),
-            (self.ui.sign_save, self.can_sign_here() && !self.writing),
-            (self.ui.sign_cancel, !self.writing),
+            (self.ui.find_button, self.page_count() > 0),
             (self.ui.highlighter, self.page_count() > 0 && annotate),
             (self.ui.underline, self.page_count() > 0 && annotate),
             (self.ui.color, self.page_count() > 0 && annotate),
@@ -783,6 +774,7 @@ impl App {
                 EnableWindow(c, i32::from(enabled));
             }
         }
+        self.enable_signing_controls();
         let text = if self.page_count() == 0 {
             "— / —".into()
         } else {
@@ -1196,8 +1188,9 @@ impl App {
                     {
                         self.signing = None;
                         if let Err(error) = self.begin_signing() {
-                            self.end_signing();
-                            self.ui.show_signing(false);
+                            if let Some(bar) = self.ui.signing {
+                                bar.show(false);
+                            }
                             Controls::layout(self.hwnd);
                             notice(self.hwnd, &error, true);
                         }
@@ -1307,9 +1300,9 @@ impl App {
             self.stop_motion();
         }
         match id {
-            find::OPEN_FIND => self.open_find(),
+            find::PREVIOUS | find::NEXT if self.find.open => self.step_find(id == find::PREVIOUS),
+            find::OPEN_FIND | find::PREVIOUS | find::NEXT => self.open_find()?,
             find::EDIT => self.update_find(),
-            find::PREVIOUS | find::NEXT => self.step_find(id == find::PREVIOUS),
             find::CLOSE => {
                 self.close_find();
                 self.render();
@@ -1589,13 +1582,19 @@ impl App {
             if unsafe { GetMessageW(&mut msg, null_mut(), 0, 0) } <= 0 {
                 break;
             }
+            let in_find = self
+                .ui
+                .find
+                .as_ref()
+                .is_some_and(|bar| msg.hwnd == bar.edit);
             if msg.message == WM_KEYDOWN {
-                if msg.hwnd == self.ui.find.edit && msg.wParam == VK_RETURN as usize {
+                if in_find && self.find.open && msg.wParam == VK_RETURN as usize {
                     self.step_find(unsafe { GetKeyState(VK_SHIFT as i32) } < 0);
                     continue;
                 }
                 // Hand navigation and dismissal to the native color list.
-                let picker_key = (msg.hwnd == self.ui.color || msg.hwnd == self.ui.position)
+                let picker_key = (msg.hwnd == self.ui.color
+                    || self.ui.signing.is_some_and(|bar| msg.hwnd == bar.position))
                     && (unsafe { SendMessageW(msg.hwnd, CB_GETDROPPEDSTATE, 0, 0) != 0 }
                         || matches!(
                             msg.wParam as u16,
@@ -1619,7 +1618,7 @@ impl App {
                 if !picker_key
                     && !tab_arrow
                     && let Some(id) = self.shortcut(msg.wParam)
-                    && (msg.hwnd != self.ui.find.edit
+                    && (!in_find
                         || matches!(
                             id,
                             find::OPEN_FIND
@@ -1652,7 +1651,7 @@ impl App {
             }
             match msg.message {
                 // TranslateMessage uses the active keyboard layout to produce '?'.
-                WM_CHAR if msg.wParam == usize::from(b'?') && msg.hwnd != self.ui.find.edit => {
+                WM_CHAR if msg.wParam == usize::from(b'?') && !in_find => {
                     if msg.lParam & (1 << 30) == 0 {
                         action(self.hwnd, SHOW_SHORTCUTS);
                     }
@@ -1735,13 +1734,18 @@ pub fn run(files: Vec<OsString>) {
         }
         theme::refresh(hwnd);
         shortcuts::add_to_window_menu(hwnd);
-        let mut app = App::new(hwnd)?;
+        let mut app = App::new(hwnd, !files.is_empty())?;
+        let opened = app.open_tabs(files.into_iter().map(PathBuf::from));
+        if app.active_tab.is_none() {
+            Controls::layout(hwnd);
+            app.controls();
+        }
         unsafe {
             DragAcceptFiles(hwnd, 1);
             ShowWindow(hwnd, SW_SHOW);
             UpdateWindow(hwnd);
         }
-        if let Err(e) = app.open_tabs(files.into_iter().map(PathBuf::from)) {
+        if let Err(e) = opened {
             notice(hwnd, &e, true);
         }
         app.process();

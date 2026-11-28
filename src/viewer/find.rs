@@ -28,39 +28,45 @@ const SS_CENTERIMAGE: u32 = 0x0200;
 const SS_ENDELLIPSIS: u32 = 0x4000;
 
 pub(super) struct Bar {
-    pub(super) button: HWND,
     pub(super) edit: HWND,
     status: HWND,
     controls: [HWND; 6],
 }
 
 impl Bar {
-    pub(super) fn new(hwnd: HWND, toolbar: &mut toolbar::Toolbar) -> Result<Self, String> {
-        let button = toolbar.button(OPEN_FIND, toolbar::FIND)?;
-        let label = child(hwnd, "STATIC", "&Find", LABEL, SS_CENTERIMAGE)?;
-        let edit = child(
-            hwnd,
-            "EDIT",
-            "",
-            EDIT,
-            WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL as u32,
-        )?;
-        let prev = toolbar.button(PREVIOUS, toolbar::PREVIOUS_MATCH)?;
-        let next = toolbar.button(NEXT, toolbar::NEXT_MATCH)?;
-        let close = toolbar.button(CLOSE, toolbar::CLOSE_FIND)?;
-        let status = child(hwnd, "STATIC", "", STATUS, SS_CENTERIMAGE | SS_ENDELLIPSIS)?;
-        theme::style_control(edit)?;
-        let bar = Self {
-            button,
-            edit,
-            status,
-            controls: [label, edit, prev, next, close, status],
-        };
-        unsafe {
-            SendMessageW(edit, EM_SETLIMITTEXT, MAX_QUERY, 0);
-        }
-        bar.show(false);
-        Ok(bar)
+    pub(super) fn new(
+        hwnd: HWND,
+        after: HWND,
+        toolbar: &mut toolbar::Toolbar,
+    ) -> Result<Self, String> {
+        toolbar.build_row(
+            after,
+            &[LABEL, EDIT, PREVIOUS, NEXT, CLOSE, STATUS],
+            |toolbar| {
+                let label = create_child(hwnd, "STATIC", "&Find", LABEL, SS_CENTERIMAGE)?;
+                let edit = create_child(
+                    hwnd,
+                    "EDIT",
+                    "",
+                    EDIT,
+                    WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL as u32,
+                )?;
+                let prev = toolbar.hidden_button(PREVIOUS, toolbar::PREVIOUS_MATCH)?;
+                let next = toolbar.hidden_button(NEXT, toolbar::NEXT_MATCH)?;
+                let close = toolbar.hidden_button(CLOSE, toolbar::CLOSE_FIND)?;
+                let status =
+                    create_child(hwnd, "STATIC", "", STATUS, SS_CENTERIMAGE | SS_ENDELLIPSIS)?;
+                theme::style_control(edit)?;
+                unsafe {
+                    SendMessageW(edit, EM_SETLIMITTEXT, MAX_QUERY, 0);
+                }
+                Ok(Self {
+                    edit,
+                    status,
+                    controls: [label, edit, prev, next, close, status],
+                })
+            },
+        )
     }
 
     fn show(&self, visible: bool) {
@@ -85,7 +91,8 @@ impl Bar {
         place: &mut impl FnMut(HWND, i32, i32, i32, i32),
     ) -> i32 {
         let control = |id| unsafe { GetDlgItem(hwnd, id as i32) };
-        if (unsafe { GetWindowLongW(control(EDIT), GWL_STYLE) } as u32 & WS_VISIBLE) == 0 {
+        let edit = control(EDIT);
+        if edit.is_null() || unsafe { GetWindowLongW(edit, GWL_STYLE) } as u32 & WS_VISIBLE == 0 {
             return 0;
         }
         let s = |n| dips(hwnd, n);
@@ -94,7 +101,7 @@ impl Bar {
         let edit_width = ((width - s(220)) / 2).clamp(s(82), s(300));
         let buttons = s(48) + edit_width;
         place(control(LABEL), s(10), row, s(34), s(26));
-        place(control(EDIT), s(44), row, edit_width, s(26));
+        place(edit, s(44), row, edit_width, s(26));
         place(control(PREVIOUS), buttons, row, s(32), s(26));
         place(control(NEXT), buttons + s(35), row, s(32), s(26));
         place(control(CLOSE), buttons + s(70), row, s(32), s(26));
@@ -361,27 +368,30 @@ fn run(hwnd: usize, mailbox: &Mailbox, events: Sender<Event>) {
 }
 
 impl App {
-    pub(super) fn open_find(&mut self) {
+    pub(super) fn open_find(&mut self) -> Result<(), String> {
         if self.page_count() == 0 {
-            return;
+            return Ok(());
         }
         self.jump_input(false);
+        let bar = self.ui.ensure_find(self.hwnd)?;
+        let edit = bar.edit;
         if !self.find.open {
             self.find.open = true;
-            self.ui.find.show(true);
+            bar.show(true);
             Controls::layout(self.hwnd);
             self.render();
         }
         unsafe {
-            SetFocus(self.ui.find.edit);
-            SendMessageW(self.ui.find.edit, EM_SETSEL, 0, -1);
+            SetFocus(edit);
+            SendMessageW(edit, EM_SETSEL, 0, -1);
         }
+        Ok(())
     }
 
     pub(super) fn close_find(&mut self) {
-        if !self.find.open {
+        let Some(bar) = self.ui.find.as_ref().filter(|_| self.find.open) else {
             return;
-        }
+        };
         self.find.open = false;
         self.find.epoch += 1;
         self.find.query.clear();
@@ -390,12 +400,12 @@ impl App {
             let _ = worker.send(Job::Release);
         }
         unsafe {
-            if self.ui.find.controls.contains(&GetFocus()) {
+            if bar.controls.contains(&GetFocus()) {
                 SetFocus(self.ui.canvas);
             }
         }
-        self.ui.find.show(false);
-        set_text(self.ui.find.edit, "");
+        bar.show(false);
+        set_text(bar.edit, "");
         self.clear_find_hits();
         Controls::layout(self.hwnd);
     }
@@ -405,15 +415,17 @@ impl App {
             v.matches = Matches::default();
             v.find_reveal = None;
         });
-        set_text(self.ui.find.status, "");
+        if let Some(bar) = &self.ui.find {
+            set_text(bar.status, "");
+        }
         canvas::redraw(self.ui.canvas);
     }
 
     pub(super) fn update_find(&mut self) {
-        if !self.find.open {
+        let Some(bar) = self.ui.find.as_ref().filter(|_| self.find.open) else {
             return;
-        }
-        let query = self.ui.find.query();
+        };
+        let query = bar.query();
         if self.find.query == query {
             return;
         }
@@ -425,7 +437,7 @@ impl App {
         self.find.pending_step = None;
         self.clear_find_hits();
         if self.find.scanning {
-            set_text(self.ui.find.status, "Searching…");
+            set_text(bar.status, "Searching…");
             if let Err(error) = self.start_find() {
                 self.find_failed(&error);
             }
@@ -453,7 +465,9 @@ impl App {
 
     pub(super) fn find_failed(&mut self, error: &str) {
         self.find.scanning = false;
-        set_text(self.ui.find.status, "Search unavailable");
+        if let Some(bar) = &self.ui.find {
+            set_text(bar.status, "Search unavailable");
+        }
         set_text(self.ui.status, error);
     }
 
@@ -461,7 +475,10 @@ impl App {
         if epoch != self.find.epoch || !self.find.open || !self.find.scanning {
             return;
         }
-        if self.find.query != self.ui.find.query() {
+        let Some(bar) = &self.ui.find else {
+            return;
+        };
+        if self.find.query != bar.query() {
             self.update_find();
             return;
         }
@@ -522,6 +539,9 @@ impl App {
     }
 
     fn find_status(&self) {
+        let Some(bar) = &self.ui.find else {
+            return;
+        };
         let (i, n) = VIEW.with_borrow(|v| (v.matches.active + 1, v.matches.hits.len()));
         let mut text = if n > 0 {
             format!("{i} of {n}")
@@ -539,14 +559,10 @@ impl App {
         if !self.find.scanning && self.find.skipped > 0 {
             text.push_str(&format!(" · {} pages skipped", self.find.skipped));
         }
-        set_text(self.ui.find.status, &text);
+        set_text(bar.status, &text);
     }
 
     pub(super) fn step_find(&mut self, previous: bool) {
-        if !self.find.open {
-            self.open_find();
-            return;
-        }
         let advanced = VIEW.with_borrow_mut(|v| {
             let m = &mut v.matches;
             if previous && m.active == 0 && self.find.scanning {

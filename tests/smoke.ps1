@@ -250,6 +250,7 @@ public static class SumiSmoke {
 }
 '@
 Add-Type -Path (Join-Path $PSScriptRoot 'ReadingProbe.cs')
+. (Join-Path $PSScriptRoot 'smokeSupport.ps1')
 . (Join-Path $PSScriptRoot 'reading.ps1')
 . (Join-Path $PSScriptRoot 'find.ps1')
 . (Join-Path $PSScriptRoot 'signingPreferences.ps1')
@@ -270,21 +271,6 @@ function Write-TestPdf([string]$Path) {
     $objects += '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>'
     $objects += '<< /Type /Annot /Subtype /Widget /FT /Sig /T (Approval) /P 4 0 R /F 4 /Rect [165 150 285 185] >>'
     Write-PdfObjects $Path $objects
-}
-
-function Write-PdfObjects([string]$Path, [string[]]$Objects) {
-    # Every inserted character is ASCII, so StringBuilder lengths are also byte offsets.
-    $pdf = [Text.StringBuilder]::new("%PDF-1.4`n")
-    $size = $objects.Count + 1
-    $xref = [Text.StringBuilder]::new("xref`n0 $size`n0000000000 65535 f `n")
-    for ($i = 0; $i -lt $objects.Count; $i++) {
-        [void]$xref.Append(("{0:D10} 00000 n `n" -f $pdf.Length))
-        [void]$pdf.Append("$($i + 1) 0 obj`n$($objects[$i])`nendobj`n")
-    }
-    $offset = $pdf.Length
-    [void]$pdf.Append($xref.ToString())
-    [void]$pdf.Append("trailer`n<< /Root 1 0 R /Size $size >>`nstartxref`n$offset`n%%EOF`n")
-    [IO.File]::WriteAllText($Path, $pdf.ToString(), [Text.Encoding]::ASCII)
 }
 
 function Wait-Page([Diagnostics.Process]$Viewer, [string]$Filename, [string]$Expected, [Diagnostics.Stopwatch]$Elapsed,
@@ -461,6 +447,12 @@ try {
     if (![SumiSmoke]::ReadText($window).StartsWith("$appTitle ")) {
         throw "The document window title did not start with '$appTitle'."
     }
+    if ([SumiSmoke]::GetDlgItem($window, 161) -ne [IntPtr]::Zero) {
+        throw 'The Find edit control exists before Find has been opened.'
+    }
+    if ([SumiSmoke]::GetDlgItem($window, 127) -ne [IntPtr]::Zero) {
+        throw 'The signature position control exists before signing has been opened.'
+    }
     [ReadingProbe]::CheckShortcutHelp($window)
     Test-ToolbarResize $window $false
     Test-ReadingTabs $viewer $window $ScreenshotPath
@@ -544,6 +536,7 @@ try {
     Wait-SignatureState $window 'The signature is on page 2' $false $true
     [SumiSmoke]::Pick($window, 127, 2)
     Wait-SignatureState $window 'The signature will be invisible' $true $false
+    Write-Host 'Verified that Find and signing controls are created on first use.'
     [SumiSmoke]::Click($window, 130)
     Wait-HighlightState $viewer $window '100% of fit size' $true
     if ([SumiSmoke]::IsWindowVisible([SumiSmoke]::GetDlgItem($window, 129)) -or

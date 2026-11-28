@@ -2,6 +2,7 @@ using System;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 
 // Native input and observations for the Windows release EXE, including runners
@@ -13,8 +14,12 @@ public static class ReadingProbe {
     [DllImport("user32.dll", SetLastError=true)]
     static extern IntPtr SendMessageTimeoutW(IntPtr window, uint msg, UIntPtr wp, IntPtr lp,
         uint flags, uint timeout, out UIntPtr result);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode, ExactSpelling=true)]
+    static extern IntPtr SendMessageTimeoutW(IntPtr window, uint msg, UIntPtr wp, [Out] StringBuilder text,
+        uint flags, uint timeout, out UIntPtr result);
     [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window, IntPtr unused);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
     [DllImport("user32.dll")] static extern uint GetQueueStatus(uint flags);
     [DllImport("user32.dll", SetLastError=true)] static extern bool AttachThreadInput(uint from, uint to, bool attach);
     [DllImport("user32.dll", SetLastError=true)] static extern bool GetKeyboardState([Out] byte[] keys);
@@ -35,6 +40,28 @@ public static class ReadingProbe {
     [DllImport("user32.dll")] static extern IntPtr GetKeyboardLayout(uint id);
     [DllImport("user32.dll", CharSet=CharSet.Unicode, ExactSpelling=true)]
     static extern short VkKeyScanExW(char character, IntPtr layout);
+
+    public static IntPtr VisibleViewerWindow(int processId) {
+        var window = IntPtr.Zero;
+        while ((window = FindWindowExW(IntPtr.Zero, window, "SumiPDF.Window", null)) != IntPtr.Zero) {
+            uint owner;
+            if (GetWindowThreadProcessId(window, out owner) != 0 && owner == (uint)processId && IsWindowVisible(window))
+                return window;
+        }
+        return IntPtr.Zero;
+    }
+    static string ReadControlText(IntPtr parent, int id) {
+        var control = GetDlgItem(parent, id);
+        if (control == IntPtr.Zero) return "";
+        var text = new StringBuilder(128);
+        UIntPtr ignored;
+        if (SendMessageTimeoutW(control, 0x000D, new UIntPtr((uint)text.Capacity), text, 2, 25, out ignored) == IntPtr.Zero)
+            return ""; // Poll again if the UI thread is busy.
+        return text.ToString();
+    }
+    public static bool HasPageReadyStatus(IntPtr parent, string pageCounter) {
+        return ReadControlText(parent, 111) == pageCounter && ReadControlText(parent, 112).Contains("100% of fit size");
+    }
 
     static void Post(IntPtr window, uint message, uint key, IntPtr position) {
         if (!PostMessageW(window, message, new UIntPtr(key), position))
@@ -200,6 +227,24 @@ public static class ReadingProbe {
         return '.';
     }
     static bool Near(int a, int b) { return Math.Abs(a - b) <= 7; }
+    public static bool FirstPagePixelsVisible(IntPtr parent) {
+        var canvas = GetDlgItem(parent, 110);
+        if (!IsWindowVisible(canvas)) return false;
+        var previous = SetThreadDpiAwarenessContext(new IntPtr(-4));
+        try {
+            Rect size;
+            if (!GetClientRect(canvas, out size) || size.Right <= 0 || size.Bottom <= 0) return false;
+            // Sample the displayed client surface without asking the viewer to paint.
+            var dc = GetDC(canvas);
+            if (dc == IntPtr.Zero) return false;
+            try {
+                int blue = 0;
+                for (int row = 1; row <= 3; row++)
+                    if (PageColor(GetPixel(dc, size.Right / 2, size.Bottom * row / 4)) == 'B') blue++;
+                return blue >= 2;
+            } finally { ReleaseDC(canvas, dc); }
+        } finally { if (previous != IntPtr.Zero) SetThreadDpiAwarenessContext(previous); }
+    }
     static string Stripe(IntPtr dc, int width, int height) {
         var stripe = new char[(height + 3) / 4];
         for (int i = 0; i < stripe.Length; i++) stripe[i] = PageColor(GetPixel(dc, width / 2, i * 4));

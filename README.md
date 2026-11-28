@@ -93,6 +93,8 @@ cargo build --release --locked --target x86_64-pc-windows-msvc
 
 Windows 用のテストは一時証明書を使う署名、改ざん検出、実際の PDF のレンダリングを扱います。PowerShell 7 のスモークテストは、複数の PDF を開き、タブ切り替え、未保存の注釈の復元、署名位置の選択を検査します。240 ページのテスト文書では、ページをまたぐスクロールや連続操作後の表示位置を調べ、操作時間とワーキングセットを記録します。CLI テストは現在のユーザーの個人ストアに一時証明書を作り、管理者権限のある Windows CI ではローカル コンピューターの個人ストアに追加署名用の一時証明書も作ります。PNG を指定した署名と原本のハッシュを検査した後、証明書とテスト鍵を削除します。同じ検査を実行する [Windows CI](.github/workflows/windows.yml) も付属しています。
 
+Windows CI の手動実行で `compare_startup` を選ぶと、同じ Windows ランナーで配布 EXE と v0.9.3 を交互に起動します。ウィンドウが見えるまでと、PDF の最初のページが見えるまでを計測し、中央値と95パーセンタイルを記録します。
+
 macOS からは Rust の `x86_64-pc-windows-gnu` ターゲットと MinGW-w64 の GCC・windres を使います。
 
 ```sh

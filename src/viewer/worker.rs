@@ -1,7 +1,7 @@
 use crate::textselect::{TextDocument, TextLayout};
 use crate::winpdf::{self, Document, Frame, SigningSource};
 use std::path::PathBuf;
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 use super::READY;
@@ -99,7 +99,16 @@ pub fn report(hwnd: usize, events: &Sender<Event>, event: Event) {
     }
 }
 
-pub fn run(hwnd: usize, jobs: Receiver<Job>, events: Sender<Event>) {
+pub(super) fn spawn(hwnd: usize, events: Sender<Event>) -> Result<Sender<Job>, String> {
+    let (tx, rx) = channel();
+    std::thread::Builder::new()
+        .name("pdf-render".into())
+        .spawn(move || run(hwnd, rx, events))
+        .map_err(|e| e.to_string())?;
+    Ok(tx)
+}
+
+fn run(hwnd: usize, jobs: Receiver<Job>, events: Sender<Event>) {
     // Delay WinRT activation and loading its DLLs until a PDF is actually opened.
     let apartment = winpdf::initialize();
     let mut active: Option<(u64, Document)> = None;

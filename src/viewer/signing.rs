@@ -1,4 +1,7 @@
-use super::{App, Controls, Event, VIEW, canvas, dialog, notice, save, wide, worker};
+use super::{
+    App, Controls, Event, SIGN_CANCEL, SIGN_CERTIFICATE, SIGN_PFX, SIGN_POSITION, SIGN_SAVE, VIEW,
+    WATERMARK, canvas, create_child, dialog, notice, save, theme, toolbar, wide, worker,
+};
 use crate::{
     highlight::UnitRect,
     pdfseal,
@@ -13,8 +16,82 @@ use std::{
 };
 use windows_sys::Win32::{
     Foundation::{HWND, RECT},
-    UI::{Input::KeyboardAndMouse::SetFocus, Shell::ShellExecuteW, WindowsAndMessaging::*},
+    Graphics::Gdi::HFONT,
+    UI::{
+        Input::KeyboardAndMouse::{EnableWindow, SetFocus},
+        Shell::ShellExecuteW,
+        WindowsAndMessaging::*,
+    },
 };
+
+#[derive(Clone, Copy)]
+pub(super) struct Bar {
+    pub(super) position: HWND,
+    pub(super) watermark: HWND,
+    pub(super) certificate: HWND,
+    pub(super) pfx: HWND,
+    save: HWND,
+    cancel: HWND,
+}
+
+impl Bar {
+    pub(super) fn new(
+        hwnd: HWND,
+        after: HWND,
+        toolbar: &mut toolbar::Toolbar,
+    ) -> Result<Self, String> {
+        toolbar.build_row(
+            after,
+            &[
+                SIGN_POSITION,
+                WATERMARK,
+                SIGN_CERTIFICATE,
+                SIGN_PFX,
+                SIGN_SAVE,
+                SIGN_CANCEL,
+            ],
+            |toolbar| {
+                let position = create_child(
+                    hwnd,
+                    "COMBOBOX",
+                    "",
+                    SIGN_POSITION,
+                    WS_TABSTOP | CBS_DROPDOWNLIST as u32,
+                )?;
+                theme::style_control(position)?;
+                Ok(Self {
+                    position,
+                    watermark: toolbar.hidden_button(WATERMARK, toolbar::DEFAULT_WATERMARK)?,
+                    certificate: toolbar.hidden_button(SIGN_CERTIFICATE, toolbar::CERTIFICATE)?,
+                    pfx: toolbar.hidden_button(SIGN_PFX, toolbar::PFX)?,
+                    save: toolbar.hidden_button(SIGN_SAVE, toolbar::CONFIRM)?,
+                    cancel: toolbar.hidden_button(SIGN_CANCEL, toolbar::CANCEL)?,
+                })
+            },
+        )
+    }
+
+    pub(super) fn show(self, visible: bool) {
+        for control in [
+            self.position,
+            self.watermark,
+            self.certificate,
+            self.pfx,
+            self.save,
+            self.cancel,
+        ] {
+            unsafe { ShowWindow(control, if visible { SW_SHOW } else { SW_HIDE }) };
+        }
+    }
+
+    pub(super) fn font(self, font: HFONT) {
+        unsafe { SendMessageW(self.position, WM_SETFONT, font as usize, 1) };
+    }
+
+    fn reset_positions(self) {
+        unsafe { SendMessageW(self.position, CB_RESETCONTENT, 0, 0) };
+    }
+}
 
 struct Field {
     id: String,
@@ -287,13 +364,35 @@ impl Session {
 
 impl App {
     pub(super) fn can_sign_here(&self) -> bool {
-        self.signing.as_ref().is_some_and(|s| {
-            let index = unsafe { SendMessageW(self.ui.position, CB_GETCURSEL, 0, 0) };
-            s.selected == usize::try_from(index).ok()
-                && (matches!(s.position(), Some(Position::Invisible))
-                    || (s.placement().is_some_and(|(p, _)| p == self.page)
-                        && VIEW.with_borrow(|v| v.bitmap.is_some())))
-        })
+        let (Some(session), Some(bar)) = (&self.signing, self.ui.signing) else {
+            return false;
+        };
+        let index = unsafe { SendMessageW(bar.position, CB_GETCURSEL, 0, 0) };
+        session.selected == usize::try_from(index).ok()
+            && (matches!(session.position(), Some(Position::Invisible))
+                || (session.placement().is_some_and(|(p, _)| p == self.page)
+                    && VIEW.with_borrow(|v| v.bitmap.is_some())))
+    }
+
+    pub(super) fn enable_signing_controls(&self) {
+        let Some(bar) = self.ui.signing else {
+            return;
+        };
+        let session = self.signing.as_ref();
+        let ready = !self.writing && session.is_some_and(Session::has_positions);
+        for (control, enabled) in [
+            (bar.position, ready),
+            (bar.certificate, ready),
+            (bar.pfx, ready),
+            (
+                bar.watermark,
+                !self.writing && session.is_some_and(Session::can_pick_watermark),
+            ),
+            (bar.save, !self.writing && self.can_sign_here()),
+            (bar.cancel, !self.writing),
+        ] {
+            unsafe { EnableWindow(control, i32::from(enabled)) };
+        }
     }
 
     pub(super) fn sync_signature(&self) {
@@ -310,17 +409,19 @@ impl App {
     }
 
     pub(super) fn restore_signing_controls(&mut self) -> Result<(), String> {
-        unsafe {
-            SendMessageW(self.ui.position, CB_RESETCONTENT, 0, 0);
-        }
+        let Some(bar) = self.ui.signing else {
+            return Ok(());
+        };
+        bar.reset_positions();
         if let Some(session) = &self.signing {
             self.ui
                 .toolbar
-                .watermark(self.ui.watermark, session.watermark.is_some())?;
+                .watermark(bar.watermark, session.watermark.is_some())?;
             if let Some(choices) = &session.choices {
-                choices.populate(self.ui.position, session.selected)?;
+                choices.populate(bar.position, session.selected)?;
             }
         }
+        bar.show(self.signing.is_some());
         Ok(())
     }
 
@@ -347,13 +448,15 @@ impl App {
                 .map_err(|e| e.to_string())?;
             self.checking_fields = Some(revision);
         }
+        let bar = self.ui.ensure_signing(self.hwnd)?;
+        let session = Session::restore(self.hwnd);
+        self.ui
+            .toolbar
+            .watermark(bar.watermark, session.watermark.is_some())?;
         self.tool = None;
         self.request_text()?;
-        let session = Session::restore(self.hwnd);
-        let custom = session.watermark.is_some();
         self.signing = Some(session);
-        self.ui.show_signing(true);
-        self.ui.toolbar.watermark(self.ui.watermark, custom)?;
+        bar.show(true);
         Controls::layout(self.hwnd);
         self.controls();
         self.status();
@@ -365,11 +468,11 @@ impl App {
         if self.signing.take().is_none() {
             return;
         }
-        unsafe {
-            SendMessageW(self.ui.position, CB_RESETCONTENT, 0, 0);
+        if let Some(bar) = self.ui.signing {
+            bar.reset_positions();
+            bar.show(false);
         }
         VIEW.with_borrow_mut(|v| v.set_signature(false, None));
-        self.ui.show_signing(false);
         Controls::layout(self.hwnd);
         self.controls();
         self.status();
@@ -380,7 +483,7 @@ impl App {
     }
 
     pub(super) fn show_fields(&mut self, choices: Choices) -> Result<(), String> {
-        let Some(session) = &mut self.signing else {
+        let (Some(session), Some(bar)) = (&mut self.signing, self.ui.signing) else {
             return Ok(());
         };
         self.known_signed = choices.already_signed;
@@ -388,24 +491,24 @@ impl App {
             return Err("This PDF is already signed. Undo all unsaved annotations before adding another signature.".into());
         }
         let preferred = choices.preferred(self.page);
-        choices.populate(self.ui.position, preferred)?;
+        choices.populate(bar.position, preferred)?;
         session.choices = Some(choices);
         self.choose_position();
         unsafe {
             SetFocus(if preferred.is_some() {
-                self.ui.position
+                bar.position
             } else {
-                self.ui.sign_cancel
+                bar.cancel
             });
         }
         Ok(())
     }
 
     pub(super) fn choose_position(&mut self) {
-        let Some(session) = &mut self.signing else {
+        let (Some(session), Some(bar)) = (&mut self.signing, self.ui.signing) else {
             return;
         };
-        let index = unsafe { SendMessageW(self.ui.position, CB_GETCURSEL, 0, 0) };
+        let index = unsafe { SendMessageW(bar.position, CB_GETCURSEL, 0, 0) };
         session.selected = usize::try_from(index).ok();
         if let Some((page, _)) = session.placement() {
             self.page_to(page);
@@ -451,14 +554,14 @@ impl App {
     }
 
     pub(super) fn choose_watermark(&mut self) -> Result<(), String> {
-        let Some(session) = &mut self.signing else {
+        let (Some(session), Some(bar)) = (&mut self.signing, self.ui.signing) else {
             return Ok(());
         };
         if !session.can_pick_watermark() {
             return Ok(());
         }
         let path = session.watermark.as_ref().map(|w| w.path.as_path());
-        match watermark_menu(self.hwnd, self.ui.watermark, path)? {
+        match watermark_menu(self.hwnd, bar.watermark, path)? {
             1 => session.watermark = None,
             choice @ (2 | 4) => {
                 let purpose = if choice == 4 {
@@ -484,7 +587,7 @@ impl App {
         }
         self.ui
             .toolbar
-            .watermark(self.ui.watermark, session.watermark.is_some())?;
+            .watermark(bar.watermark, session.watermark.is_some())?;
         Ok(())
     }
 }

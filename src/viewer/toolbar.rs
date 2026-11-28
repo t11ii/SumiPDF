@@ -11,7 +11,8 @@ use windows::{
 };
 use windows_sys::Win32::UI::Controls::{
     ICC_BAR_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx, TOOLTIPS_CLASSW, TTF_IDISHWND,
-    TTF_SUBCLASS, TTM_ADDTOOLW, TTM_UPDATETIPTEXTW, TTS_ALWAYSTIP, TTS_NOPREFIX, TTTOOLINFOW,
+    TTF_SUBCLASS, TTM_ADDTOOLW, TTM_DELTOOLW, TTM_UPDATETIPTEXTW, TTS_ALWAYSTIP, TTS_NOPREFIX,
+    TTTOOLINFOW,
 };
 
 #[derive(Clone, Copy)]
@@ -53,6 +54,7 @@ pub(super) struct Toolbar {
     names: IAccPropServices,
     buttons: Vec<HWND>,
     color: Option<HWND>,
+    font: HFONT,
 }
 
 impl Toolbar {
@@ -91,6 +93,7 @@ impl Toolbar {
             names,
             buttons: Vec::new(),
             color: None,
+            font: null_mut(),
         })
     }
 
@@ -140,17 +143,81 @@ impl Toolbar {
     }
 
     pub fn button(&mut self, id: usize, icon: Icon) -> Result<HWND, String> {
+        self.create_button(id, icon, WS_VISIBLE)
+    }
+
+    pub(super) fn hidden_button(&mut self, id: usize, icon: Icon) -> Result<HWND, String> {
+        self.create_button(id, icon, 0)
+    }
+
+    fn create_button(&mut self, id: usize, icon: Icon, visibility: u32) -> Result<HWND, String> {
         let toggle = matches!(id, HIGHLIGHT | UNDERLINE);
         let style = if toggle {
             (BS_CHECKBOX | BS_PUSHLIKE) as u32
         } else {
             0
         };
-        let hwnd = child(self.parent, "BUTTON", icon.glyph, id, WS_TABSTOP | style)?;
+        let hwnd = create_child(
+            self.parent,
+            "BUTTON",
+            icon.glyph,
+            id,
+            visibility | WS_TABSTOP | style,
+        )?;
         theme::style_control(hwnd)?;
         self.describe(hwnd, icon.label, TTM_ADDTOOLW)?;
+        if !self.font.is_null() {
+            unsafe { SendMessageW(hwnd, WM_SETFONT, self.font as usize, 0) };
+        }
         self.buttons.push(hwnd);
         Ok(hwnd)
+    }
+
+    // A native control or its tooltip can fail to initialize. Roll back the row
+    // so another attempt can create it without reusing a partial row.
+    pub(super) fn build_row<T>(
+        &mut self,
+        after: HWND,
+        ids: &[usize],
+        build: impl FnOnce(&mut Self) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let before = self.buttons.len();
+        let result = build(self).and_then(|row| {
+            // Native Tab navigation follows sibling order. Insert the row
+            // immediately after the button that opens it.
+            let mut previous = after;
+            for &id in ids {
+                let control = unsafe { GetDlgItem(self.parent, id as i32) };
+                if unsafe {
+                    SetWindowPos(
+                        control,
+                        previous,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    )
+                } == 0
+                {
+                    return Err(std::io::Error::last_os_error().to_string());
+                }
+                previous = control;
+            }
+            Ok(row)
+        });
+        if result.is_err() {
+            self.buttons.truncate(before);
+            for &id in ids {
+                let control = unsafe { GetDlgItem(self.parent, id as i32) };
+                if !control.is_null() {
+                    let _ = self.tooltip(control, PCWSTR::null(), TTM_DELTOOLW);
+                    Self::clear_name(&self.names, control);
+                    unsafe { DestroyWindow(control) };
+                }
+            }
+        }
+        result
     }
 
     pub fn watermark(&self, button: HWND, custom: bool) -> Result<(), String> {
@@ -164,7 +231,8 @@ impl Toolbar {
         Ok(())
     }
 
-    pub fn set_font(&self, font: HFONT) {
+    pub fn set_font(&mut self, font: HFONT) {
+        self.font = font;
         for &button in &self.buttons {
             unsafe {
                 SendMessageW(button, WM_SETFONT, font as usize, 1);
@@ -175,14 +243,14 @@ impl Toolbar {
     // MSAA annotations must be removed while their HWNDs still exist.
     pub fn clear_names(&mut self) {
         for button in self.buttons.drain(..).chain(self.color.take()) {
-            unsafe {
-                let _ = self.names.ClearHwndProps(
-                    WinHwnd(button),
-                    OBJID_CLIENT as u32,
-                    0,
-                    &[PROPID_ACC_NAME],
-                );
-            }
+            Self::clear_name(&self.names, button);
+        }
+    }
+
+    fn clear_name(names: &IAccPropServices, control: HWND) {
+        unsafe {
+            let _ =
+                names.ClearHwndProps(WinHwnd(control), OBJID_CLIENT as u32, 0, &[PROPID_ACC_NAME]);
         }
     }
 }
@@ -383,6 +451,11 @@ mod tests {
             assert!(!parent.is_null());
             let mut ui = Controls::new(parent).unwrap();
             ui.fonts(parent);
+            let find_edit = ui.ensure_find(parent).unwrap().edit;
+            let signing = ui.ensure_signing(parent).unwrap();
+            let find_label = GetWindow(find_edit, GW_HWNDPREV);
+            assert_eq!(GetWindow(find_label, GW_HWNDPREV), ui.find_button);
+            assert_eq!(GetWindow(signing.position, GW_HWNDPREV), ui.sign);
             let dc = GetDC(parent);
             let old = SelectObject(dc, ui.icon_font);
             let mut indices = std::collections::HashSet::new();
@@ -425,16 +498,16 @@ mod tests {
             assert_eq!(tip, "Markup color");
             assert_eq!(name, tip);
             assert_eq!(
-                labels(&ui.toolbar, ui.certificate).1,
+                labels(&ui.toolbar, signing.certificate).1,
                 "Choose from the Windows certificate store"
             );
             assert_eq!(labels(&ui.toolbar, ui.sign).1, "Sign PDF… (Ctrl+S)");
-            ui.toolbar.watermark(ui.watermark, true).unwrap();
-            let (tip, name) = labels(&ui.toolbar, ui.watermark);
+            ui.toolbar.watermark(signing.watermark, true).unwrap();
+            let (tip, name) = labels(&ui.toolbar, signing.watermark);
             assert!(tip.contains("custom image") && tip == name);
             SelectObject(dc, old);
             ReleaseDC(parent, dc);
-            ui.show_signing(true);
+            signing.show(true);
             Controls::layout(parent);
             let dc = GetDC(parent);
             let p = theme::palette();
@@ -449,17 +522,17 @@ mod tests {
                     assert_eq!(surface(toggle), p.chrome);
                 }
                 assert_eq!(surface(ui.color), p.field);
-                assert_eq!(surface(ui.position), p.field);
+                assert_eq!(surface(signing.position), p.field);
                 assert_eq!(surface(ui.page), p.field);
                 let mut prior_ink = 0;
                 for label in [w!("I"), w!("MMMM")] {
-                    let index = SendMessageW(ui.position, CB_ADDSTRING, 0, label.0 as isize);
+                    let index = SendMessageW(signing.position, CB_ADDSTRING, 0, label.0 as isize);
                     assert!(index >= 0);
-                    SendMessageW(ui.position, CB_SETCURSEL, index as usize, 0);
-                    let ink = snapshot(ui.position, dc, |image, bounds| {
+                    SendMessageW(signing.position, CB_SETCURSEL, index as usize, 0);
+                    let ink = snapshot(signing.position, dc, |image, bounds| {
                         let mut count = 0;
                         for y in 3..bounds.bottom - 3 {
-                            for x in 3..bounds.right - dips(ui.position, 18) {
+                            for x in 3..bounds.right - dips(signing.position, 18) {
                                 count += usize::from(GetPixel(image, x, y) != p.field);
                             }
                         }
@@ -479,7 +552,7 @@ mod tests {
                 SetFocus(old_focus);
                 ShowWindow(parent, SW_HIDE);
             }
-            let icons = [ui.fit, ui.sign, ui.pfx];
+            let icons = [ui.fit, ui.sign, signing.pfx];
             let reference = icons.map(|button| glyph_pixels(button, dc));
             for width in [440, 689, 690, 900] {
                 SetWindowPos(
