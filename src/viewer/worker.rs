@@ -48,8 +48,15 @@ pub enum Event {
     Layout {
         revision: u64,
         page: u32,
+        purpose: TextPurpose,
         result: Result<TextLayout, String>,
     },
+}
+
+#[derive(Clone, Copy)]
+pub enum TextPurpose {
+    Markup,
+    Selection,
 }
 
 pub enum TextJob {
@@ -57,18 +64,20 @@ pub enum TextJob {
     Page {
         revision: u64,
         page: u32,
+        purpose: TextPurpose,
         source: SigningSource,
     },
 }
 
-// Parsing text must never block page painting. Only the highlight tool starts
-// this worker. Release the parsed document when the user turns the tool off.
+// Parse text on demand. The markup tool can reuse the document while active.
+// Reading selections keep only their current page's layout on the UI thread.
 pub fn text_pages(hwnd: usize, jobs: Receiver<TextJob>, events: Sender<Event>) {
     let mut cache: Option<(u64, TextDocument)> = None;
     while let Ok(first) = jobs.recv() {
         let TextJob::Page {
             revision,
             page,
+            purpose,
             source,
         } = jobs.try_iter().last().unwrap_or(first)
         else {
@@ -83,12 +92,16 @@ pub fn text_pages(hwnd: usize, jobs: Receiver<TextJob>, events: Sender<Event>) {
             }
             cache.as_ref().unwrap().1.page(page)
         })();
+        if matches!(purpose, TextPurpose::Selection) {
+            cache = None;
+        }
         report(
             hwnd,
             &events,
             Event::Layout {
                 revision,
                 page,
+                purpose,
                 result,
             },
         );

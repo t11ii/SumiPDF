@@ -21,6 +21,7 @@ const BINDINGS: &[&str] = &[
     "Ctrl+0\tFit page",
     "Ctrl+wheel\tZoom in / out",
     "Shift+wheel\tScroll horizontally",
+    "Drag text, then H / U\tHighlight or underline selected text",
     "H\tToggle highlight",
     "U\tToggle underline",
     "Ctrl+Z\tUndo the last annotation",

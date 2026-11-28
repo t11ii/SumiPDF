@@ -6,8 +6,8 @@ use windows::{
     Data::Pdf::{PdfDocument, PdfPage, PdfPageRenderOptions},
     Foundation::Size,
     Graphics::Imaging::{
-        BitmapAlphaMode, BitmapDecoder, BitmapEncoder, BitmapPixelFormat, BitmapTransform,
-        ColorManagementMode, ExifOrientationMode,
+        BitmapAlphaMode, BitmapDecoder, BitmapEncoder, BitmapInterpolationMode, BitmapPixelFormat,
+        BitmapTransform, ColorManagementMode, ExifOrientationMode,
     },
     Storage::{
         FileAccessMode, StorageOpenOptions,
@@ -29,7 +29,10 @@ use windows::{
     core::{AgileReference, Array, Error, HSTRING, Result as WinResult},
 };
 
-use crate::raster_size::{MAX_PIXELS, bounded_bitmap_size, bounded_decoded_size};
+use crate::raster_size::{
+    FIT_PIXELS, bounded_bitmap_size, bounded_decoded_size, fitted_page_size, supersampled_size,
+    view_pixel_limit,
+};
 
 /// WinRT initialization and shutdown must occur on the same thread.
 pub struct Apartment(PhantomData<Rc<()>>);
@@ -191,7 +194,7 @@ impl Document {
     }
 
     pub fn render_fit(&self, index: u32, area: (i32, i32), zoom: f64) -> Result<Bitmap, String> {
-        self.render_page(index, area, zoom, None)
+        self.render_page(index, area, zoom, Some(FIT_PIXELS))
             .map(|frame| frame.bitmap)
     }
 
@@ -204,20 +207,37 @@ impl Document {
     ) -> Result<Frame, String> {
         let page = Page(self.pdf.GetPage(index).map_err(|e| e.to_string())?);
         let size = checked_size(&page.0)?;
-        let fit = (f64::from(area.0) / f64::from(size.Width))
-            .min(f64::from(area.1) / f64::from(size.Height));
-        let width = (f64::from(size.Width) * fit * zoom).round().max(1.0) as u32;
-        let budget = cache_pixels.unwrap_or(MAX_PIXELS).clamp(1, MAX_PIXELS);
-        let dimensions =
-            |cap| bounded_bitmap_size(f64::from(size.Width), f64::from(size.Height), width, cap);
-        let (w, h) = dimensions(budget);
-        let limited_to =
-            (budget < MAX_PIXELS && (w, h) != dimensions(MAX_PIXELS)).then_some(budget);
-        let bitmap = rasterize(&page.0, w, h, budget)
-            .map_err(|e| format!("{} ページを表示できませんでした。 {e}", index + 1))?;
+        let ratio = f64::from(size.Width) / f64::from(size.Height);
+        let (width, height) = fitted_page_size(area, ratio, zoom);
+        let requested = (width as u32, height as u32);
+        let limit = view_pixel_limit(zoom);
+        let budget = cache_pixels.unwrap_or(limit).clamp(1, limit);
+        let dimensions = |cap| bounded_bitmap_size(requested, cap);
+        let output = dimensions(budget);
+        let limited_to = (budget < limit && output != dimensions(limit)).then_some(budget);
+        // Average extra samples into the display-sized frame while still on the render thread.
+        let smoothed = if zoom <= 1.0 && output == requested {
+            supersampled_size(output)
+                .and_then(|samples| rasterize(&page.0, samples, Some(output), budget).ok())
+        } else {
+            None
+        };
+        let bitmap = match smoothed {
+            Some(bitmap) => Ok(bitmap),
+            None => rasterize(&page.0, output, None, budget),
+        }
+        .or_else(|error| {
+            let standard = budget.min(FIT_PIXELS);
+            let fallback = dimensions(standard);
+            if fallback == output {
+                return Err(error);
+            }
+            rasterize(&page.0, fallback, None, standard)
+        })
+        .map_err(|e| format!("{} ページを表示できませんでした。 {e}", index + 1))?;
         Ok(Frame {
             bitmap,
-            ratio: f64::from(size.Width) / f64::from(size.Height),
+            ratio,
             limited_to,
         })
     }
@@ -243,20 +263,26 @@ fn checked_size(page: &PdfPage) -> Result<Size, String> {
     Ok(size)
 }
 
-fn rasterize(page: &PdfPage, width: u32, height: u32, budget: u64) -> WinResult<Bitmap> {
+fn rasterize(
+    page: &PdfPage,
+    size: (u32, u32),
+    downsample_to: Option<(u32, u32)>,
+    budget: u64,
+) -> WinResult<Bitmap> {
     let stream = InMemoryRandomAccessStream::new()?;
     let options = PdfPageRenderOptions::new()?;
-    options.SetDestinationWidth(width)?;
-    options.SetDestinationHeight(height)?;
+    options.SetDestinationWidth(size.0)?;
+    options.SetDestinationHeight(size.1)?;
     options.SetBitmapEncoderId(BitmapEncoder::BmpEncoderId()?)?;
     page.RenderWithOptionsToStreamAsync(&stream, &options)?
         .join()?;
-    decode_page_bitmap(&stream, (width, height), budget)
+    decode_page_bitmap(&stream, size, downsample_to, budget)
 }
 
 fn decode_page_bitmap(
     stream: &InMemoryRandomAccessStream,
     requested: (u32, u32),
+    downsample_to: Option<(u32, u32)>,
     budget: u64,
 ) -> WinResult<Bitmap> {
     stream.Seek(0)?;
@@ -268,17 +294,31 @@ fn decode_page_bitmap(
             requested.0, requested.1, actual.0, actual.1
         )
     };
-    let (width, height) = bounded_decoded_size(requested, actual, budget).ok_or_else(|| {
-        Error::new(
-            E_UNEXPECTED,
-            format!("ページ画像の寸法がゼロです（{}）。", dimensions()),
-        )
-    })?;
+    let (width, height) = if let Some(output) = downsample_to {
+        if actual.0.abs_diff(requested.0) > 1 || actual.1.abs_diff(requested.1) > 1 {
+            return Err(Error::new(
+                E_UNEXPECTED,
+                format!(
+                    "高解像度のページ画像の寸法が一致しません（{}）。",
+                    dimensions()
+                ),
+            ));
+        }
+        output
+    } else {
+        bounded_decoded_size(requested, actual, budget).ok_or_else(|| {
+            Error::new(
+                E_UNEXPECTED,
+                format!("ページ画像の寸法がゼロです（{}）。", dimensions()),
+            )
+        })?
+    };
     let decode = || -> WinResult<Array<u8>> {
         let transform = BitmapTransform::new()?;
         if (width, height) != actual {
             transform.SetScaledWidth(width)?;
             transform.SetScaledHeight(height)?;
+            transform.SetInterpolationMode(BitmapInterpolationMode::Fant)?;
         }
         decoder
             .GetPixelDataTransformedAsync(
@@ -327,9 +367,10 @@ mod tests {
     fn reads_the_real_bmp_rows_when_windows_returns_a_different_size() {
         let _apartment = initialize().unwrap();
         // The second BMP exceeds the edge limit but requires only 128 KiB of test pixels.
-        for (w, h, requested, expected) in [
-            (201, 100, (200, 100), (201, 100)),
-            (8193, 4, (4096, 3000), (4096, 1)),
+        for (w, h, requested, downsample_to, expected) in [
+            (201, 100, (200, 100), None, (201, 100)),
+            (8193, 4, (4096, 3000), None, (4096, 1)),
+            (201, 101, (200, 100), Some((100, 50)), (100, 50)),
         ] {
             let mut pixels = vec![255; (w * h * 4) as usize];
             for row in pixels.chunks_exact_mut(w as usize * 4) {
@@ -354,7 +395,7 @@ mod tests {
                 .unwrap();
             encoder.FlushAsync().unwrap().join().unwrap();
             drop(encoder);
-            let image = decode_page_bitmap(&stream, requested, MAX_PIXELS).unwrap();
+            let image = decode_page_bitmap(&stream, requested, downsample_to, FIT_PIXELS).unwrap();
             assert_eq!((image.width, image.height), expected);
             let stride = image.width as usize * 4;
             assert_eq!(image.pixels.len(), stride * image.height as usize);
@@ -366,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_renders_unsigned_graphics_and_text_only_a4_pages_at_fit_and_minimum_zoom() {
+    fn windows_renders_unsigned_graphics_and_text_only_a4_pages_at_fit_and_zoom() {
         let _apartment = initialize().unwrap();
         let content = "1 0 0 rg 0 0 297.64 420.945 re f\n";
         let text = "BT /F1 36 Tf 64 700 Td (Text-only PDF) Tj ET\n";
@@ -416,6 +457,25 @@ mod tests {
                     > 50
             );
         }
+        let zoom = 4.0;
+        let limit = view_pixel_limit(zoom);
+        let detailed = document
+            .render_page(1, (900, 1000), zoom, Some(limit))
+            .unwrap();
+        let pixels = u64::from(detailed.bitmap.width) * u64::from(detailed.bitmap.height);
+        assert!(
+            (FIT_PIXELS + 1..=limit).contains(&pixels),
+            "high-zoom bitmap: {pixels} pixels"
+        );
+        assert!(
+            detailed
+                .bitmap
+                .pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|p| p[..3] == [0, 0, 0])
+        );
         let source = document.signing_source().unwrap();
         drop(document);
         let read = std::thread::spawn(move || source.read_bytes())

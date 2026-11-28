@@ -622,7 +622,7 @@ dependencies = [
 
 [[package]]
 name = "sumi-pdf"
-version = "0.9.6"
+version = "0.9.7"
 dependencies = [
  "embed-resource",
  "lopdf",

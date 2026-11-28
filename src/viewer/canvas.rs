@@ -2,7 +2,10 @@
 //! neighbors. Reading and editing share the same Win32 painting path.
 use super::{dips, rect, wide};
 use crate::continuous::{Layout, Position};
-use crate::highlight::{HIGHLIGHT_OPACITY, Mark, MarkKind, MarkStyle, TextRun, UnitRect};
+use crate::highlight::{
+    HIGHLIGHT_OPACITY, Mark, MarkColor, MarkKind, MarkStyle, TextRun, UnitRect,
+};
+use crate::raster_size::{FIT_PIXELS, fitted_page_size, view_pixel_limit};
 use crate::textselect::TextLayout;
 use crate::winpdf::{Bitmap, Frame};
 use std::{
@@ -30,6 +33,39 @@ enum Drag {
         origin: (f32, f32),
         glyph: Option<usize>,
     },
+    Text(TextDrag),
+}
+
+#[derive(Clone, Copy)]
+enum TextDragPhase {
+    Starting,
+    Loading { released: bool },
+    Selecting(usize),
+}
+
+#[derive(Clone, Copy)]
+struct TextDrag {
+    page: u32,
+    area: PageArea,
+    origin: (i32, i32),
+    point: (i32, i32),
+    phase: TextDragPhase,
+}
+
+impl TextDrag {
+    fn delta(self) -> (i32, i32) {
+        (self.point.0 - self.origin.0, self.point.1 - self.origin.1)
+    }
+
+    fn moved(self, minimum: i32) -> bool {
+        let (dx, dy) = self.delta();
+        dx.abs().max(dy.abs()) >= minimum
+    }
+}
+
+struct Selection {
+    page: u32,
+    runs: Vec<TextRun>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -100,6 +136,9 @@ pub struct Canvas {
     tool: Option<MarkStyle>,
     page: u32,
     text_layout: Option<TextLayout>,
+    text_selection_enabled: bool,
+    selection_layout: Option<(u32, TextLayout)>,
+    selection: Option<Selection>,
     marks: Vec<Mark>,
     preview: Vec<TextRun>,
     completed: VecDeque<Mark>,
@@ -187,6 +226,8 @@ impl Canvas {
         self.cancel_drag();
         self.marks.clear();
         self.text_layout = None;
+        self.selection = None;
+        self.selection_layout = None;
         self.empty = empty;
         self.text = text.into();
     }
@@ -239,12 +280,14 @@ impl Canvas {
             self.cancel_drag();
             redraw(hwnd);
         } else if !reading && let Some(mut old) = self.reading.take() {
+            self.clear_text_selection(hwnd);
+            self.selection_layout = None;
             self.resume = Some(old.layout.position);
             self.text = "Loading page…".into();
             if let Some(cached) = old.frames.remove(&page)
                 && let Ok(image) = cached.image
             {
-                self.single_ratio = Some(f64::from(image.width) / f64::from(image.height));
+                self.single_ratio = Some(old.layout.aspect_ratio(page));
                 self.bitmap = Some(image);
                 self.single_quality = cached.limited_to.is_none().then_some(cached.quality);
             }
@@ -335,42 +378,60 @@ impl Canvas {
         };
         let wanted = r.layout.wanted();
         r.frames.retain(|index, _| wanted.contains(index));
-        const CACHE_PIXELS: u64 = 12 * 1024 * 1024;
+        const FIT_CACHE_PIXELS: u64 = 12 * 1024 * 1024;
         const PREVIEW_PIXELS: u64 = 1024 * 1024;
+        let lead_limit = view_pixel_limit(self.zoom);
+        let cache_limit = FIT_CACHE_PIXELS + lead_limit - FIT_PIXELS;
         let visible = r.layout.visible();
         let on_screen = |index| visible.iter().any(|p| p.page == index);
-        let bytes = |f: &CachedPage| f.image.as_ref().map_or(0, |img| img.pixels.len() as u64);
-        let used: u64 = r.frames.values().map(|f| bytes(f) / 4).sum();
+        let pixels = |f: &CachedPage| {
+            f.image
+                .as_ref()
+                .map_or(0, |img| img.pixels.len() as u64 / 4)
+        };
+        let mut used: u64 = r.frames.values().map(pixels).sum();
+        if used > cache_limit {
+            // Keep the current image until its replacement arrives after zooming out.
+            r.frames
+                .retain(|index, f| *index == page || f.quality == quality);
+            used = r.frames.values().map(pixels).sum();
+        }
         // Account for replacement before dispatch. The worker also enforces
         // the budget if the native decoder produces an unexpectedly large BMP.
         for &next in &wanted {
             let old = r.frames.get(&next);
-            let room = CACHE_PIXELS
-                .saturating_sub(used - old.map_or(0, |f| bytes(f) / 4) + wanted.len() as u64);
-            let limit = if on_screen(next) {
-                crate::raster_size::MAX_PIXELS
-            } else {
+            let old_pixels = old.map_or(0, pixels);
+            let available =
+                |used: u64| cache_limit.saturating_sub(used - old_pixels + wanted.len() as u64);
+            let limit = if !on_screen(next) {
                 PREVIEW_PIXELS
+            } else if next == page {
+                lead_limit
+            } else {
+                FIT_PIXELS
             };
             if old.is_some_and(|f| {
                 f.quality == quality && f.limited_to.is_none_or(|cap| cap >= limit)
             }) {
                 continue;
             }
-            let mut budget = room.min(limit);
-            // Prioritize the page at the reading position when an old,
-            // full-resolution offscreen neighbor is occupying its allowance.
+            let mut budget = available(used).min(limit);
+            // Reclaim oversized neighbors before reducing the lead's resolution.
             if next == page && budget < limit {
                 let mut recovered = 0;
                 r.frames.retain(|index, f| {
-                    if !on_screen(*index) && bytes(f) / 4 > PREVIEW_PIXELS {
-                        recovered += bytes(f) / 4;
+                    let n = pixels(f);
+                    if *index != page
+                        && ((!on_screen(*index) && n > PREVIEW_PIXELS) || n > FIT_PIXELS)
+                    {
+                        recovered += n;
                         false
                     } else {
                         true
                     }
                 });
-                budget = (room + recovered).min(limit);
+                used -= recovered;
+                budget = available(used).min(limit);
             }
             if budget > 0
                 && !r.frames.get(&next).is_some_and(|f| {
@@ -486,6 +547,79 @@ impl Canvas {
         self.text_layout = layout;
     }
 
+    pub(super) fn enable_text_selection(&mut self, hwnd: HWND, enabled: bool) {
+        if self.text_selection_enabled && !enabled {
+            self.clear_text_selection(hwnd);
+            self.selection_layout = None;
+        }
+        self.text_selection_enabled = enabled;
+    }
+
+    pub(super) fn clear_text_selection(&mut self, hwnd: HWND) {
+        if matches!(self.drag, Some(Drag::Text(_))) {
+            self.cancel_drag();
+        }
+        if self.selection.take().is_some() {
+            redraw(hwnd);
+        }
+    }
+
+    pub(super) fn has_selection(&self) -> bool {
+        self.drag.is_none() && self.selection.is_some()
+    }
+
+    pub(super) fn selection_active(&self) -> bool {
+        self.selection.is_some() || matches!(self.drag, Some(Drag::Text(_)))
+    }
+
+    pub(super) fn take_selection(&mut self, style: MarkStyle) -> Option<Mark> {
+        if !self.has_selection() {
+            return None;
+        }
+        let Selection { page, runs } = self.selection.take()?;
+        Some(Mark { page, style, runs })
+    }
+
+    pub(super) fn pending_text_page(&self) -> Option<u32> {
+        match self.drag {
+            Some(Drag::Text(TextDrag {
+                page,
+                phase: TextDragPhase::Loading { .. },
+                ..
+            })) => Some(page),
+            _ => None,
+        }
+    }
+
+    pub(super) fn finish_reading_text(
+        &mut self,
+        hwnd: HWND,
+        page: u32,
+        layout: TextLayout,
+    ) -> Option<(i32, i32)> {
+        let Some(Drag::Text(mut drag)) = self.drag else {
+            return None;
+        };
+        let TextDragPhase::Loading { released } = drag.phase else {
+            return None;
+        };
+        if drag.page != page {
+            return None;
+        }
+        let (x, y) = drag.area.normalized(drag.origin);
+        let glyph = layout.hit(x, y);
+        self.selection_layout = Some((page, layout));
+        if let Some(glyph) = glyph {
+            self.update_selection(hwnd, drag, glyph);
+            drag.phase = TextDragPhase::Selecting(glyph);
+            self.drag = (!released).then_some(Drag::Text(drag));
+            None
+        } else {
+            self.drag = (!released).then_some(Drag::Pan(drag.point));
+            Some(drag.delta())
+        }
+    }
+
     pub fn take_new_mark(&mut self) -> Option<Mark> {
         self.completed.pop_front()
     }
@@ -511,9 +645,10 @@ impl Canvas {
         let Some(image) = &self.bitmap else {
             return PageArea::default();
         };
-        let fit = (w as f64 / f64::from(image.width)).min(h as f64 / f64::from(image.height));
-        let width = (f64::from(image.width) * fit * self.zoom).round().max(1.0) as i32;
-        let height = (f64::from(image.height) * fit * self.zoom).round().max(1.0) as i32;
+        let ratio = self
+            .single_ratio
+            .unwrap_or_else(|| f64::from(image.width) / f64::from(image.height));
+        let (width, height) = fitted_page_size((w, h), ratio, self.zoom);
         let max_x = ((width - w + 1) / 2).max(0);
         let max_y = ((height - h + 1) / 2).max(0);
         self.offset.0 = self.offset.0.clamp(-max_x, max_x);
@@ -527,9 +662,13 @@ impl Canvas {
     }
 
     fn start_drag(&mut self, hwnd: HWND, point: (i32, i32)) -> bool {
+        if self.selection.is_some() {
+            self.clear_text_selection(hwnd);
+            super::action(unsafe { GetParent(hwnd) }, super::SELECTION_CHANGED);
+        }
         let page = self.layout(hwnd);
-        self.drag = if self.reading.is_some() {
-            Some(Drag::Pan(point))
+        self.drag = if let Some(reading) = &self.reading {
+            Some(self.start_reading_drag(reading, point))
         } else if self.draw_signature && page.contains(point) {
             Some(Drag::Signature(page.normalized(point)))
         } else if self.tool.is_some() && page.contains(point) {
@@ -549,7 +688,82 @@ impl Canvas {
         self.drag.is_some()
     }
 
+    fn start_reading_drag(&self, reading: &Reading, point: (i32, i32)) -> Drag {
+        if !self.text_selection_enabled {
+            return Drag::Pan(point);
+        }
+        let Some((page, area)) = reading.layout.visible().into_iter().find_map(|p| {
+            let area = PageArea {
+                x: p.x,
+                y: p.y,
+                w: p.w,
+                h: p.h,
+            };
+            (area.contains(point) && reading.frames.get(&p.page).is_some_and(|f| f.image.is_ok()))
+                .then_some((p.page, area))
+        }) else {
+            return Drag::Pan(point);
+        };
+        let phase =
+            if let Some((_, layout)) = self.selection_layout.as_ref().filter(|(p, _)| *p == page) {
+                let (x, y) = area.normalized(point);
+                let Some(glyph) = layout.hit(x, y) else {
+                    return Drag::Pan(point);
+                };
+                TextDragPhase::Selecting(glyph)
+            } else {
+                TextDragPhase::Starting
+            };
+        Drag::Text(TextDrag {
+            page,
+            area,
+            origin: point,
+            point,
+            phase,
+        })
+    }
+
+    fn update_selection(&mut self, hwnd: HWND, drag: TextDrag, glyph: usize) {
+        let (_, layout) = self.selection_layout.as_ref().unwrap();
+        let (x, y) = drag.area.normalized(drag.point);
+        let runs = if drag.moved(dips(hwnd, 3)) {
+            layout.range(glyph, x, y)
+        } else {
+            Vec::new()
+        };
+        let previous = self
+            .selection
+            .as_ref()
+            .map_or(&[][..], |s| s.runs.as_slice());
+        if previous == runs {
+            return;
+        }
+        for run in previous.iter().chain(&runs) {
+            unsafe { InvalidateRect(hwnd, &drag.area.pixels(&run.ink(MarkKind::Highlight)), 0) };
+        }
+        self.selection = (!runs.is_empty()).then_some(Selection {
+            page: drag.page,
+            runs,
+        });
+    }
+
     fn update_preview(&mut self, hwnd: HWND, point: (i32, i32)) {
+        if let Some(Drag::Text(mut drag)) = self.drag {
+            if matches!(drag.phase, TextDragPhase::Loading { released: true }) {
+                return;
+            }
+            drag.point = point;
+            match drag.phase {
+                TextDragPhase::Starting if drag.moved(dips(hwnd, 3)) => {
+                    drag.phase = TextDragPhase::Loading { released: false };
+                    super::action(unsafe { GetParent(hwnd) }, super::LOAD_SELECTION_TEXT);
+                }
+                TextDragPhase::Selecting(glyph) => self.update_selection(hwnd, drag, glyph),
+                _ => {}
+            }
+            self.drag = Some(Drag::Text(drag));
+            return;
+        }
         if let Some(Drag::Signature((x0, y0))) = self.drag {
             let page = self.layout(hwnd);
             if page.w <= 0 || page.h <= 0 {
@@ -622,6 +836,36 @@ impl Canvas {
             self.preview = new;
         }
     }
+
+    fn finish_drag(&mut self, hwnd: HWND, point: (i32, i32)) -> bool {
+        self.update_preview(hwnd, point);
+        if let Some(Drag::Text(mut drag)) = self.drag.take() {
+            // The first selection on a page can finish before text is ready.
+            if matches!(drag.phase, TextDragPhase::Loading { .. }) {
+                drag.phase = TextDragPhase::Loading { released: true };
+                self.drag = Some(Drag::Text(drag));
+            }
+            super::action(unsafe { GetParent(hwnd) }, super::SELECTION_CHANGED);
+            return false;
+        }
+        if let Some(area) = self.signature_preview.take() {
+            self.placed_signature = Some((self.page, area));
+            self.signature = Some(area);
+            redraw(hwnd);
+            return true;
+        }
+        if self.preview.is_empty() {
+            return false;
+        }
+        let mark = Mark {
+            page: self.page,
+            style: self.tool.expect("active markup drag"),
+            runs: std::mem::take(&mut self.preview),
+        };
+        self.marks.push(mark.clone());
+        self.completed.push_back(mark);
+        true
+    }
 }
 
 pub fn pan(hwnd: HWND, dx: i32, dy: i32) -> bool {
@@ -674,8 +918,22 @@ fn paint_highlights(dc: HDC, clip: RECT, page: PageArea, index: u32, state: &Can
         .tool
         .filter(|_| state.reading.is_none())
         .map(|s| (s, state.preview.as_slice()));
+    let selection = state
+        .selection
+        .as_ref()
+        .filter(|s| s.page == index)
+        .map(|s| {
+            (
+                MarkStyle {
+                    kind: MarkKind::Highlight,
+                    color: MarkColor::Blue,
+                },
+                s.runs.as_slice(),
+            )
+        });
     let mut visible = committed
         .chain(preview)
+        .chain(selection)
         .flat_map(|(style, runs)| runs.iter().map(move |run| (style, run)))
         .filter_map(|(style, run)| {
             let p = page.pixels(&run.ink(style.kind));
@@ -954,6 +1212,21 @@ pub unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, w: WPARAM, l: LPAR
         WM_SETCURSOR
             if (l as u16) == HTCLIENT as u16
                 && VIEW.with_borrow(|v| {
+                    matches!(
+                        v.drag,
+                        Some(Drag::Text(TextDrag {
+                            phase: TextDragPhase::Selecting(_),
+                            ..
+                        }))
+                    )
+                }) =>
+        {
+            unsafe { SetCursor(LoadCursorW(null_mut(), IDC_IBEAM)) };
+            1
+        }
+        WM_SETCURSOR
+            if (l as u16) == HTCLIENT as u16
+                && VIEW.with_borrow(|v| {
                     (v.draw_signature || v.tool.is_some()) && v.bitmap.is_some()
                 }) =>
         {
@@ -974,7 +1247,7 @@ pub unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, w: WPARAM, l: LPAR
         WM_MOUSEMOVE => {
             let previous = VIEW.with_borrow_mut(|v| match &mut v.drag {
                 Some(Drag::Pan(p)) => Some(std::mem::replace(p, point)),
-                Some(Drag::Highlight { .. } | Drag::Signature(_)) => {
+                Some(Drag::Highlight { .. } | Drag::Signature(_) | Drag::Text(_)) => {
                     v.update_preview(hwnd, point);
                     None
                 }
@@ -993,27 +1266,7 @@ pub unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, w: WPARAM, l: LPAR
             0
         }
         WM_LBUTTONUP => {
-            let marked = VIEW.with_borrow_mut(|v| {
-                v.update_preview(hwnd, point);
-                v.drag = None;
-                if let Some(area) = v.signature_preview.take() {
-                    v.placed_signature = Some((v.page, area));
-                    v.signature = Some(area);
-                    redraw(hwnd);
-                    return true;
-                }
-                if v.preview.is_empty() {
-                    return false;
-                }
-                let mark = Mark {
-                    page: v.page,
-                    style: v.tool.expect("active markup drag"),
-                    runs: std::mem::take(&mut v.preview),
-                };
-                v.marks.push(mark.clone());
-                v.completed.push_back(mark);
-                true
-            });
+            let marked = VIEW.with_borrow_mut(|v| v.finish_drag(hwnd, point));
             unsafe {
                 if GetCapture() == hwnd {
                     ReleaseCapture();
@@ -1034,8 +1287,23 @@ pub unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, w: WPARAM, l: LPAR
         }
         WM_CAPTURECHANGED | WM_CANCELMODE => {
             let preview = VIEW.with_borrow_mut(|v| {
-                v.drag = None;
-                let visible = v.signature_preview.take().is_some() || !v.preview.is_empty();
+                // Releasing our own capture is normal after recording the
+                // endpoint of a drag while its page's text is still loading.
+                if msg == WM_CAPTURECHANGED
+                    && matches!(
+                        v.drag,
+                        Some(Drag::Text(TextDrag {
+                            phase: TextDragPhase::Loading { released: true },
+                            ..
+                        }))
+                    )
+                {
+                    return false;
+                }
+                let selected =
+                    matches!(v.drag.take(), Some(Drag::Text(_))) && v.selection.take().is_some();
+                let visible =
+                    v.signature_preview.take().is_some() || !v.preview.is_empty() || selected;
                 v.preview.clear();
                 visible
             });
@@ -1056,6 +1324,112 @@ pub unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, w: WPARAM, l: LPAR
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn high_zoom_gives_the_reading_position_more_pixels_than_its_prefetch() {
+        let area = (600, 440);
+        let mut layout = Layout::new(3, Position::at(1));
+        layout.configure(area, 18, 18, 4.0);
+        let mut view = Canvas {
+            zoom: 4.0,
+            reading: Some(Reading {
+                layout,
+                frames: BTreeMap::new(),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(view.next_render(1, area), Some((1, Some(32 * 1024 * 1024))));
+        view.reading.as_mut().unwrap().frames.insert(
+            1,
+            CachedPage {
+                quality: (area, view.zoom.to_bits()),
+                limited_to: None,
+                image: Ok(Bitmap {
+                    width: 1,
+                    height: 1,
+                    pixels: windows::core::Array::from_slice(&[255; 4]),
+                }),
+            },
+        );
+        assert_eq!(view.next_render(1, area), Some((2, Some(1024 * 1024))));
+        view.zoom = 1.0;
+        view.reading
+            .as_mut()
+            .unwrap()
+            .layout
+            .configure(area, 18, 18, 1.0);
+        assert_eq!(view.next_render(1, area), Some((1, Some(8 * 1024 * 1024))));
+    }
+
+    #[test]
+    fn a_drag_released_before_text_load_can_be_highlighted_on_its_page() {
+        let hwnd = unsafe {
+            CreateWindowExW(
+                0,
+                wide("STATIC").as_ptr(),
+                null(),
+                WS_POPUP,
+                0,
+                0,
+                636,
+                476,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null(),
+            )
+        };
+        assert!(!hwnd.is_null());
+        let mut layout = Layout::new(2, Position::at(1));
+        layout.configure((600, 440), 18, 18, 1.0);
+        layout.measured(1, 300.0 / 220.0);
+        let page = layout.visible().into_iter().find(|p| p.page == 1).unwrap();
+        let mut state = Canvas {
+            reading: Some(Reading {
+                layout,
+                frames: BTreeMap::from([(
+                    1,
+                    CachedPage {
+                        quality: ((600, 440), 1.0_f64.to_bits()),
+                        limited_to: None,
+                        image: Ok(Bitmap {
+                            width: 1,
+                            height: 1,
+                            pixels: windows::core::Array::from_slice(&[255; 4]),
+                        }),
+                    },
+                )]),
+            }),
+            text_selection_enabled: true,
+            ..Default::default()
+        };
+        let text = crate::textselect::TextDocument::load(&crate::highlight_roundtrip::fixture())
+            .unwrap()
+            .page(0)
+            .unwrap();
+        assert!(state.start_drag(hwnd, (page.x + 172, page.y + 122)));
+        assert!(!state.finish_drag(hwnd, (page.x + 182, page.y + 182)));
+        assert!(!state.has_selection());
+        assert!(state.finish_reading_text(hwnd, 1, text).is_none());
+        assert!(state.has_selection());
+        assert!(state.marks.is_empty());
+        let mark = state.take_selection(MarkStyle::default()).unwrap();
+        assert_eq!(mark.page, 1);
+        assert_eq!(mark.runs.len(), 2);
+        assert!(!state.has_selection());
+
+        // A first drag on a page without any text still pans by the full drag.
+        state.selection_layout = None;
+        let from = (page.x + 5, page.y + 12);
+        assert!(state.start_drag(hwnd, from));
+        assert!(!state.finish_drag(hwnd, (from.0 + 8, from.1 + 24)));
+        assert_eq!(
+            state.finish_reading_text(hwnd, 1, TextLayout::default()),
+            Some((8, 24))
+        );
+        assert!(state.drag.is_none() && !state.has_selection());
+        unsafe { DestroyWindow(hwnd) };
+    }
 
     #[test]
     fn continuous_paint_shows_both_page_surfaces_and_their_gutter() {
@@ -1149,7 +1523,6 @@ mod tests {
 
     #[test]
     fn colored_markers_preserve_text_and_underlines_only_paint_the_lower_edge() {
-        use crate::highlight::MarkColor;
         let bounds = UnitRect {
             left: 0.25,
             top: 0.25,

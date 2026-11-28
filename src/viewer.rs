@@ -11,6 +11,7 @@ mod worker;
 
 use crate::highlight::{Mark, MarkColor, MarkKind, MarkStyle};
 use crate::preferences;
+use crate::textselect::TextLayout;
 use canvas::VIEW;
 use std::{
     ffi::OsString,
@@ -67,6 +68,9 @@ const NEXT_TAB: usize = 135;
 const CLOSE_TAB: usize = 136;
 const SELECT_TAB: usize = 137;
 const SCROLLED: usize = 138;
+const LOAD_SELECTION_TEXT: usize = 139;
+const SELECTION_CHANGED: usize = 140;
+const CLEAR_SELECTION: usize = 141;
 const SHOW_SHORTCUTS: usize = 144;
 const RESTORE_TABS: usize = 0x1fd0;
 const FORGET_CERTIFICATE: usize = 0x1fe0;
@@ -789,6 +793,7 @@ impl App {
     fn controls(&self) {
         let editing = self.signing.is_none() && !self.writing;
         let annotate = editing && !self.known_signed;
+        VIEW.with_borrow_mut(|v| v.enable_text_selection(self.ui.canvas, annotate));
         for (c, enabled) in [
             (self.ui.open, !self.writing),
             (self.ui.tab_bar, !self.writing),
@@ -913,8 +918,13 @@ impl App {
             } else {
                 format!("Pages {}–{}", range.0 + 1, range.1 + 1)
             };
+            let help = if VIEW.with_borrow(canvas::Canvas::has_selection) {
+                "H to highlight  ·  U to underline  ·  Esc to clear"
+            } else {
+                "Scroll with the mouse wheel"
+            };
             format!(
-                "{pages}  ·  {:.0}% of fit size  ·  Scroll with the mouse wheel",
+                "{pages}  ·  {:.0}% of fit size  ·  {help}",
                 self.zoom * 100.0
             )
         };
@@ -954,6 +964,10 @@ impl App {
             self.release_text();
             return Ok(());
         }
+        self.load_text(self.page, worker::TextPurpose::Markup)
+    }
+
+    fn load_text(&mut self, page: u32, purpose: worker::TextPurpose) -> Result<(), String> {
         let Some(doc) = &self.document else {
             return Ok(());
         };
@@ -973,10 +987,22 @@ impl App {
             .unwrap()
             .send(worker::TextJob::Page {
                 revision: self.revision,
-                page: self.page,
+                page,
+                purpose,
                 source,
             })
             .map_err(|_| "The text selection service has stopped.".to_owned())
+    }
+
+    fn finish_selection_text(&mut self, page: u32, layout: TextLayout) {
+        let movement =
+            VIEW.with_borrow_mut(|v| v.finish_reading_text(self.ui.canvas, page, layout));
+        if let Some((dx, dy)) = movement
+            && canvas::scroll_reading(self.ui.canvas, f64::from(dx), -f64::from(dy))
+        {
+            self.render();
+        }
+        self.status();
     }
     fn text_failed(&mut self, error: &str) {
         self.tool = None;
@@ -1098,7 +1124,10 @@ impl App {
             return;
         }
         if self.tool.is_none() && self.signing.is_none() {
-            VIEW.with_borrow_mut(|v| v.jump(page));
+            VIEW.with_borrow_mut(|v| {
+                v.clear_text_selection(self.ui.canvas);
+                v.jump(page);
+            });
             self.page = page;
             self.controls();
             canvas::redraw(self.ui.canvas);
@@ -1289,6 +1318,7 @@ impl App {
             Event::Layout {
                 revision,
                 page,
+                purpose: worker::TextPurpose::Markup,
                 result,
             } if revision == self.revision && page == self.page && self.tool.is_some() => {
                 match result {
@@ -1301,6 +1331,14 @@ impl App {
                     }
                     Err(e) => self.text_failed(&e),
                 }
+            }
+            Event::Layout {
+                revision,
+                page,
+                purpose: worker::TextPurpose::Selection,
+                result,
+            } if revision == self.revision => {
+                self.finish_selection_text(page, result.unwrap_or_default());
             }
             Event::SignatureFields { revision, result }
                 if self.checking_fields == Some(revision) =>
@@ -1402,6 +1440,20 @@ impl App {
                 }
             }
             SCROLLED => self.render(),
+            LOAD_SELECTION_TEXT => {
+                if let Some(page) = VIEW.with_borrow(canvas::Canvas::pending_text_page)
+                    && self
+                        .load_text(page, worker::TextPurpose::Selection)
+                        .is_err()
+                {
+                    self.finish_selection_text(page, TextLayout::default());
+                }
+            }
+            SELECTION_CHANGED => self.status(),
+            CLEAR_SELECTION => {
+                VIEW.with_borrow_mut(|v| v.clear_text_selection(self.ui.canvas));
+                self.status();
+            }
             PREV => self.page_to(self.page.saturating_sub(1)),
             NEXT => self.page_to(self.page + 1),
             FIRST => self.page_to(0),
@@ -1428,6 +1480,15 @@ impl App {
                 } else {
                     MarkKind::Underline
                 };
+                let style = MarkStyle {
+                    kind,
+                    color: self.color,
+                };
+                if let Some(mark) = VIEW.with_borrow_mut(|v| v.take_selection(style)) {
+                    self.marks.push(mark);
+                    self.update_marks();
+                    return Ok(());
+                }
                 let previous = self.tool;
                 self.tool = (previous != Some(kind)).then_some(kind);
                 if previous.is_some() && self.tool.is_some() {
@@ -1606,6 +1667,9 @@ impl App {
                 find::NEXT
             }),
             (false, VK_ESCAPE) if self.find.open => Some(find::CLOSE),
+            (false, VK_ESCAPE) if VIEW.with_borrow(canvas::Canvas::selection_active) => {
+                Some(CLEAR_SELECTION)
+            }
             (true, VK_TAB) if unsafe { GetKeyState(VK_SHIFT as i32) } < 0 => Some(PREVIOUS_TAB),
             (true, VK_TAB) => Some(NEXT_TAB),
             (true, 0x57) => Some(CLOSE_TAB),

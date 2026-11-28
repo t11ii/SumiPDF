@@ -7,7 +7,7 @@ use crate::{
 use lopdf::{Document, Stream, dictionary};
 use std::{fs, path::Path, process::Command};
 
-fn fixture() -> Vec<u8> {
+pub(crate) fn fixture() -> Vec<u8> {
     let mut pdf = Document::with_version("1.7");
     let pages = pdf.new_object_id();
     let font =

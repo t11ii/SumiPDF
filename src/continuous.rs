@@ -1,5 +1,6 @@
 //! Virtual page layout. The leading page and a fraction of its stride describe
 //! a reading position without summing the heights of preceding pages.
+use crate::raster_size::fitted_page_size;
 use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Default)]
@@ -72,18 +73,16 @@ impl Layout {
         self.clamp();
     }
 
-    fn size(&self, page: u32) -> (i32, i32) {
-        let ratio = self
-            .ratios
+    pub fn aspect_ratio(&self, page: u32) -> f64 {
+        self.ratios
             .get(&page)
             .copied()
             .or(self.typical)
-            .unwrap_or(210.0 / 297.0);
-        let w = f64::from(self.area.0).min(f64::from(self.area.1) * ratio);
-        (
-            (w * self.zoom).round().max(1.0) as i32,
-            (w / ratio * self.zoom).round().max(1.0) as i32,
-        )
+            .unwrap_or(210.0 / 297.0)
+    }
+
+    fn size(&self, page: u32) -> (i32, i32) {
+        fitted_page_size(self.area, self.aspect_ratio(page), self.zoom)
     }
 
     fn stride(&self, page: u32) -> f64 {
