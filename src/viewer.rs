@@ -1140,6 +1140,7 @@ impl App {
         let Some(path) = dialog::choose(self.hwnd, purpose)? else {
             return Ok(());
         };
+        let review_page = signed.then_some(self.page);
         let marks = self.marks.clone();
         let events = self.events.clone();
         let hwnd = self.hwnd as usize;
@@ -1151,7 +1152,14 @@ impl App {
             .spawn(move || {
                 let signature = cert.as_ref().map(|cert| (cert, appearance.as_ref()));
                 let result = save::copy(&source, &marks, signature, &path).map(|_| path);
-                worker::report(hwnd, &events, Event::Saved { signed, result });
+                worker::report(
+                    hwnd,
+                    &events,
+                    Event::Saved {
+                        review_page,
+                        result,
+                    },
+                );
             })
             .map_err(|e| e.to_string())?;
         self.writing = true;
@@ -1199,7 +1207,7 @@ impl App {
                 Err(e) => {
                     self.reset_canvas("Could not open this PDF.");
                     set_text(self.ui.status, "Could not load PDF");
-                    notice(self.hwnd, &e, true);
+                    notice(self.hwnd, &format!("{e}\n\n{}", self.path.display()), true);
                 }
             },
             Event::Painted(ticket, reading, result) if ticket == self.ticket => {
@@ -1254,29 +1262,37 @@ impl App {
                     notice(self.hwnd, &e, true);
                 }
             }
-            Event::Saved { signed, result } => {
+            Event::Saved {
+                review_page,
+                result,
+            } => {
                 self.writing = false;
-                self.sync_canvas_tool();
-                self.sync_signature();
-                self.controls();
                 match result {
                     Ok(path) => {
-                        if signed {
-                            self.end_signing();
-                        }
                         self.saved_marks.clone_from(&self.marks);
                         self.title();
-                        self.controls();
-                        let what = if signed {
-                            "signed PDF"
+                        if let Some(page) = review_page {
+                            self.end_signing();
+                            if let Err(error) = self.open_signed_copy(&path, page) {
+                                let message = format!(
+                                    "Saved the signed PDF.\n{}\n\nCould not open it automatically. {error}",
+                                    path.display()
+                                );
+                                set_text(self.ui.status, &format!("Saved  ·  {}", path.display()));
+                                notice(self.hwnd, &message, true);
+                            }
                         } else {
-                            "annotated PDF"
-                        };
-                        let s = format!("Saved the {what}.\n{}", path.display());
-                        set_text(self.ui.status, &format!("Saved  ·  {}", path.display()));
-                        notice(self.hwnd, &s, false);
+                            self.sync_canvas_tool();
+                            self.controls();
+                            let message = format!("Saved the annotated PDF.\n{}", path.display());
+                            set_text(self.ui.status, &format!("Saved  ·  {}", path.display()));
+                            notice(self.hwnd, &message, false);
+                        }
                     }
                     Err(e) => {
+                        self.sync_canvas_tool();
+                        self.sync_signature();
+                        self.controls();
                         set_text(self.ui.status, "Could not save the PDF.");
                         notice(self.hwnd, &e, true);
                     }

@@ -1,4 +1,5 @@
 use super::*;
+use std::path::Path;
 use windows_sys::Win32::UI::Controls::*;
 
 /// A tab keeps editing state and its original open stream. Page images and parsed
@@ -378,6 +379,33 @@ impl App {
         Ok(())
     }
 
+    fn add_tab(&mut self, path: PathBuf, state: Option<DocumentState>) -> Result<usize, String> {
+        self.ensure_worker()?;
+        let index = self.tabs.len();
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let close_button = insert(self.ui.tab_bar, index, &name)?;
+        self.tabs.push(Tab {
+            path,
+            close_button,
+            state,
+        });
+        Ok(index)
+    }
+
+    pub(super) fn open_signed_copy(&mut self, path: &Path, page: u32) -> Result<(), String> {
+        let path = std::path::absolute(path).map_err(|e| e.to_string())?;
+        let index = self.add_tab(
+            path,
+            Some(DocumentState {
+                page,
+                zoom: 1.0,
+                known_signed: true,
+                ..Default::default()
+            }),
+        )?;
+        self.switch_tab(index)
+    }
+
     pub(super) fn open_tabs(
         &mut self,
         paths: impl IntoIterator<Item = PathBuf>,
@@ -392,16 +420,7 @@ impl App {
                 target = Some(index);
                 continue;
             }
-            self.ensure_worker()?;
-            let index = self.tabs.len();
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
-            let close_button = insert(self.ui.tab_bar, index, &name)?;
-            self.tabs.push(Tab {
-                path,
-                close_button,
-                state: None,
-            });
-            target = Some(index);
+            target = Some(self.add_tab(path, None)?);
         }
         if let Some(index) = target {
             if self.active_tab == Some(index) {

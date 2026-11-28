@@ -40,7 +40,7 @@ pub enum Event {
         result: Result<super::signing::Choices, String>,
     },
     Saved {
-        signed: bool,
+        review_page: Option<u32>,
         result: Result<PathBuf, String>,
     },
     Layout {

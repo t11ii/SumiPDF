@@ -117,10 +117,19 @@ function Test-SigningPreferences([string]$ExecutablePath, [string]$InputPdf, [st
             $dialog = Wait-Dialog $viewer.Id 'Save a signed copy'
             $out = Join-Path $Folder "Preference test $run-signed.pdf"
             [SumiSmoke]::AcceptFileDialog($dialog)
-            [SumiSmoke]::DismissSaveConfirmation($viewer.Id, $window)
+            [void](Wait-Page $viewer ([IO.Path]::GetFileName($out)) '2 / 2' ([Diagnostics.Stopwatch]::StartNew()) -Quiet)
+            if ([ReadingProbe]::TabCount($window) -ne 2 -or ![SumiSmoke]::IsWindowEnabled($window)) {
+                throw 'The signed copy should be visible in its own tab without a confirmation dialog.'
+            }
+            if ([SumiSmoke]::IsWindowEnabled([SumiSmoke]::GetDlgItem($window, 108))) {
+                throw 'The signed copy is offering to edit annotations.'
+            }
             $expectedWatermark = @('pdf', 'png', 'pdf', 'builtin')[$run - 1]
             Assert-GuiSignature $out $Identity.Thumbprint $expectedWatermark
             if ($run -lt 4) {
+                $original = [IO.Path]::GetFileName($runPdf)
+                [ReadingProbe]::ClickTab($window, $original)
+                [void](Wait-Page $viewer $original '2 / 2' ([Diagnostics.Stopwatch]::StartNew()) -Quiet)
                 [SumiSmoke]::Click($window, 107)
                 Wait-SignatureState $window "Signer: $($Identity.Name)" $true $true
                 if ($run -eq 3) {
@@ -143,5 +152,5 @@ function Test-SigningPreferences([string]$ExecutablePath, [string]$InputPdf, [st
             $viewer.Dispose()
         }
     }
-    Write-Host 'Verified the PFX signer, opt-in password reuse and subsequent opt-out across four GUI launches. Signed PDFs confirmed Acrobat watermark discovery, restored PNG and PDF choices, and the persistent built-in override.'
+    Write-Host 'Verified that saving opens the signed PDF at the signature page and keeps the original tab. Confirmed the PFX signer, password reuse and opt-out, Acrobat watermark discovery, and saved watermark choices across four GUI launches.'
 }
