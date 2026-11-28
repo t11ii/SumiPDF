@@ -78,6 +78,7 @@ const ZOOM_STEP: f64 = 1.25;
 const MIN_ZOOM: f64 = 0.5;
 const MAX_ZOOM: f64 = 8.0;
 const WINDOW: &str = "SumiPDF.Window";
+const APP_TITLE: &str = concat!("SumiPDF v", env!("CARGO_PKG_VERSION"));
 const APP_ICON: *const u16 = 201 as *const u16; // Icon resource ID in assets/app.rc.
 const CANVAS_ID: usize = 110;
 const CANVAS: &str = "SumiPDF.Page";
@@ -806,9 +807,9 @@ impl App {
         };
         if let Some(index) = self.active_tab {
             tabs::update_label(self.ui.tab_bar, index, &format!("{name}{star}"));
-            set_text(self.hwnd, &format!("{name}{star}  —  SumiPDF"));
+            set_text(self.hwnd, &format!("{APP_TITLE}  —  {name}{star}"));
         } else {
-            set_text(self.hwnd, "SumiPDF");
+            set_text(self.hwnd, APP_TITLE);
         }
     }
     fn discard_all_ok(&self) -> bool {
@@ -1717,7 +1718,7 @@ pub fn run(files: Vec<OsString>) {
             CreateWindowExW(
                 WS_EX_CONTROLPARENT,
                 wide(WINDOW).as_ptr(),
-                wide("SumiPDF").as_ptr(),
+                wide(APP_TITLE).as_ptr(),
                 WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,

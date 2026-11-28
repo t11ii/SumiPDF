@@ -2,6 +2,8 @@
 201 ICON "assets/SumiPDF.ico"
 
 #include <windows.h>
+#include "sumiVersion.h"
+
 202 DIALOGEX 0, 0, 338, 145
 STYLE DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "SumiPDF"
@@ -35,4 +37,34 @@ BEGIN
     LTEXT "Action", -1, 126, 8, 168, 12
     LISTBOX 1000, 8, 23, 296, 185, LBS_USETABSTOPS | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_TABSTOP | WS_BORDER
     DEFPUSHBUTTON "Close", IDOK, 248, 215, 56, 15
+END
+
+LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
+
+1 VERSIONINFO
+FILEVERSION SUMIPDF_VERSION
+PRODUCTVERSION SUMIPDF_VERSION
+FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+FILEFLAGS 0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+FILESUBTYPE 0
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "\0"
+            VALUE "FileDescription", "SumiPDF\0"
+            VALUE "FileVersion", SUMIPDF_VERSION_TEXT
+            VALUE "InternalName", "SumiPDF\0"
+            VALUE "OriginalFilename", "SumiPDF.exe\0"
+            VALUE "ProductName", "SumiPDF\0"
+            VALUE "ProductVersion", SUMIPDF_VERSION_TEXT
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
 END

@@ -423,6 +423,13 @@ function Test-PfxSigning([string]$ExecutablePath, [string]$InputPdf, [string]$Fo
 }
 
 $exe = (Resolve-Path -LiteralPath $Executable).Path
+$manifest = [IO.File]::ReadAllText((Join-Path $PSScriptRoot '../Cargo.toml'))
+$version = [regex]::Match($manifest, '(?m)^version = "([^"]+)"').Groups[1].Value
+$fileVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo($exe)
+if (!$version -or $fileVersion.FileVersion -cne $version -or $fileVersion.ProductVersion -cne $version) {
+    throw "Expected version '$version' in the executable. FileVersion '$($fileVersion.FileVersion)', ProductVersion '$($fileVersion.ProductVersion)'."
+}
+$appTitle = "SumiPDF v$version"
 $dir = Join-Path ([IO.Path]::GetTempPath()) ("SumiPDF-smoke-" + [Guid]::NewGuid().ToString('N'))
 $fixture = Join-Path $dir 'two pages.pdf'
 $signedFixture = Join-Path $dir 'signed once.pdf'
@@ -451,6 +458,9 @@ try {
     $profileDir = Join-Path $dir 'viewer profile'
     $viewer = Start-SmokeViewer $exe $profileDir @($readingFixture, $signedFixture, $fixture)
     $window = Wait-Page $viewer 'two pages.pdf' '1 / 2' $timer
+    if (![SumiSmoke]::ReadText($window).StartsWith("$appTitle ")) {
+        throw "The document window title did not start with '$appTitle'."
+    }
     [ReadingProbe]::CheckShortcutHelp($window)
     Test-ToolbarResize $window $false
     Test-ReadingTabs $viewer $window $ScreenshotPath
@@ -555,6 +565,14 @@ try {
             throw 'Closing an inactive tab changed the visible document.'
         }
     }
+    $deadline = [Diagnostics.Stopwatch]::StartNew()
+    $title = [SumiSmoke]::ReadText($window)
+    while ($title -cne $appTitle -and $deadline.ElapsedMilliseconds -lt 5000) {
+        Start-Sleep -Milliseconds 20
+        $title = [SumiSmoke]::ReadText($window)
+    }
+    if ($title -cne $appTitle) { throw "Expected empty window title '$appTitle', found '$title'." }
+    Write-Host "Verified '$appTitle' in the empty and document window titles and matching executable version information."
     if (-not $viewer.CloseMainWindow() -or -not $viewer.WaitForExit(5000)) {
         throw 'The viewer did not close normally.'
     }
