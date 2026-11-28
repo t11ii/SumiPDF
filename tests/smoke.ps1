@@ -77,18 +77,33 @@ public static class SumiSmoke {
     static extern IntPtr SendString(IntPtr h, uint message, UIntPtr wparam, string text,
         uint flags, uint timeout, out UIntPtr result);
     public static void SetFileName(IntPtr dialog, string path) {
+        SetFileName(dialog, path, false);
+    }
+    public static void SetFileName(IntPtr dialog, string path, bool checkProposedName) {
         var timer = System.Diagnostics.Stopwatch.StartNew();
+        var expected = System.IO.Path.GetFileName(path);
+        var expectedStem = System.IO.Path.GetFileNameWithoutExtension(path);
+        var proposed = "";
+        bool proposalMatches = false;
         do {
             var edit = FileNameEdit(dialog);
-            UIntPtr result;
-            if (edit != IntPtr.Zero && IsWindowVisible(edit) && IsWindowEnabled(edit)
-                && SendString(edit, 0x000c, UIntPtr.Zero, path, 2, 2000, out result) != IntPtr.Zero
-                && result != UIntPtr.Zero && ReadText(edit) == path) {
-                AcceptFileDialog(dialog);
-                return;
+            if (edit != IntPtr.Zero && IsWindowVisible(edit) && IsWindowEnabled(edit)) {
+                if (checkProposedName) {
+                    proposed = System.IO.Path.GetFileName(ReadText(edit).Trim('"'));
+                    proposalMatches = proposed == expected || proposed == expectedStem;
+                }
+                UIntPtr result;
+                if ((!checkProposedName || proposalMatches)
+                    && SendString(edit, 0x000c, UIntPtr.Zero, path, 2, 2000, out result) != IntPtr.Zero
+                    && result != UIntPtr.Zero && ReadText(edit) == path) {
+                    AcceptFileDialog(dialog);
+                    return;
+                }
             }
             System.Threading.Thread.Sleep(30);
         } while (timer.ElapsedMilliseconds < 8000);
+        if (checkProposedName && !proposalMatches)
+            throw new InvalidOperationException("Expected suggested file name '" + expected + "'. Saw '" + proposed + "'.");
         throw new InvalidOperationException("Could not enter the filename in " + ReadText(dialog));
     }
     public static void AcceptFileDialog(IntPtr dialog) {

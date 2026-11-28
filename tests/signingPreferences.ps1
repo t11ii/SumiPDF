@@ -109,8 +109,7 @@ function Test-SigningPreferences([string]$ExecutablePath, [string]$InputPdf, [st
     } finally { $bitmap.Dispose() }
 
     foreach ($run in 1..4) {
-        # Accept the proposed name after picking artwork in a different folder.
-        # Each launch uses a new input in the PDF folder.
+        # Exercise the proposed filename after picking artwork in a different folder.
         $runPdf = Join-Path $Folder "Preference test $run.pdf"
         Copy-Item -LiteralPath $InputPdf -Destination $runPdf
         $viewer = Start-SmokeViewer $ExecutablePath $profileDir @($runPdf)
@@ -153,7 +152,9 @@ function Test-SigningPreferences([string]$ExecutablePath, [string]$InputPdf, [st
             # After opting in, the saved PFX must reach Save without another password prompt.
             $dialog = Wait-Dialog $viewer.Id 'Save a signed copy'
             $out = Join-Path $Folder "Preference test $run-signed.pdf"
-            [SumiSmoke]::AcceptFileDialog($dialog)
+            # The Windows dialog can prefer a recently used folder. Verify the
+            # proposed name and explicitly choose the fixture output directory.
+            [SumiSmoke]::SetFileName($dialog, $out, $true)
             [void](Wait-Page $viewer ([IO.Path]::GetFileName($out)) '2 / 2' ([Diagnostics.Stopwatch]::StartNew()) -Quiet)
             if ([ReadingProbe]::TabCount($window) -ne 2 -or ![SumiSmoke]::IsWindowEnabled($window)) {
                 throw 'The signed copy should be visible in its own tab without a confirmation dialog.'
@@ -190,4 +191,5 @@ function Test-SigningPreferences([string]$ExecutablePath, [string]$InputPdf, [st
         }
     }
     Write-Host 'Verified that saving opens the signed PDF at the signature page and keeps the original tab. Confirmed the PFX signer, password reuse and opt-out, Acrobat watermark discovery, and saved watermark choices across four GUI launches.'
+    if ($supportsImage) { Write-Host 'Verified PNG and JPEG signature images, reuse across launches, and return to the certificate name.' }
 }
