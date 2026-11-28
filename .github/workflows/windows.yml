@@ -10,7 +10,7 @@ on:
         type: boolean
         default: false
       compare_startup:
-        description: Compare startup with v0.9.3 on the same Windows runner
+        description: Compare startup with v0.9.4 on the same Windows runner
         type: boolean
         default: false
 
@@ -33,15 +33,15 @@ jobs:
           path: find-baseline
           sparse-checkout: dist
           persist-credentials: false
-      - name: Get the v0.9.3 startup baseline
+      - name: Get the v0.9.4 startup baseline
         if: inputs.compare_startup
         uses: actions/checkout@v6
         with:
-          ref: dbaa2fa7e4c7fca587f7f5a9efc9a66e4cf8d368
+          ref: 27d4046fdb1ee2fb7ec75aa23d9f141e84d61b92
           path: startup-baseline
           sparse-checkout: dist
           persist-credentials: false
-      - name: Compare startup with v0.9.3
+      - name: Compare startup with v0.9.4
         if: inputs.compare_startup
         shell: pwsh
         run: ./tests/startup.ps1 -Executable ./dist/SumiPDF.exe -BaselineExecutable ./startup-baseline/dist/SumiPDF.exe -CsvPath ./SumiPDF-startup.csv

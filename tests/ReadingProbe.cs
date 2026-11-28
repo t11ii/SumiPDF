@@ -32,6 +32,10 @@ public static class ReadingProbe {
     [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr window, uint command);
     [DllImport("user32.dll")] static extern bool IsWindow(IntPtr window);
     [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr window);
+    [DllImport("user32.dll")] static extern IntPtr GetSystemMenu(IntPtr window, bool revert);
+    [DllImport("user32.dll")] static extern uint GetMenuState(IntPtr menu, uint item, uint flags);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode, ExactSpelling=true)]
+    static extern int GetMenuStringW(IntPtr menu, uint item, StringBuilder text, int capacity, uint flags);
     [DllImport("user32.dll", CharSet=CharSet.Unicode, ExactSpelling=true)]
     static extern IntPtr FindWindowExW(IntPtr parent, IntPtr after, string kind, string name);
     [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", ExactSpelling=true, CharSet=CharSet.Unicode)]
@@ -165,6 +169,31 @@ public static class ReadingProbe {
     }
     public static int TabCount(IntPtr window) {
         return Query(GetDlgItem(window, 133), 0x1304);
+    }
+    public static int SelectedTabIndex(IntPtr window) {
+        return Query(GetDlgItem(window, 133), 0x130B); // TCM_GETCURSEL
+    }
+
+    const uint SessionRestoreItem = 0x1FD0;
+    public static bool SessionRestoreChecked(IntPtr window) {
+        var menu = GetSystemMenu(window, false);
+        var label = new StringBuilder(128);
+        uint state = GetMenuState(menu, SessionRestoreItem, 0); // MF_BYCOMMAND
+        if (state == uint.MaxValue || GetMenuStringW(menu, SessionRestoreItem, label, label.Capacity, 0) == 0
+            || label.ToString().Replace("&", "") != "Restore previous tabs at startup") {
+            throw new InvalidOperationException("Missing the Restore previous tabs at startup system menu item.");
+        }
+        if ((state & 0x0003) != 0) throw new InvalidOperationException("The session restore menu item is disabled.");
+        return (state & 0x0008) != 0; // MF_CHECKED
+    }
+    public static void ToggleSessionRestore(IntPtr window, bool expectedChecked) {
+        Post(window, 0x0112, SessionRestoreItem, IntPtr.Zero); // WM_SYSCOMMAND
+        var elapsed = Stopwatch.StartNew();
+        do {
+            if (SessionRestoreChecked(window) == expectedChecked) return;
+            Thread.Sleep(25);
+        } while (elapsed.ElapsedMilliseconds < 5000);
+        throw new InvalidOperationException("The session restore menu item did not toggle.");
     }
 
     [ComImport, Guid("618736E0-3C3D-11CF-810C-00AA00389B71"), InterfaceType(ComInterfaceType.InterfaceIsIDispatch)]

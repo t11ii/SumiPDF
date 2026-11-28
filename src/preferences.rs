@@ -1,4 +1,4 @@
-//! Per-user signing preferences. Each toolbar setting owns one independently replaced file.
+//! Per-user preferences. Each setting owns one independently replaced file.
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     ffi::OsString,
@@ -10,6 +10,20 @@ use std::{
 const MAX_RECORD_BYTES: usize = 1024 * 1024;
 const WATERMARK_FILE: &str = "watermark.json";
 const IDENTITY_FILE: &str = "identity.json";
+const RESTORE_TABS_FILE: &str = "restoreTabs.json";
+const TAB_SESSION_FILE: &str = "session.json";
+
+#[derive(Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub(crate) struct TabSession {
+    pub active: Option<OsString>,
+    pub tabs: Vec<RememberedTab>,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub(crate) struct RememberedTab {
+    pub path: OsString,
+    pub page: u32,
+}
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
@@ -130,6 +144,36 @@ impl Preferences {
         }
         self.write(IDENTITY_FILE, record)
     }
+
+    fn restore_tabs_enabled(&self) -> Result<bool, String> {
+        Ok(self.read(RESTORE_TABS_FILE)?.unwrap_or(true))
+    }
+
+    fn set_restore_tabs_enabled(&self, enabled: bool) -> Result<(), String> {
+        self.write(RESTORE_TABS_FILE, Some(&enabled))
+    }
+
+    fn load_tab_session(&self) -> Result<TabSession, String> {
+        if !self.restore_tabs_enabled()? {
+            return Ok(TabSession::default());
+        }
+        let mut session: TabSession = self.read(TAB_SESSION_FILE)?.unwrap_or_default();
+        session.tabs.retain(|tab| {
+            let path = Path::new(&tab.path);
+            path.is_absolute() && !tab.path.as_encoded_bytes().contains(&0) && path.is_file()
+        });
+        Ok(session)
+    }
+
+    fn save_tab_session(&self, session: &TabSession) -> Result<(), String> {
+        if self.restore_tabs_enabled()? {
+            self.write(
+                TAB_SESSION_FILE,
+                (!session.tabs.is_empty()).then_some(session),
+            )?;
+        }
+        Ok(())
+    }
 }
 
 fn validate_path(path: &Path) -> Result<(), String> {
@@ -195,12 +239,76 @@ pub(crate) fn save_identity(identity: Option<&Identity>) -> Result<(), String> {
     for_user()?.save_identity(identity)
 }
 
+#[cfg(windows)]
+pub(crate) fn restore_tabs_enabled() -> bool {
+    for_user()
+        .and_then(|prefs| prefs.restore_tabs_enabled())
+        .unwrap_or(true)
+}
+
+#[cfg(windows)]
+pub(crate) fn set_restore_tabs_enabled(enabled: bool) -> Result<(), String> {
+    for_user()?.set_restore_tabs_enabled(enabled)
+}
+
+#[cfg(windows)]
+pub(crate) fn load_tab_session() -> Result<TabSession, String> {
+    for_user()?.load_tab_session()
+}
+
+#[cfg(windows)]
+pub(crate) fn save_tab_session(session: &TabSession) -> Result<(), String> {
+    for_user()?.save_tab_session(session)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn settings(profile: &Path) -> Preferences {
         Preferences::from_profile(Some(profile.as_os_str().to_owned())).unwrap()
+    }
+
+    #[test]
+    fn tab_session_skips_missing_files_and_honors_the_persisted_switch() {
+        let profile = tempfile::tempdir().unwrap();
+        let prefs = settings(profile.path());
+        let present = profile.path().join("論文 1.pdf").into_os_string();
+        let missing = profile.path().join("moved.pdf").into_os_string();
+        fs::write(Path::new(&present), "").unwrap();
+        assert!(prefs.restore_tabs_enabled().unwrap());
+
+        let session = TabSession {
+            active: Some(present.clone()),
+            tabs: vec![
+                RememberedTab {
+                    path: missing,
+                    page: 0,
+                },
+                RememberedTab {
+                    path: present.clone(),
+                    page: 4,
+                },
+            ],
+        };
+        prefs.save_tab_session(&session).unwrap();
+        let next_launch = settings(profile.path());
+        let restored = next_launch.load_tab_session().unwrap();
+        assert_eq!(restored.active, Some(present.clone()));
+        assert_eq!(
+            restored.tabs,
+            [RememberedTab {
+                path: present,
+                page: 4
+            }]
+        );
+
+        next_launch.set_restore_tabs_enabled(false).unwrap();
+        assert!(!prefs.restore_tabs_enabled().unwrap());
+        prefs.save_tab_session(&TabSession::default()).unwrap();
+        assert!(prefs.load_tab_session().unwrap().tabs.is_empty());
+        next_launch.set_restore_tabs_enabled(true).unwrap();
+        assert_eq!(prefs.load_tab_session().unwrap(), restored);
     }
 
     #[test]

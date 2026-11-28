@@ -10,6 +10,7 @@ mod toolbar;
 mod worker;
 
 use crate::highlight::{Mark, MarkColor, MarkKind, MarkStyle};
+use crate::preferences;
 use canvas::VIEW;
 use std::{
     ffi::OsString,
@@ -67,6 +68,7 @@ const CLOSE_TAB: usize = 136;
 const SELECT_TAB: usize = 137;
 const SCROLLED: usize = 138;
 const SHOW_SHORTCUTS: usize = 144;
+const RESTORE_TABS: usize = 0x1fd0;
 const FORGET_CERTIFICATE: usize = 0x1fe0;
 const RENDER_TIMER: usize = 1;
 const SCROLL_TIMER: usize = 2;
@@ -131,9 +133,13 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             action(hwnd, SHOW_SHORTCUTS);
             0
         }
-        WM_SYSCOMMAND if w & 0xfff0 == FORGET_CERTIFICATE => {
-            action(hwnd, FORGET_CERTIFICATE);
+        WM_SYSCOMMAND if matches!(w & 0xfff0, FORGET_CERTIFICATE | RESTORE_TABS) => {
+            action(hwnd, w & 0xfff0);
             0
+        }
+        WM_INITMENUPOPUP if (l as usize >> 16) & 0xffff != 0 => {
+            shortcuts::check_restore_tabs(hwnd, preferences::restore_tabs_enabled());
+            unsafe { DefWindowProcW(hwnd, msg, w, l) }
         }
         WM_MEASUREITEM if w == COLOR && l != 0 => {
             let item = unsafe { &mut *(l as *mut MEASUREITEMSTRUCT) };
@@ -666,6 +672,7 @@ struct App {
     find: find::State,
     tabs: Vec<tabs::Tab>,
     active_tab: Option<usize>,
+    pending_restore: Option<tabs::SessionRestore>,
     resume_source: Option<crate::winpdf::SigningSource>,
     hwnd: HWND,
     ui: Controls,
@@ -710,6 +717,7 @@ impl App {
             find: find::State::default(),
             tabs: Vec::new(),
             active_tab: None,
+            pending_restore: None,
             resume_source: None,
             hwnd,
             ui,
@@ -1171,9 +1179,16 @@ impl App {
     }
     fn event(&mut self, event: Event) {
         match event {
+            Event::PreviousTabs(result) if self.pending_restore.is_some() => {
+                self.pending_restore = Some(tabs::SessionRestore::Ready(result));
+            }
             Event::Find(epoch, result) => self.find_page(epoch, result),
             Event::Opened(id, result) if id == self.revision => match result {
                 Ok(document) => {
+                    if matches!(self.pending_restore, Some(tabs::SessionRestore::Opening)) {
+                        self.pending_restore = None;
+                    }
+                    self.page = self.page.min(document.pages.saturating_sub(1));
                     self.resume_source = document.source.as_ref().ok().cloned();
                     self.document = Some(document);
                     if self.tool.is_some()
@@ -1197,6 +1212,12 @@ impl App {
                     }
                     self.controls();
                     self.render();
+                }
+                Err(_) if matches!(self.pending_restore, Some(tabs::SessionRestore::Opening)) => {
+                    if let Err(error) = self.skip_failed_restore_tab() {
+                        self.pending_restore = None;
+                        set_text(self.ui.status, &error);
+                    }
                 }
                 Err(e) => {
                     self.reset_canvas("Could not open this PDF.");
@@ -1308,6 +1329,15 @@ impl App {
                 self.render();
             }
             SHOW_SHORTCUTS => shortcuts::show(self.hwnd)?,
+            RESTORE_TABS => {
+                let enabled = !preferences::restore_tabs_enabled();
+                preferences::set_restore_tabs_enabled(enabled)?;
+                shortcuts::check_restore_tabs(self.hwnd, enabled);
+                if !enabled && !matches!(self.pending_restore, Some(tabs::SessionRestore::Opening))
+                {
+                    self.pending_restore = None;
+                }
+            }
             FORGET_CERTIFICATE if !self.writing => self.forget_certificate()?,
             OPEN if !self.writing => {
                 self.open_tabs(dialog::open_pdfs(self.hwnd)?)?;
@@ -1325,6 +1355,9 @@ impl App {
                 };
                 if let Some(index) = target {
                     if id == CLOSE_TAB {
+                        if self.active_tab == Some(index) {
+                            self.pending_restore = None;
+                        }
                         self.close_tab(index)?
                     } else {
                         self.switch_tab(index)?
@@ -1400,10 +1433,17 @@ impl App {
             CLOSE if self.writing => {
                 notice(self.hwnd, "Please wait for the save to finish.", false)
             }
-            CLOSE if self.discard_all_ok() => unsafe {
+            CLOSE if self.discard_all_ok() => {
+                if let Err(error) = self.remember_tabs() {
+                    notice(
+                        self.hwnd,
+                        &format!("Could not remember the open tabs. {error}"),
+                        true,
+                    );
+                }
                 self.ui.toolbar.clear_names();
-                DestroyWindow(self.hwnd);
-            },
+                unsafe { DestroyWindow(self.hwnd) };
+            }
             _ => {}
         }
         Ok(())
@@ -1579,6 +1619,18 @@ impl App {
             while let Ok(event) = self.receiver.try_recv() {
                 self.event(event);
             }
+            // Process an already queued file drop or Open command before
+            // applying the background session load to an empty window.
+            if matches!(self.pending_restore, Some(tabs::SessionRestore::Ready(_)))
+                && unsafe { PeekMessageW(&mut msg, null_mut(), 0, 0, PM_NOREMOVE) } == 0
+                && let Some(tabs::SessionRestore::Ready(result)) = self.pending_restore.take()
+                && let Err(error) = result.and_then(|session| self.restore_tab_session(session))
+            {
+                set_text(
+                    self.ui.status,
+                    &format!("Could not restore the previous tabs. {error}"),
+                );
+            }
             if unsafe { GetMessageW(&mut msg, null_mut(), 0, 0) } <= 0 {
                 break;
             }
@@ -1660,6 +1712,9 @@ impl App {
                     if let Err(e) = self.command(msg.wParam, msg.lParam as HWND) {
                         notice(self.hwnd, &e, true);
                     }
+                    if msg.wParam == CLOSE && unsafe { IsWindow(self.hwnd) } == 0 {
+                        return;
+                    }
                 }
                 READY if msg.hwnd == self.hwnd => {}
                 WHEEL if msg.hwnd == self.hwnd => {
@@ -1733,8 +1788,10 @@ pub fn run(files: Vec<OsString>) {
             return Err(std::io::Error::last_os_error().to_string());
         }
         theme::refresh(hwnd);
-        shortcuts::add_to_window_menu(hwnd);
-        let mut app = App::new(hwnd, !files.is_empty())?;
+        let restore_tabs = preferences::restore_tabs_enabled();
+        shortcuts::add_to_window_menu(hwnd, restore_tabs);
+        let start_with_files = !files.is_empty();
+        let mut app = App::new(hwnd, start_with_files)?;
         let opened = app.open_tabs(files.into_iter().map(PathBuf::from));
         if app.active_tab.is_none() {
             Controls::layout(hwnd);
@@ -1747,6 +1804,15 @@ pub fn run(files: Vec<OsString>) {
         }
         if let Err(e) = opened {
             notice(hwnd, &e, true);
+        }
+        if !start_with_files
+            && restore_tabs
+            && let Err(error) = app.read_previous_tabs()
+        {
+            set_text(
+                app.ui.status,
+                &format!("Could not restore the previous tabs. {error}"),
+            );
         }
         app.process();
         Ok(())

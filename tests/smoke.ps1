@@ -254,6 +254,7 @@ Add-Type -Path (Join-Path $PSScriptRoot 'ReadingProbe.cs')
 . (Join-Path $PSScriptRoot 'reading.ps1')
 . (Join-Path $PSScriptRoot 'find.ps1')
 . (Join-Path $PSScriptRoot 'signingPreferences.ps1')
+. (Join-Path $PSScriptRoot 'sessionRestore.ps1')
 
 function Write-TestPdf([string]$Path) {
     $objects = @(
@@ -426,6 +427,7 @@ try {
     [void][IO.Directory]::CreateDirectory($dir)
     Write-TestPdf $fixture
     Write-ReadingPdf $readingFixture 240
+    Test-SessionRestore $exe $dir $appTitle
     & (Join-Path $PSScriptRoot 'signingCli.ps1') -Executable $exe -Pdf $fixture -SignedGuiFixture $signedFixture
     $identity = New-TestPfx $dir
     Test-PfxSigning $exe $signedFixture $dir $identity

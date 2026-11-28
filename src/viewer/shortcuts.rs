@@ -31,11 +31,17 @@ const BINDINGS: &[&str] = &[
     "? (Shift+/)\tShow keyboard shortcuts",
 ];
 
-pub(super) fn add_to_window_menu(hwnd: HWND) {
+pub(super) fn add_to_window_menu(hwnd: HWND, restore_tabs: bool) {
     unsafe {
         let menu = GetSystemMenu(hwnd, 0);
         if !menu.is_null() {
             AppendMenuW(menu, MF_SEPARATOR, 0, null());
+            AppendMenuW(
+                menu,
+                MF_STRING | restore_tabs_flags(restore_tabs),
+                RESTORE_TABS,
+                wide("Restore previous tabs at startup").as_ptr(),
+            );
             AppendMenuW(
                 menu,
                 MF_STRING,
@@ -48,6 +54,19 @@ pub(super) fn add_to_window_menu(hwnd: HWND) {
                 SYSTEM_HELP,
                 wide("Keyboard shortcuts…\t?").as_ptr(),
             );
+        }
+    }
+}
+
+fn restore_tabs_flags(enabled: bool) -> u32 {
+    if enabled { MF_CHECKED } else { MF_UNCHECKED }
+}
+
+pub(super) fn check_restore_tabs(hwnd: HWND, enabled: bool) {
+    unsafe {
+        let menu = GetSystemMenu(hwnd, 0);
+        if !menu.is_null() {
+            CheckMenuItem(menu, RESTORE_TABS as u32, restore_tabs_flags(enabled));
         }
     }
 }

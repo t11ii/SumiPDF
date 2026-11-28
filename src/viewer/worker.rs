@@ -1,3 +1,4 @@
+use crate::preferences::TabSession;
 use crate::textselect::{TextDocument, TextLayout};
 use crate::winpdf::{self, Document, Frame, SigningSource};
 use std::path::PathBuf;
@@ -32,6 +33,7 @@ pub struct OpenedDocument {
 }
 
 pub enum Event {
+    PreviousTabs(Result<TabSession, String>),
     Find(u64, Result<super::find::Page, String>),
     Opened(u64, Result<OpenedDocument, String>),
     Painted(u64, bool, Result<Frame, String>),

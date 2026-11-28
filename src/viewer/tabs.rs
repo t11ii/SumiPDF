@@ -1,4 +1,5 @@
 use super::*;
+use crate::preferences::{RememberedTab, TabSession};
 use std::path::Path;
 use windows_sys::Win32::UI::Controls::*;
 
@@ -8,6 +9,12 @@ pub(super) struct Tab {
     path: PathBuf,
     pub(super) close_button: HWND,
     state: Option<DocumentState>,
+}
+
+pub(super) enum SessionRestore {
+    Reading,
+    Ready(Result<TabSession, String>),
+    Opening,
 }
 
 #[derive(Default)]
@@ -408,6 +415,7 @@ impl App {
         }
         let mut target = None;
         for path in paths {
+            self.pending_restore = None;
             let path = std::path::absolute(path).map_err(|e| e.to_string())?;
             if let Some(index) = self.tabs.iter().position(|t| t.path == path) {
                 target = Some(index);
@@ -423,6 +431,99 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    pub(super) fn read_previous_tabs(&mut self) -> Result<(), String> {
+        let events = self.events.clone();
+        let hwnd = self.hwnd as usize;
+        // A remembered path may be on a disconnected drive. Keep checking it
+        // off the UI thread so the user can open another PDF while waiting.
+        std::thread::Builder::new()
+            .name("pdf-session".into())
+            .spawn(move || {
+                let session = preferences::load_tab_session();
+                worker::report(hwnd, &events, Event::PreviousTabs(session));
+            })
+            .map_err(|e| e.to_string())?;
+        self.pending_restore = Some(SessionRestore::Reading);
+        Ok(())
+    }
+
+    pub(super) fn restore_tab_session(&mut self, session: TabSession) -> Result<(), String> {
+        if session.tabs.is_empty() || !self.tabs.is_empty() || !preferences::restore_tabs_enabled()
+        {
+            return Ok(());
+        }
+        let mut active = None;
+        let mut add_error = None;
+        for tab in session.tabs {
+            let selected = session.active.as_ref() == Some(&tab.path);
+            let result = self.add_tab(
+                PathBuf::from(tab.path),
+                Some(DocumentState {
+                    page: tab.page.min(u32::MAX - 1),
+                    zoom: 1.0,
+                    ..Default::default()
+                }),
+            );
+            let index = match result {
+                Ok(index) => index,
+                Err(error) => {
+                    add_error = Some(error);
+                    break;
+                }
+            };
+            if selected {
+                active = Some(index);
+            }
+        }
+        if let Some(index) = active.or_else(|| self.tabs.len().checked_sub(1)) {
+            self.switch_tab(index)?;
+            self.pending_restore = Some(SessionRestore::Opening);
+        }
+        add_error.map_or(Ok(()), Err)
+    }
+
+    pub(super) fn skip_failed_restore_tab(&mut self) -> Result<(), String> {
+        if let Some(index) = self.active_tab {
+            self.close_tab(index)?;
+        }
+        if self.active_tab.is_none() {
+            self.pending_restore = None;
+            set_text(
+                self.ui.status,
+                "Could not restore any of the previous tabs.",
+            );
+        }
+        Ok(())
+    }
+
+    pub(super) fn remember_tabs(&mut self) -> Result<(), String> {
+        // Leave the saved session available if this window never opened a
+        // document. Closing all tabs in a used window records an empty session.
+        self.pending_restore = None;
+        if self.revision == 0 {
+            return Ok(());
+        }
+        let session = TabSession {
+            active: self
+                .active_tab
+                .map(|index| self.tabs[index].path.as_os_str().to_owned()),
+            tabs: self
+                .tabs
+                .iter()
+                .enumerate()
+                .map(|(index, tab)| RememberedTab {
+                    path: tab.path.as_os_str().to_owned(),
+                    page: if self.active_tab == Some(index) {
+                        self.page
+                    } else {
+                        tab.state.as_ref().map_or(0, |state| state.page)
+                    },
+                })
+                .collect(),
+        };
+        preferences::save_tab_session(&session)
     }
 
     fn park_tab(&mut self) {
@@ -455,6 +556,7 @@ impl App {
         if self.active_tab == Some(index) {
             return Ok(());
         }
+        self.pending_restore = None;
         self.park_tab();
         self.activate_tab(Some(index))
     }
