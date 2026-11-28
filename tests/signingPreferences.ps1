@@ -110,7 +110,9 @@ function Test-SigningPreferences([string]$ExecutablePath, [string]$InputPdf, [st
 
     foreach ($run in 1..4) {
         # Exercise the proposed filename after picking artwork in a different folder.
-        $runPdf = Join-Path $Folder "Preference test $run.pdf"
+        $basename = "Preference test $run $([guid]::NewGuid().ToString('N'))"
+        $runPdf = Join-Path $Folder "$basename.pdf"
+        $savedName = "$basename-signed.pdf"
         Copy-Item -LiteralPath $InputPdf -Destination $runPdf
         $viewer = Start-SmokeViewer $ExecutablePath $profileDir @($runPdf)
         try {
@@ -151,11 +153,8 @@ function Test-SigningPreferences([string]$ExecutablePath, [string]$InputPdf, [st
             }
             # After opting in, the saved PFX must reach Save without another password prompt.
             $dialog = Wait-Dialog $viewer.Id 'Save a signed copy'
-            $out = Join-Path $Folder "Preference test $run-signed.pdf"
-            # The Windows dialog can prefer a recently used folder. Verify the
-            # proposed name and explicitly choose the fixture output directory.
-            [SumiSmoke]::SetFileName($dialog, $out, $true)
-            [void](Wait-Page $viewer ([IO.Path]::GetFileName($out)) '2 / 2' ([Diagnostics.Stopwatch]::StartNew()) -Quiet)
+            [SumiSmoke]::AcceptFileDialog($dialog)
+            [void](Wait-Page $viewer $savedName '2 / 2' ([Diagnostics.Stopwatch]::StartNew()) -Quiet)
             if ([ReadingProbe]::TabCount($window) -ne 2 -or ![SumiSmoke]::IsWindowEnabled($window)) {
                 throw 'The signed copy should be visible in its own tab without a confirmation dialog.'
             }
@@ -163,7 +162,6 @@ function Test-SigningPreferences([string]$ExecutablePath, [string]$InputPdf, [st
                 throw 'The signed copy is offering to edit annotations.'
             }
             $expectedWatermark = @('pdf', 'png', 'pdf', 'builtin')[$run - 1]
-            Assert-GuiSignature $out $Identity.Thumbprint $expectedWatermark $expectedImage
             if ($run -lt 4) {
                 $original = [IO.Path]::GetFileName($runPdf)
                 [ReadingProbe]::ClickTab($window, $original)
@@ -185,6 +183,16 @@ function Test-SigningPreferences([string]$ExecutablePath, [string]$InputPdf, [st
             if (!$viewer.CloseMainWindow() -or !$viewer.WaitForExit(5000) -or $viewer.ExitCode -ne 0) {
                 throw "Signing preference viewer $run did not close normally."
             }
+            # The Windows dialog can keep a recently used directory. The saved
+            # tab records the exact path the viewer opened after accepting it.
+            $session = Get-Content -LiteralPath (Join-Path $profileDir 'SumiPDF/session.json') -Raw | ConvertFrom-Json
+            $signedPaths = @(foreach ($tab in $session.tabs) {
+                $path = [string]::new([char[]][int[]]$tab.path.Windows)
+                if ([IO.Path]::GetFileName($path) -ceq $savedName) { $path }
+            })
+            if ($signedPaths.Count -ne 1) { throw "Expected a saved tab for $savedName." }
+            try { Assert-GuiSignature $signedPaths[0] $Identity.Thumbprint $expectedWatermark $expectedImage }
+            finally { Remove-Item -LiteralPath $signedPaths[0] }
         } finally {
             if (!$viewer.HasExited) { $viewer.Kill(); $viewer.WaitForExit() }
             $viewer.Dispose()
