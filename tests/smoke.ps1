@@ -599,6 +599,10 @@ try {
             throw 'Annotation tools were enabled after identifying an existing signature.'
         }
     }
+    [SumiSmoke]::Click($window, 102)
+    [void](Wait-Page $viewer 'signed once.pdf' '1 / 2' ([Diagnostics.Stopwatch]::StartNew()))
+    [SumiSmoke]::DragOnPage($window, 200, 300, 0.22, 0.38, 0.56, 0.38)
+    Wait-HighlightState $viewer $window 'Esc to clear selection' $false
     if (-not $viewer.CloseMainWindow() -or -not $viewer.WaitForExit(5000) -or $viewer.ExitCode -ne 0) {
         throw 'The viewer did not close the signed document normally.'
     }

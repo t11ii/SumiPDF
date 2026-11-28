@@ -33,6 +33,13 @@ impl TextDocument {
         Ok(Self::from_document(doc))
     }
 
+    pub fn selection(bytes: &[u8], index: u32) -> Result<TextLayout, String> {
+        let doc = Self::load_for_search(bytes)?;
+        let mut layout = doc.page(index)?;
+        layout.allows_annotations = crate::pdfseal::allows_annotations(bytes, &doc.doc);
+        Ok(layout)
+    }
+
     fn from_document(doc: Document) -> Self {
         let pages = doc.page_iter().collect();
         Self { doc, pages }
@@ -92,6 +99,7 @@ impl TextDocument {
 pub struct TextLayout {
     glyphs: Vec<UnitRect>,
     lines: Vec<Line>,
+    pub allows_annotations: bool,
 }
 #[derive(Clone)]
 struct Line {

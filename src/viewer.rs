@@ -76,6 +76,7 @@ const RESTORE_TABS: usize = 0x1fd0;
 const FORGET_CERTIFICATE: usize = 0x1fe0;
 const RENDER_TIMER: usize = 1;
 const SCROLL_TIMER: usize = 2;
+const SMOOTH_TIMER: usize = 3;
 const ACTION: u32 = WM_APP + 1;
 const READY: u32 = WM_APP + 2;
 const DROPPED: u32 = WM_APP + 3;
@@ -730,6 +731,8 @@ struct App {
     wheel_delta: i32,
     wheel_motion: Option<WheelMotion>,
     requested: Option<(u64, u32, (i32, i32), u64)>,
+    first_frame_pending: bool,
+    smoothing_in_progress: bool,
     marks: Vec<Mark>,
     saved_marks: Vec<Mark>,
     tool: Option<MarkKind>,
@@ -775,6 +778,8 @@ impl App {
             wheel_delta: 0,
             wheel_motion: None,
             requested: None,
+            first_frame_pending: false,
+            smoothing_in_progress: false,
             marks: Vec::new(),
             saved_marks: Vec::new(),
             tool: None,
@@ -793,7 +798,9 @@ impl App {
     fn controls(&self) {
         let editing = self.signing.is_none() && !self.writing;
         let annotate = editing && !self.known_signed;
-        VIEW.with_borrow_mut(|v| v.enable_text_selection(self.ui.canvas, annotate));
+        VIEW.with_borrow_mut(|v| {
+            v.enable_text_selection(self.ui.canvas, editing && self.page_count() > 0)
+        });
         for (c, enabled) in [
             (self.ui.open, !self.writing),
             (self.ui.tab_bar, !self.writing),
@@ -918,11 +925,15 @@ impl App {
             } else {
                 format!("Pages {}–{}", range.0 + 1, range.1 + 1)
             };
-            let help = if VIEW.with_borrow(canvas::Canvas::has_selection) {
-                "H to highlight  ·  U to underline  ·  Esc to clear"
-            } else {
-                "Scroll with the mouse wheel"
-            };
+            let help = VIEW.with_borrow(|v| {
+                if !v.has_selection() {
+                    "Scroll with the mouse wheel"
+                } else if !self.known_signed && v.selection_allows_annotations() {
+                    "H to highlight  ·  U to underline  ·  Esc to clear"
+                } else {
+                    "Esc to clear selection"
+                }
+            });
             format!(
                 "{pages}  ·  {:.0}% of fit size  ·  {help}",
                 self.zoom * 100.0
@@ -1105,6 +1116,11 @@ impl App {
         }
         let Some((page, cache_pixels)) = VIEW.with_borrow_mut(|v| v.next_render(self.page, area))
         else {
+            if let Some(quality) = self.smoothing_quality()
+                && VIEW.with_borrow(|v| v.has_smoothing(self.page, quality))
+            {
+                unsafe { SetTimer(self.hwnd, SMOOTH_TIMER, 200, None) };
+            }
             return;
         };
         self.requested = Some((self.revision, page, area, self.zoom.to_bits()));
@@ -1118,6 +1134,41 @@ impl App {
             cache_pixels,
         });
     }
+
+    fn smoothing_quality(&self) -> Option<canvas::Quality> {
+        if self.smoothing_in_progress
+            || self.requested.is_some()
+            || self.wheel_motion.is_some()
+            || self.writing
+            || self.tool.is_some()
+            || self.signing.is_some()
+            || self.resume_source.is_none()
+        {
+            return None;
+        }
+        Some((canvas::area(self.ui.canvas), self.zoom.to_bits()))
+    }
+
+    fn smooth_visible_page(&mut self) {
+        if let Some(quality) = self.smoothing_quality()
+            && let Some(source) = self.resume_source.clone()
+            && let Some(smoothing) = VIEW.with_borrow_mut(|v| v.take_smoothing(self.page, quality))
+        {
+            self.smoothing_in_progress = worker::smooth(
+                self.hwnd as usize,
+                self.events.clone(),
+                source,
+                worker::SmoothingRequest {
+                    revision: self.revision,
+                    page: self.page,
+                    quality,
+                    smoothing,
+                },
+            )
+            .is_ok();
+        }
+    }
+
     fn page_to(&mut self, page: u32) {
         self.stop_motion();
         if page >= self.page_count() {
@@ -1295,12 +1346,19 @@ impl App {
                 if let Some((revision, page, area, zoom)) = self.requested.take()
                     && revision == self.revision
                 {
+                    let first_frame =
+                        self.first_frame_pending && page == self.page && result.is_ok();
                     let repaint = VIEW.with_borrow_mut(|v| {
                         let repaint = v.finish_render(page, (area, zoom), reading, result);
                         v.reveal_find(self.ui.canvas) || repaint
                     });
                     if repaint {
                         canvas::redraw(self.ui.canvas);
+                        if first_frame {
+                            self.first_frame_pending = false;
+                            // Present the first page before queuing the next render.
+                            unsafe { UpdateWindow(self.ui.canvas) };
+                        }
                     }
                     self.render();
                     let visible = VIEW.with_borrow(|v| {
@@ -1314,6 +1372,19 @@ impl App {
                         }
                     }
                 }
+            }
+            Event::Smoothed(request, image) => {
+                self.smoothing_in_progress = false;
+                if request.revision == self.revision
+                    && request.quality == (canvas::area(self.ui.canvas), self.zoom.to_bits())
+                    && let Some(image) = image
+                    && VIEW.with_borrow_mut(|v| {
+                        v.finish_smoothing(request.page, request.quality, image)
+                    })
+                {
+                    canvas::redraw(self.ui.canvas);
+                }
+                self.render();
             }
             Event::Layout {
                 revision,
@@ -1484,9 +1555,11 @@ impl App {
                     kind,
                     color: self.color,
                 };
-                if let Some(mark) = VIEW.with_borrow_mut(|v| v.take_selection(style)) {
-                    self.marks.push(mark);
-                    self.update_marks();
+                if VIEW.with_borrow(canvas::Canvas::has_selection) {
+                    if let Some(mark) = VIEW.with_borrow_mut(|v| v.take_selection(style)) {
+                        self.marks.push(mark);
+                        self.update_marks();
+                    }
                     return Ok(());
                 }
                 let previous = self.tool;
@@ -1848,6 +1921,10 @@ impl App {
                         KillTimer(self.hwnd, RENDER_TIMER);
                     }
                     self.render();
+                }
+                WM_TIMER if msg.hwnd == self.hwnd && msg.wParam == SMOOTH_TIMER => {
+                    unsafe { KillTimer(self.hwnd, SMOOTH_TIMER) };
+                    self.smooth_visible_page();
                 }
                 _ => unsafe {
                     TranslateMessage(&msg);

@@ -60,6 +60,13 @@ pub struct Frame {
     pub bitmap: Bitmap,
     pub ratio: f64,
     pub limited_to: Option<u64>,
+    pub smoothing: Option<Smoothing>,
+}
+
+#[derive(Clone, Copy)]
+pub struct Smoothing {
+    output: (u32, u32),
+    samples: (u32, u32),
 }
 
 // DetachPixelData returns owned CoTaskMem containing just bytes. No COM object or
@@ -215,31 +222,44 @@ impl Document {
         let dimensions = |cap| bounded_bitmap_size(requested, cap);
         let output = dimensions(budget);
         let limited_to = (budget < limit && output != dimensions(limit)).then_some(budget);
-        // Average extra samples into the display-sized frame while still on the render thread.
-        let smoothed = if zoom <= 1.0 && output == requested {
-            supersampled_size(output)
-                .and_then(|samples| rasterize(&page.0, samples, Some(output), budget).ok())
+        let bitmap = rasterize(&page.0, output, None, budget)
+            .or_else(|error| {
+                let standard = budget.min(FIT_PIXELS);
+                let fallback = dimensions(standard);
+                if fallback == output {
+                    return Err(error);
+                }
+                rasterize(&page.0, fallback, None, standard)
+            })
+            .map_err(|e| format!("{} ページを表示できませんでした。 {e}", index + 1))?;
+        // The first usable frame is complete. Smoothing can replace it at the same size later.
+        let smoothing = if zoom <= 1.0
+            && output == requested
+            && output.0.abs_diff(bitmap.width) <= 1
+            && output.1.abs_diff(bitmap.height) <= 1
+        {
+            let output = (bitmap.width, bitmap.height);
+            supersampled_size(output).map(|samples| Smoothing { output, samples })
         } else {
             None
         };
-        let bitmap = match smoothed {
-            Some(bitmap) => Ok(bitmap),
-            None => rasterize(&page.0, output, None, budget),
-        }
-        .or_else(|error| {
-            let standard = budget.min(FIT_PIXELS);
-            let fallback = dimensions(standard);
-            if fallback == output {
-                return Err(error);
-            }
-            rasterize(&page.0, fallback, None, standard)
-        })
-        .map_err(|e| format!("{} ページを表示できませんでした。 {e}", index + 1))?;
         Ok(Frame {
             bitmap,
             ratio,
             limited_to,
+            smoothing,
         })
+    }
+
+    pub fn smooth_page(&self, index: u32, smoothing: Smoothing) -> WinResult<Bitmap> {
+        let page = Page(self.pdf.GetPage(index)?);
+        let (width, height) = smoothing.output;
+        rasterize(
+            &page.0,
+            smoothing.samples,
+            Some(smoothing.output),
+            u64::from(width) * u64::from(height),
+        )
     }
 }
 
@@ -457,6 +477,14 @@ mod tests {
                     > 50
             );
         }
+        let first = document.render_page(1, (900, 1000), 1.0, None).unwrap();
+        let smoothing = first.smoothing.expect("fit frame can be smoothed later");
+        let smoothed = document.smooth_page(1, smoothing).unwrap();
+        assert_eq!(
+            (smoothed.width, smoothed.height),
+            (first.bitmap.width, first.bitmap.height)
+        );
+        assert_eq!(smoothed.pixels.len(), first.bitmap.pixels.len());
         let zoom = 4.0;
         let limit = view_pixel_limit(zoom);
         let detailed = document

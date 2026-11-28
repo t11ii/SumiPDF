@@ -155,6 +155,24 @@ fn search_maps_split_text_and_japanese_to_rotated_cropped_page_rectangles() {
 }
 
 #[test]
+fn signed_pdf_still_has_selectable_embedded_text() {
+    let signed = crate::pdfseal::sign_pdf(sample(0), |_, _| Ok(vec![1; 64])).unwrap();
+    let layout = TextDocument::selection(&signed, 0).unwrap();
+    let first = layout.glyphs[0];
+    let (x, y) = (
+        (first.left + first.right) / 2.0,
+        (first.top + first.bottom) / 2.0,
+    );
+    assert_eq!(layout.hit(x, y), Some(0));
+    assert!(!layout.allows_annotations);
+    assert!(
+        TextDocument::selection(&sample(0), 0)
+            .unwrap()
+            .allows_annotations
+    );
+}
+
+#[test]
 fn search_finds_repeated_words_joined_by_glyph_positioning_in_signed_pdfs() {
     let mut doc = Document::load_mem(&sample(0)).unwrap();
     let page = doc.page_iter().next().unwrap();
